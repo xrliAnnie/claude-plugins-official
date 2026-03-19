@@ -262,6 +262,16 @@
       }
     },
     {
+      "name": "netlify-skills",
+      "description": "Netlify platform skills for Claude Code — functions, edge functions, blobs, database, image CDN, forms, config, CLI, frameworks, caching, AI gateway, and deployment.",
+      "category": "development",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/netlify/context-and-tools.git"
+      },
+      "homepage": "https://github.com/netlify/context-and-tools"
+    },
+    {
       "name": "ruby-lsp",
       "description": "Ruby language server for code intelligence and analysis",
       "version": "1.0.0",
