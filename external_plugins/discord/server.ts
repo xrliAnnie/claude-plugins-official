@@ -105,6 +105,8 @@ type GroupPolicy = {
 type Access = {
   dmPolicy: 'pairing' | 'allowlist' | 'disabled'
   allowFrom: string[]
+  /** Bot user IDs allowed to bypass the bot message filter. Empty or absent = all bots blocked. */
+  allowBots?: string[]
   /** Keyed on channel ID (snowflake), not guild ID. One entry per guild channel. */
   groups: Record<string, GroupPolicy>
   pending: Record<string, PendingEntry>
@@ -155,6 +157,7 @@ function readAccessFile(): Access {
     return {
       dmPolicy: parsed.dmPolicy ?? 'pairing',
       allowFrom: parsed.allowFrom ?? [],
+      allowBots: parsed.allowBots,
       groups: parsed.groups ?? {},
       pending: parsed.pending ?? {},
       mentionPatterns: parsed.mentionPatterns,
@@ -800,7 +803,10 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 })
 
 client.on('messageCreate', msg => {
-  if (msg.author.bot) return
+  if (msg.author.bot) {
+    const access = loadAccess()
+    if (!access.allowBots?.includes(msg.author.id)) return
+  }
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 })
 
