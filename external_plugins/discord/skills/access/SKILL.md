@@ -34,6 +34,7 @@ Arguments passed: `$ARGUMENTS`
 {
   "dmPolicy": "pairing",
   "allowFrom": ["<senderId>", ...],
+  "allowBots": ["<botUserId>", ...],
   "groups": {
     "<channelId>": { "requireMention": true, "allowFrom": [] }
   },
@@ -124,6 +125,10 @@ Read, set the key, write, confirm.
 
 - **Always** Read the file before Write — the channel server may have added
   pending entries. Don't clobber.
+- **Preserve `allowBots`** — when reading and writing back access.json,
+  always keep the existing `allowBots` array intact. This field controls
+  which bot user IDs bypass the bot message filter (line 803 of server.ts).
+  Dropping it silently disables bot-to-bot messaging.
 - Pretty-print the JSON (2-space indent) so it's hand-editable.
 - The channels dir might not exist if the server hasn't run yet — handle
   ENOENT gracefully and create defaults.
