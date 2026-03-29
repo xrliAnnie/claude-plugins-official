@@ -1,0 +1,87 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 8 * * *'   # Daily at 08:00 UTC (00:00 PST)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/anthropics/claude-plugins-official.git
+          git fetch upstream main
+
+      - name: Check for new commits
+        id: check
+        run: |
+          BEHIND=$(git rev-list HEAD..upstream/main --count)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          OLD_UPSTREAM=$(git merge-base HEAD upstream/main)
+          echo "old_upstream=$OLD_UPSTREAM" >> "$GITHUB_OUTPUT"
+
+      - name: Rebase
+        if: steps.check.outputs.behind != '0'
+        id: rebase
+        run: |
+          if git rebase upstream/main; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          else
+            git rebase --abort
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Force push
+        if: steps.rebase.outputs.status == 'success'
+        run: git push origin main --force-with-lease
+
+      - name: Detect discord changes
+        if: steps.rebase.outputs.status == 'success'
+        id: changes
+        run: |
+          OLD_UP="${{ steps.check.outputs.old_upstream }}"
+          CHANGED=$(git diff --name-only "$OLD_UP" upstream/main -- external_plugins/discord/ || true)
+          if [ -n "$CHANGED" ]; then
+            echo "discord_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "discord_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Discord webhook — plugin updated
+        if: steps.changes.outputs.discord_changed == 'true'
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          curl -s -H "Content-Type: application/json" -d '{
+            "content": "[Flywheel Fork Sync] Discord Plugin Updated Upstream — fork rebase 后 external_plugins/discord/ 有变化，需要重新部署。请运行 update-discord-plugin。"
+          }' "$WEBHOOK_URL"
+
+      - name: Notify + issue on conflict
+        if: steps.rebase.outputs.status == 'conflict'
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -s -H "Content-Type: application/json" -d '{
+            "content": "[Flywheel Fork Sync] Upstream Rebase CONFLICT — daily rebase 失败，需要手动解决冲突。"
+          }' "$WEBHOOK_URL"
+          gh issue create \
+            --title "Upstream rebase conflict — $(date +%F)" \
+            --body "Our patch: allowBots commit on server.ts. Manual rebase needed." \
+            --label "upstream-conflict"
