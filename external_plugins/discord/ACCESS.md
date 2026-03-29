@@ -115,6 +115,11 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
   // User snowflakes allowed to DM.
   "allowFrom": ["184695080709324800"],
 
+  // Bot user IDs allowed to bypass the bot message filter.
+  // Only these bots can send messages that reach the assistant.
+  // Absent or empty = all bot messages are dropped (default behavior).
+  "allowBots": ["123456789012345678"],
+
   // Guild channels the bot is active in. Empty object = DM-only.
   "groups": {
     "846209781206941736": {
