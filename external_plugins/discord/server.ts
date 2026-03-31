@@ -220,6 +220,31 @@ type GateResult =
   | { action: 'drop' }
   | { action: 'pair'; code: string; isResend: boolean }
 
+// --- Typing keepalive ---
+// Discord typing indicators expire after ~10 seconds. We refresh every 8s
+// so Annie always sees "Bot is typing..." while a Lead processes a message.
+type TypingState = { interval: ReturnType<typeof setInterval>; safety: ReturnType<typeof setTimeout> }
+const activeTyping = new Map<string, TypingState>()
+const TYPING_REFRESH_MS = 8_000
+const TYPING_MAX_DURATION_MS = 10 * 60_000 // 10-minute safety cap
+
+function startTypingKeepalive(channel: { sendTyping(): Promise<void> }, chatId: string): void {
+  stopTypingKeepalive(chatId)
+  const send = () => { void channel.sendTyping().catch(() => {}) }
+  send() // immediate
+  const interval = setInterval(send, TYPING_REFRESH_MS)
+  const safety = setTimeout(() => stopTypingKeepalive(chatId), TYPING_MAX_DURATION_MS)
+  activeTyping.set(chatId, { interval, safety })
+}
+
+function stopTypingKeepalive(chatId: string): void {
+  const state = activeTyping.get(chatId)
+  if (!state) return
+  clearInterval(state.interval)
+  clearTimeout(state.safety)
+  activeTyping.delete(chatId)
+}
+
 // Track message IDs we recently sent, so reply-to-bot in guild channels
 // counts as a mention without needing fetchReference().
 const recentSentIds = new Set<string>()
@@ -607,6 +632,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     switch (req.params.name) {
       case 'reply': {
         const chat_id = args.chat_id as string
+        stopTypingKeepalive(chat_id) // stop "Bot is typing..." before sending
         const text = args.text as string
         const reply_to = args.reply_to as string | undefined
         const files = (args.files as string[] | undefined) ?? []
@@ -854,9 +880,10 @@ async function handleInbound(msg: Message): Promise<void> {
     return
   }
 
-  // Typing indicator — signals "processing" until we reply (or ~10s elapses).
+  // Typing keepalive — refreshes every 8s so "Bot is typing..." persists
+  // until the reply tool is called (or the 10-minute safety cap expires).
   if ('sendTyping' in msg.channel) {
-    void msg.channel.sendTyping().catch(() => {})
+    startTypingKeepalive(msg.channel as { sendTyping(): Promise<void> }, chat_id)
   }
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
