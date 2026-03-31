@@ -832,6 +832,8 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 })
 
 client.on('messageCreate', msg => {
+  // Never process our own messages — prevents typing keepalive re-trigger on reply echo.
+  if (msg.author.id === client.user?.id) return
   if (msg.author.bot) {
     const access = loadAccess()
     if (!access.allowBots?.includes(msg.author.id)) return
