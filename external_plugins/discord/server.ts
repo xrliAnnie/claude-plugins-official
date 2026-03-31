@@ -223,10 +223,15 @@ type GateResult =
 // --- Typing keepalive ---
 // Discord typing indicators expire after ~10 seconds. We refresh every 8s
 // so Annie always sees "Bot is typing..." while a Lead processes a message.
-type TypingState = { interval: ReturnType<typeof setInterval>; safety: ReturnType<typeof setTimeout> }
+type TypingState = {
+  interval: ReturnType<typeof setInterval>
+  safety: ReturnType<typeof setTimeout>
+  idle: ReturnType<typeof setTimeout>
+}
 const activeTyping = new Map<string, TypingState>()
 const TYPING_REFRESH_MS = 8_000
 const TYPING_MAX_DURATION_MS = 10 * 60_000 // 10-minute safety cap
+const TYPING_IDLE_MS = 30_000 // Auto-stop if no tool call within 30s (FLY-29)
 
 function startTypingKeepalive(channel: { sendTyping(): Promise<void> }, chatId: string): void {
   stopTypingKeepalive(chatId)
@@ -234,7 +239,16 @@ function startTypingKeepalive(channel: { sendTyping(): Promise<void> }, chatId: 
   send() // immediate
   const interval = setInterval(send, TYPING_REFRESH_MS)
   const safety = setTimeout(() => stopTypingKeepalive(chatId), TYPING_MAX_DURATION_MS)
-  activeTyping.set(chatId, { interval, safety })
+  const idle = setTimeout(() => stopTypingKeepalive(chatId), TYPING_IDLE_MS)
+  activeTyping.set(chatId, { interval, safety, idle })
+}
+
+/** Reset idle timer — called on any tool call referencing this channel. */
+function resetTypingIdle(chatId: string): void {
+  const state = activeTyping.get(chatId)
+  if (!state) return
+  clearTimeout(state.idle)
+  state.idle = setTimeout(() => stopTypingKeepalive(chatId), TYPING_IDLE_MS)
 }
 
 function stopTypingKeepalive(chatId: string): void {
@@ -242,6 +256,7 @@ function stopTypingKeepalive(chatId: string): void {
   if (!state) return
   clearInterval(state.interval)
   clearTimeout(state.safety)
+  clearTimeout(state.idle)
   activeTyping.delete(chatId)
 }
 
@@ -625,6 +640,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
+  // FLY-29: Any tool call with chat_id resets the idle timer, keeping typing
+  // alive while the Lead is actively using Discord tools.
+  const chatIdArg = (args.chat_id ?? args.channel) as string | undefined
+  if (chatIdArg) resetTypingIdle(chatIdArg)
   try {
     switch (req.params.name) {
       case 'reply': {
