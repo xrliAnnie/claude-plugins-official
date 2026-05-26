@@ -110,6 +110,16 @@ async function callReplyGuard(chatId: string, text: string): Promise<GuardDeny |
       body: JSON.stringify({ projectName, leadId, chatId, text }),
       signal: controller.signal,
     })
+    // A 404 means this Bridge has no reply-guard route at all — i.e. the
+    // guard is not deployed here (e.g. a Bridge running code from before the
+    // route existed). That is NOT a transient outage, so fail OPEN regardless
+    // of token content: this keeps the plugin safe to deploy globally even
+    // before/independently of the Bridge route, and avoids blocking replies
+    // against a Bridge that was never meant to enforce. (When the guard IS
+    // deployed but disabled, the route returns 200 {allow:true}, not 404.)
+    if (res.status === 404) return null
+    // Other non-OK responses (5xx, 429, etc.) mean the Bridge is present but
+    // erroring — fall through to the catch's fail-closed-on-issue-token path.
     if (!res.ok) throw new Error(`guard HTTP ${res.status}`)
     const decision = (await res.json()) as {
       allow?: boolean
