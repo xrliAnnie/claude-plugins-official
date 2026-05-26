@@ -53,6 +53,124 @@ try {
 const TOKEN = process.env.DISCORD_BOT_TOKEN
 const STATIC = process.env.DISCORD_ACCESS_MODE === 'static'
 
+// ──────────────────────────────────────────────────────────────────────
+// FLY-162 Layer 2 — preventive routing guard (Flywheel fork addition)
+//
+// Before a `reply` or `edit_message` posts user-visible text, ask the
+// Flywheel Bridge whether issue-bound content is being written to the Lead's
+// chat-channel TOP LEVEL. Issue content must instead go to the issue's thread
+// via POST /api/chat-threads/send. The Bridge owns the authoritative
+// classification (chatChannel vs registered thread vs other).
+//
+// Hybrid fail policy when the Bridge is unreachable / not wired:
+//   • text contains >= 1 configured issue token  -> fail CLOSED (deny)
+//   • otherwise (free-form, zero tokens)          -> fail OPEN (proceed)
+// This keeps ordinary chat working during Bridge outages while still
+// protecting the TC-02 class (issue content leaking to the top level).
+// ──────────────────────────────────────────────────────────────────────
+const GUARD_PREFIXES = (process.env.TEAMLEAD_ISSUE_PREFIXES ?? 'FLY,GEO')
+  .split(',')
+  .map(s => s.trim().toUpperCase())
+  .filter(Boolean)
+const GUARD_TOKEN_RE = /\b([A-Za-z]{2,})-(\d+)\b/g
+
+function localHasIssueToken(text: string): boolean {
+  if (!text) return false
+  const allowed = new Set(GUARD_PREFIXES)
+  for (const m of text.matchAll(GUARD_TOKEN_RE)) {
+    if (m[1] && allowed.has(m[1].toUpperCase())) return true
+  }
+  return false
+}
+
+interface GuardDeny {
+  allow: false
+  reason?: string
+  issues?: string[]
+  guidance?: string
+}
+
+async function callReplyGuard(chatId: string, text: string): Promise<GuardDeny | null> {
+  const bridgeUrl = process.env.BRIDGE_URL
+  const apiToken = process.env.TEAMLEAD_API_TOKEN
+  const leadId = process.env.LEAD_ID
+  const projectName = process.env.PROJECT_NAME
+  // Not wired (running outside a Flywheel Lead) -> guard disabled (fail open).
+  if (!bridgeUrl || !apiToken || !leadId || !projectName) return null
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 1500)
+  try {
+    const res = await fetch(`${bridgeUrl}/api/discord/reply-guard`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiToken}`,
+      },
+      body: JSON.stringify({ projectName, leadId, chatId, text }),
+      signal: controller.signal,
+    })
+    // A 404 means this Bridge has no reply-guard route at all — i.e. the
+    // guard is not deployed here (e.g. a Bridge running code from before the
+    // route existed). That is NOT a transient outage, so fail OPEN regardless
+    // of token content: this keeps the plugin safe to deploy globally even
+    // before/independently of the Bridge route, and avoids blocking replies
+    // against a Bridge that was never meant to enforce. (When the guard IS
+    // deployed but disabled, the route returns 200 {allow:true}, not 404.)
+    if (res.status === 404) return null
+    // Other non-OK responses (5xx, 429, etc.) mean the Bridge is present but
+    // erroring — fall through to the catch's fail-closed-on-issue-token path.
+    if (!res.ok) throw new Error(`guard HTTP ${res.status}`)
+    const decision = (await res.json()) as {
+      allow?: boolean
+      reason?: string
+      issues?: string[]
+      guidance?: string
+    }
+    if (decision && decision.allow === false) {
+      return {
+        allow: false,
+        reason: decision.reason,
+        issues: decision.issues,
+        guidance: decision.guidance,
+      }
+    }
+    return null // allow (includes allow=true soft-telemetry responses)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (localHasIssueToken(text)) {
+      process.stderr.write(
+        `[reply-guard] Bridge unavailable (${msg}); fail-closed on issue-bearing text\n`,
+      )
+      return {
+        allow: false,
+        reason: 'guard_unavailable',
+        guidance:
+          'Bridge routing guard unavailable; do not post issue content at the chat-channel top level — use POST /api/chat-threads/send when the Bridge is healthy.',
+      }
+    }
+    process.stderr.write(
+      `[reply-guard] Bridge unavailable (${msg}); fail-open on free-form text\n`,
+    )
+    return null
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function guardDenyResult(deny: GuardDeny) {
+  const issues = (deny.issues ?? []).join(', ')
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: `BLOCKED by routing guard (${deny.reason ?? 'denied'}). Issues: ${issues}. ${deny.guidance ?? ''}`.trim(),
+      },
+    ],
+    isError: true,
+  }
+}
+
 if (!TOKEN) {
   process.stderr.write(
     `discord channel: DISCORD_BOT_TOKEN required\n` +
@@ -656,6 +774,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const reply_to = args.reply_to as string | undefined
         const files = (args.files as string[] | undefined) ?? []
 
+        // FLY-162 Layer 2: deny issue content posted at the chat-channel top level.
+        const guardDeny = await callReplyGuard(chat_id, text)
+        if (guardDeny) return guardDenyResult(guardDeny)
+
         const ch = await fetchAllowedChannel(chat_id)
         if (!('send' in ch)) throw new Error('channel is not sendable')
 
@@ -732,9 +854,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: 'reacted' }] }
       }
       case 'edit_message': {
-        const ch = await fetchAllowedChannel(args.chat_id as string)
+        const chat_id = args.chat_id as string
+        const text = args.text as string
+        // FLY-162 Layer 2: editing a message to inject issue content at the
+        // chat-channel top level is the same leak as a fresh reply — guard it.
+        const guardDeny = await callReplyGuard(chat_id, text)
+        if (guardDeny) return guardDenyResult(guardDeny)
+
+        const ch = await fetchAllowedChannel(chat_id)
         const msg = await ch.messages.fetch(args.message_id as string)
-        const edited = await msg.edit(args.text as string)
+        const edited = await msg.edit(text)
         return { content: [{ type: 'text', text: `edited (id: ${edited.id})` }] }
       }
       case 'download_attachment': {
