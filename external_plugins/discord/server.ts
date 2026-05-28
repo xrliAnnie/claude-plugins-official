@@ -83,6 +83,17 @@ function localHasIssueToken(text: string): boolean {
   return false
 }
 
+// FLY-173: the project core channel (#geoforge3d-core) is exempt from the reply
+// guard — triage overviews / cross-issue coordination legitimately list issue
+// numbers there. DISCORD_CORE_CHANNEL is injected per-pane by claude-lead.sh,
+// derived strictly from the project's generalChannel (the SAME source the Bridge
+// uses). Empty/unset → no core configured → never matches (no exemption).
+// Pure, side-effect-free.
+function isCoreChannel(chatId: string): boolean {
+  const core = process.env.DISCORD_CORE_CHANNEL
+  return !!core && chatId === core
+}
+
 interface GuardDeny {
   allow: false
   reason?: string
@@ -138,6 +149,18 @@ async function callReplyGuard(chatId: string, text: string): Promise<GuardDeny |
     return null // allow (includes allow=true soft-telemetry responses)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
+    // FLY-173: core channel is always exempt — even when the Bridge is down it
+    // must not re-block Simba's core triage. Checked BEFORE the issue-token
+    // fail-closed branch. (Healthy path stays Bridge-authoritative: the Bridge
+    // route returns allow for core via its generalChannel classification, so we
+    // only need this in the Bridge-unavailable catch path — no normal-path
+    // short-circuit, no plugin/Bridge divergence.)
+    if (isCoreChannel(chatId)) {
+      process.stderr.write(
+        `[reply-guard] Bridge unavailable (${msg}); fail-open on core channel (FLY-173)\n`,
+      )
+      return null
+    }
     if (localHasIssueToken(text)) {
       process.stderr.write(
         `[reply-guard] Bridge unavailable (${msg}); fail-closed on issue-bearing text\n`,
