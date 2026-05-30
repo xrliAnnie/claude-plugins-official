@@ -22,6 +22,13 @@ cd "$DIR"
 # locations (matches the launchd/tmux PATH handling in claude-lead.sh).
 command -v bun >/dev/null 2>&1 || export PATH="$HOME/.bun/bin:$HOME/.npm-global/bin:$PATH"
 
+# Hard fail if bun is still unresolvable — there is no point continuing to a
+# `bun install` / `exec bun` that would fail with a less direct error.
+if ! command -v bun >/dev/null 2>&1; then
+  echo "discord channel: bun not found on PATH — aborting (FLY-183)" >&2
+  exit 127
+fi
+
 # Install deps (first run / version bumps). Do not silently swallow failures:
 # tolerate an install error ONLY when deps are already present (offline), else
 # fail loudly rather than exec a server that will crash with a less direct error.

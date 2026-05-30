@@ -10,6 +10,7 @@
  * lookback, and the instructions tell the model this.
  */
 
+import { execFileSync } from 'node:child_process'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
@@ -939,16 +940,29 @@ process.on('SIGINT', shutdown)
 
 // FLY-183: parent-death detection. start-adapter.sh exec's into this process,
 // so the adapter is a DIRECT child of Claude; on Claude death the process is
-// reparented to launchd (ppid === 1). stdin EOF is unreliable under Bun for
+// reparented to launchd (live ppid -> 1). stdin EOF is unreliable under Bun for
 // abrupt parent death (the MCP StdioServerTransport only listens for stdin
-// 'data'/'error', not 'end'/'close'), and macOS has no PR_SET_PDEATHSIG, so
-// poll process.ppid as the robust signal. The SIGTERM/SIGINT/stdin handlers
-// above remain the faster graceful-shutdown path. The interval is unref'd so it
-// never keeps the process alive on its own.
+// 'data'/'error', not 'end'/'close'), and macOS has no PR_SET_PDEATHSIG, so we
+// poll the parent pid. IMPORTANT: Bun CACHES `process.ppid` (it keeps returning
+// the original parent after the parent dies — verified on Bun 1.3.11), so we
+// must read the LIVE ppid via `ps` each tick rather than trust process.ppid.
+// The SIGTERM/SIGINT/stdin handlers above remain the faster graceful path. The
+// interval is unref'd so it never keeps the process alive on its own.
 const FLY183_PARENT_WATCH_MS = 10_000
+function fly183LivePpid(): number {
+  try {
+    const out = execFileSync('ps', ['-o', 'ppid=', '-p', String(process.pid)], {
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+    return Number.parseInt(out.trim(), 10)
+  } catch {
+    return -1 // ps failed/transient — treat as "unknown", retry next tick
+  }
+}
 const fly183ParentWatch = setInterval(() => {
-  if (process.ppid === 1) {
-    process.stderr.write('discord channel: parent died (ppid=1), self-terminating (FLY-183)\n')
+  if (fly183LivePpid() === 1) {
+    process.stderr.write('discord channel: parent died (live ppid=1), self-terminating (FLY-183)\n')
     shutdown()
   }
 }, FLY183_PARENT_WATCH_MS)
