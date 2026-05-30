@@ -937,6 +937,23 @@ process.stdin.on('close', shutdown)
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
+// FLY-183: parent-death detection. start-adapter.sh exec's into this process,
+// so the adapter is a DIRECT child of Claude; on Claude death the process is
+// reparented to launchd (ppid === 1). stdin EOF is unreliable under Bun for
+// abrupt parent death (the MCP StdioServerTransport only listens for stdin
+// 'data'/'error', not 'end'/'close'), and macOS has no PR_SET_PDEATHSIG, so
+// poll process.ppid as the robust signal. The SIGTERM/SIGINT/stdin handlers
+// above remain the faster graceful-shutdown path. The interval is unref'd so it
+// never keeps the process alive on its own.
+const FLY183_PARENT_WATCH_MS = 10_000
+const fly183ParentWatch = setInterval(() => {
+  if (process.ppid === 1) {
+    process.stderr.write('discord channel: parent died (ppid=1), self-terminating (FLY-183)\n')
+    shutdown()
+  }
+}, FLY183_PARENT_WATCH_MS)
+fly183ParentWatch.unref?.()
+
 client.on('error', err => {
   process.stderr.write(`discord channel: client error: ${err}\n`)
 })
