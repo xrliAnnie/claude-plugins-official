@@ -967,6 +967,19 @@ const FLY183_PS_BIN: string =
   }) ?? 'ps' // last-resort PATH lookup (e.g. unusual layouts); absolute preferred
 let fly183PpidFailStreak = 0
 const FLY183_PPID_FAIL_WARN_AT = 3
+// Record a failed/unusable ppid read and warn exactly once at the threshold (not
+// every tick). Both a thrown `execFileSync` AND an unparseable/NaN result route
+// here (Codex R3 LOW) so a persistently-degraded watch — e.g. `ps` printing
+// nothing parseable — is surfaced rather than silently looping forever.
+function fly183NotePpidReadFailure(): number {
+  fly183PpidFailStreak += 1
+  if (fly183PpidFailStreak === FLY183_PPID_FAIL_WARN_AT) {
+    process.stderr.write(
+      `discord channel: parent-death watch degraded — '${FLY183_PS_BIN}' failed ${fly183PpidFailStreak}x; orphan self-clean inactive (FLY-183)\n`,
+    )
+  }
+  return -1 // treat as "unknown" — retry next tick
+}
 function fly183LivePpid(): number {
   try {
     const out = execFileSync(FLY183_PS_BIN, ['-o', 'ppid=', '-p', String(process.pid)], {
@@ -975,20 +988,12 @@ function fly183LivePpid(): number {
     })
     const ppid = Number.parseInt(out.trim(), 10)
     if (Number.isNaN(ppid)) {
-      return -1 // unparseable — treat as "unknown", retry next tick
+      return fly183NotePpidReadFailure() // unparseable — same degraded path as a throw
     }
     fly183PpidFailStreak = 0
     return ppid
   } catch {
-    fly183PpidFailStreak += 1
-    if (fly183PpidFailStreak === FLY183_PPID_FAIL_WARN_AT) {
-      // Warn exactly once at the threshold (not every tick) — the parent-death
-      // watch is effectively disabled while `ps` keeps failing.
-      process.stderr.write(
-        `discord channel: parent-death watch degraded — '${FLY183_PS_BIN}' failed ${fly183PpidFailStreak}x; orphan self-clean inactive (FLY-183)\n`,
-      )
-    }
-    return -1 // ps failed/transient — treat as "unknown", retry next tick
+    return fly183NotePpidReadFailure()
   }
 }
 const fly183ParentWatch = setInterval(() => {
