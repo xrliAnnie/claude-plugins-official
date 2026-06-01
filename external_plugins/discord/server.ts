@@ -10,6 +10,7 @@
  * lookback, and the instructions tell the model this.
  */
 
+import { execFileSync } from 'node:child_process'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
@@ -30,7 +31,7 @@ import {
   type Interaction,
 } from 'discord.js'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, existsSync } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
 
@@ -936,6 +937,72 @@ process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
+
+// FLY-183: parent-death detection. start-adapter.sh exec's into this process,
+// so the adapter is a DIRECT child of Claude; on Claude death the process is
+// reparented to launchd (live ppid -> 1). stdin EOF is unreliable under Bun for
+// abrupt parent death (the MCP StdioServerTransport only listens for stdin
+// 'data'/'error', not 'end'/'close'), and macOS has no PR_SET_PDEATHSIG, so we
+// poll the parent pid. IMPORTANT: Bun CACHES `process.ppid` (it keeps returning
+// the original parent after the parent dies — verified on Bun 1.3.11), so we
+// must read the LIVE ppid via `ps` each tick rather than trust process.ppid.
+// The SIGTERM/SIGINT/stdin handlers above remain the faster graceful path. The
+// interval is unref'd so it never keeps the process alive on its own.
+//
+// Codex R2 MEDIUM: resolve an ABSOLUTE `ps` path once at startup. execFileSync
+// with a bare 'ps' depends on PATH, and start-adapter.sh only repairs PATH when
+// `bun` is unresolvable — so an MCP env that finds bun but omits /bin:/usr/bin
+// would make every poll throw ENOENT, `fly183LivePpid()` return -1 forever, and
+// the watch never fire. An absolute path needs no PATH lookup. We also surface a
+// stderr warning once repeated polls fail, so a silently-disabled watch is
+// visible rather than masquerading as a healthy adapter.
+const FLY183_PARENT_WATCH_MS = 10_000
+const FLY183_PS_BIN: string =
+  ['/bin/ps', '/usr/bin/ps'].find(p => {
+    try {
+      return existsSync(p)
+    } catch {
+      return false
+    }
+  }) ?? 'ps' // last-resort PATH lookup (e.g. unusual layouts); absolute preferred
+let fly183PpidFailStreak = 0
+const FLY183_PPID_FAIL_WARN_AT = 3
+// Record a failed/unusable ppid read and warn exactly once at the threshold (not
+// every tick). Both a thrown `execFileSync` AND an unparseable/NaN result route
+// here (Codex R3 LOW) so a persistently-degraded watch — e.g. `ps` printing
+// nothing parseable — is surfaced rather than silently looping forever.
+function fly183NotePpidReadFailure(): number {
+  fly183PpidFailStreak += 1
+  if (fly183PpidFailStreak === FLY183_PPID_FAIL_WARN_AT) {
+    process.stderr.write(
+      `discord channel: parent-death watch degraded — '${FLY183_PS_BIN}' failed ${fly183PpidFailStreak}x; orphan self-clean inactive (FLY-183)\n`,
+    )
+  }
+  return -1 // treat as "unknown" — retry next tick
+}
+function fly183LivePpid(): number {
+  try {
+    const out = execFileSync(FLY183_PS_BIN, ['-o', 'ppid=', '-p', String(process.pid)], {
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+    const ppid = Number.parseInt(out.trim(), 10)
+    if (Number.isNaN(ppid)) {
+      return fly183NotePpidReadFailure() // unparseable — same degraded path as a throw
+    }
+    fly183PpidFailStreak = 0
+    return ppid
+  } catch {
+    return fly183NotePpidReadFailure()
+  }
+}
+const fly183ParentWatch = setInterval(() => {
+  if (fly183LivePpid() === 1) {
+    process.stderr.write('discord channel: parent died (live ppid=1), self-terminating (FLY-183)\n')
+    shutdown()
+  }
+}, FLY183_PARENT_WATCH_MS)
+fly183ParentWatch.unref?.()
 
 client.on('error', err => {
   process.stderr.write(`discord channel: client error: ${err}\n`)
