@@ -712,7 +712,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: 'object',
         properties: {
           chat_id: { type: 'string' },
-          text: { type: 'string' },
+          text: { type: 'string', description: 'The message body to send.' },
+          // FLY-239: `message` is accepted as an alias for `text` so a model that
+          // drifts to the sibling-tool param name (SendMessage/loop use `message`)
+          // still sends instead of crashing. Prefer `text`.
+          message: { type: 'string', description: 'Alias for `text` (prefer `text`).' },
           reply_to: {
             type: 'string',
             description: 'Message ID to thread under. Use message_id from the inbound <channel> block, or an id from fetch_messages.',
@@ -723,7 +727,9 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             description: 'Absolute file paths to attach (images, logs, etc). Max 10 files, 25MB each.',
           },
         },
-        required: ['chat_id', 'text'],
+        // `text` (or its `message` alias) is enforced in the handler so a
+        // message-only call yields a clear error rather than a schema reject.
+        required: ['chat_id'],
       },
     },
     {
@@ -747,9 +753,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           chat_id: { type: 'string' },
           message_id: { type: 'string' },
-          text: { type: 'string' },
+          text: { type: 'string', description: 'The new message body.' },
+          // FLY-239: accept `message` as an alias for `text` (see reply tool).
+          message: { type: 'string', description: 'Alias for `text` (prefer `text`).' },
         },
-        required: ['chat_id', 'message_id', 'text'],
+        required: ['chat_id', 'message_id'],
       },
     },
     {
@@ -783,6 +791,27 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }))
 
+// FLY-239: the reply / edit_message tools carry the message body in `text`.
+// After a context compaction a model can drift to passing it as `message` (the
+// param name used by sibling SendMessage / loop-bridge tools). Previously that
+// landed in the handler with text=undefined and crashed chunk() with an opaque
+// "undefined is not an object (evaluating 'text.length')", so the Lead could
+// `react`/`edit` but never send a new reply. Accept `message` as an alias and
+// otherwise fail with a clear, actionable error. Pure / side-effect-free.
+function resolveOutboundText(
+  args: Record<string, unknown>,
+): { text: string } | { error: string } {
+  const raw = args.text ?? args.message
+  if (typeof raw !== 'string' || raw.length === 0) {
+    return {
+      error:
+        'missing required field: `text` (the message body to send). ' +
+        'Pass the body as `text` (the alias `message` is also accepted).',
+    }
+  }
+  return { text: raw }
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   // FLY-29: Any tool call with chat_id resets the idle timer, keeping typing
@@ -794,7 +823,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'reply': {
         const chat_id = args.chat_id as string
         stopTypingKeepalive(chat_id) // stop "Bot is typing..." before sending
-        const text = args.text as string
+        const resolved = resolveOutboundText(args)
+        if ('error' in resolved) {
+          return { content: [{ type: 'text', text: resolved.error }], isError: true }
+        }
+        const text = resolved.text
         const reply_to = args.reply_to as string | undefined
         const files = (args.files as string[] | undefined) ?? []
 
@@ -879,7 +912,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'edit_message': {
         const chat_id = args.chat_id as string
-        const text = args.text as string
+        const resolved = resolveOutboundText(args)
+        if ('error' in resolved) {
+          return { content: [{ type: 'text', text: resolved.error }], isError: true }
+        }
+        const text = resolved.text
         // FLY-162 Layer 2: editing a message to inject issue content at the
         // chat-channel top level is the same leak as a fresh reply — guard it.
         const guardDeny = await callReplyGuard(chat_id, text)
