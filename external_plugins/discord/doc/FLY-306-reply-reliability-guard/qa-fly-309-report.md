@@ -42,7 +42,22 @@ Negative / `NaN` / `Infinity` / string-typed `retryAfter`/`timeToReset` → clas
 
 Single in-flight chunk retry is **at-least-once**: if Discord accepted a send but the response was lost (e.g. ECONNRESET), the retry duplicates **that one chunk**. Discord's message API has no idempotency key, so exactly-once is impossible at this layer. The trade (rare visible duplicate ≫ silent message loss) is documented and matches discord.js's own network-retry semantics. Not a QA failure.
 
+## Real Discord E2E (slot 1 — added per Tadashi / Annie request)
+
+Ran the EXACT shipping reply path (#6 `sendReplyChunks` + server.ts-faithful env→retry wiring) against a **real Discord channel** using the **slot-1 test bot only** (`flywheel-test-1`, `#cos-test` `1493080991290626079`, guild `1485787271192907816`) — production bot/channel never touched. Failures injected by wrapping the real `ch.send` (throw fires before any real send → no phantom message). Verification = REST-fetch the channel back and count real messages by a per-run nonce. **Harness: `e2e-fly306-slot1.ts` (live-bot one-shot; not a CI test).**
+
+Result: **5/5 PASS** (run `mqioaa8h-ilyv`):
+
+| # | Scenario | Evidence (real channel) |
+|---|----------|-------------------------|
+| ① | Normal reply delivered | msg id `1516940226793312368`, channel count = 1 |
+| ② | Kill-switch `=0` still delivers | env→`maxRetries=0`, msg id `1516940228735270972`, count = 1 |
+| ② | Kill-switch `=0` does NOT retry a transient (reverts old fail-fast) | 1 send attempt, threw, channel count = **0** (no phantom) |
+| ③ | Transient (`RateLimitError`) → retry recovers, NO duplicate | 2 attempts (1 fail + 1 ok, **300ms Retry-After honored**), channel = **EXACTLY 1** msg id `1516940233046888519` |
+| ④ | Multi-chunk, middle chunk fails once → each chunk exactly once | 3 ids delivered; channel **A=1, B=1, C=1**; B attempts=2; head chunk NOT duplicated |
+
 ## Artifacts
 
-- `external_plugins/discord/fly306-qa-adversarial.test.ts` — 27 independent adversarial tests.
-- Baseline: `bun test` in `external_plugins/discord` → **61 pass / 0 fail / 157 expect()**.
+- `external_plugins/discord/fly306-qa-adversarial.test.ts` — 27 independent adversarial tests (on PR #6).
+- `external_plugins/discord/e2e-fly306-slot1.ts` — real-Discord E2E harness (qa/FLY-309 evidence branch only).
+- Baseline: `bun test` in `external_plugins/discord` → **61 pass / 0 fail / 157 expect()**; E2E **5/5 PASS** on `#cos-test`.
