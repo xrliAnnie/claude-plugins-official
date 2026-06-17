@@ -34,6 +34,8 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, existsSync } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
+import { parseIntInRange, type SendWithRetryOpts } from './retry'
+import { sendReplyChunks } from './reply-send'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -275,6 +277,33 @@ function defaultAccess(): Access {
 
 const MAX_CHUNK_LIMIT = 2000
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+
+// FLY-306: bounded retry for outbound sends. Defaults are conservative; each is
+// env-overridable (strict integer in range, else the default — see
+// parseIntInRange). DISCORD_REPLY_MAX_RETRIES=0 restores the old "fail on first
+// error" behaviour.
+const envInt = (name: string, fallback: number, min: number, max: number): number =>
+  parseIntInRange(process.env[name], fallback, min, max)
+const REPLY_MAX_RETRIES = envInt('DISCORD_REPLY_MAX_RETRIES', 3, 0, 10)
+const REPLY_RETRY_BASE_MS = envInt('DISCORD_REPLY_RETRY_BASE_MS', 500, 0, 60_000)
+const REPLY_RETRY_CAP_MS = envInt('DISCORD_REPLY_RETRY_CAP_MS', 8_000, 0, 120_000)
+
+const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms))
+
+const replyRetryOpts: SendWithRetryOpts = {
+  maxRetries: REPLY_MAX_RETRIES,
+  baseMs: REPLY_RETRY_BASE_MS,
+  capMs: REPLY_RETRY_CAP_MS,
+  sleep,
+  jitterRand: Math.random,
+  onRetry: ({ attempt, delayMs, err }) => {
+    const msg = err instanceof Error ? err.message : String(err)
+    process.stderr.write(
+      `discord: reply send transient failure (attempt ${attempt + 1}/${REPLY_MAX_RETRIES}), ` +
+        `retrying in ${delayMs}ms: ${msg}\n`,
+    )
+  },
+}
 
 // reply's files param takes any path. .env is ~60 bytes and ships as an
 // upload. Claude can already Read+paste file contents, so this isn't a new
@@ -852,28 +881,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
         const chunks = chunk(text, limit, mode)
-        const sentIds: string[] = []
 
-        try {
-          for (let i = 0; i < chunks.length; i++) {
-            const shouldReplyTo =
-              reply_to != null &&
-              replyMode !== 'off' &&
-              (replyMode === 'all' || i === 0)
-            const sent = await ch.send({
-              content: chunks[i],
-              ...(i === 0 && files.length > 0 ? { files } : {}),
-              ...(shouldReplyTo
-                ? { reply: { messageReference: reply_to, failIfNotExists: false } }
-                : {}),
-            })
-            noteSent(sent.id)
-            sentIds.push(sent.id)
-          }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          throw new Error(`reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`)
-        }
+        // FLY-306: send each chunk with bounded retry on transient failures.
+        // The loop advances only on a successful send, so chunks already
+        // delivered are never re-sent. A single chunk's retry is still
+        // at-least-once — if Discord accepted it but the response was lost, the
+        // retry can duplicate that one chunk; that is the accepted trade-off
+        // versus silently dropping the message. On exhaustion the thrown error
+        // steers the model to send only the missing tail, not the whole message.
+        const sentIds = await sendReplyChunks(
+          payload => ch.send(payload),
+          chunks,
+          { files, reply_to, replyMode },
+          replyRetryOpts,
+          noteSent,
+        )
 
         const result =
           sentIds.length === 1
