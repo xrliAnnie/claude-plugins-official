@@ -42,6 +42,7 @@ import {
   isRoundtableTopicThread,
   createThreadBudgetStore,
   decideTopicThreadHandling,
+  seedThreadBudget,
   type RoundtableConfig,
 } from './roundtable-thread-policy'
 
@@ -76,7 +77,17 @@ const RT_CFG: RoundtableConfig | undefined = loadRoundtableConfig(process.env)
 const rtBudget = createThreadBudgetStore()
 // threadId -> source message id for top-level messages we redirected into a
 // thread, so the reply handler can strip a cross-channel `reply_to` (R1#5).
+// Bounded (Codex code review R1 finding 4): insertion-ordered, oldest evicted past
+// the cap so a long-running Lead process can't grow it without limit.
+const RT_REDIRECT_MAX = 1000
 const rtRedirectedSource = new Map<string, string>()
+function rtRememberRedirect(threadId: string, sourceMessageId: string): void {
+  rtRedirectedSource.set(threadId, sourceMessageId)
+  if (rtRedirectedSource.size > RT_REDIRECT_MAX) {
+    const oldest = rtRedirectedSource.keys().next().value
+    if (oldest !== undefined) rtRedirectedSource.delete(oldest)
+  }
+}
 // thread ids this bot is confirmed a member of (positive cache only — a newly
 // added member is picked up by re-probing; we never cache "absent" so a lead
 // pulled in after first contact is not permanently locked out).
@@ -87,11 +98,15 @@ const RT_DISCORD_API = 'https://discord.com/api/v10'
 // Ensure the topic thread for a roundtable message exists (idempotent). Thread id ==
 // source message id (Discord "thread from message" invariant). The Bridge poller
 // normally creates it; this closes the race so the redirected reply never 404s.
+// Returns TRUE only when the thread is CONFIRMED to exist (2xx create, or the precise
+// "already has a thread" error code 160004) — Codex code review R1 finding 2: the
+// caller must NOT present an unconfirmed thread id to the agent (a 403/429/5xx/timeout
+// or an unrelated 400 would otherwise route the reply at a thread that may not exist).
 async function ensureRoundtableThread(
   parentChannelId: string,
   messageId: string,
-): Promise<void> {
-  if (!TOKEN) return
+): Promise<boolean> {
+  if (!TOKEN) return false
   try {
     const res = await fetch(
       `${RT_DISCORD_API}/channels/${parentChannelId}/messages/${messageId}/threads`,
@@ -102,12 +117,19 @@ async function ensureRoundtableThread(
         signal: AbortSignal.timeout(5000),
       },
     )
-    // 2xx = created. 400/409 "message already has a thread" (code 160004) = idempotent OK.
-    if (!res.ok && res.status !== 400 && res.status !== 409) {
-      process.stderr.write(`[roundtable] ensureThread ${messageId}: HTTP ${res.status}\n`)
+    if (res.ok) return true // created
+    // "A thread has already been created for this message" → code 160004 (idempotent OK).
+    if (res.status === 400 || res.status === 409) {
+      try {
+        const body = (await res.json()) as { code?: number }
+        if (body?.code === 160004) return true
+      } catch {}
     }
+    process.stderr.write(`[roundtable] ensureThread ${messageId}: HTTP ${res.status} (unconfirmed)\n`)
+    return false
   } catch (e) {
     process.stderr.write(`[roundtable] ensureThread ${messageId} failed: ${e}\n`)
+    return false
   }
 }
 
@@ -1317,10 +1339,18 @@ async function handleInbound(msg: Message): Promise<void> {
       RT_CFG,
     )
     if (routed.routedToThread && routed.sourceMessageId) {
-      await ensureRoundtableThread(msg.channelId, routed.sourceMessageId)
-      chat_id = routed.chatId
-      // Remember the source so the reply handler can strip a cross-channel reply_to.
-      rtRedirectedSource.set(chat_id, routed.sourceMessageId)
+      // Only present the topic thread id to the agent once the thread is CONFIRMED to
+      // exist (R1 finding 2) — otherwise the redirected reply could 404. On failure we
+      // leave chat_id at the parent (the message is still answerable there).
+      const confirmed = await ensureRoundtableThread(msg.channelId, routed.sourceMessageId)
+      if (confirmed) {
+        chat_id = routed.chatId
+        // Remember the source so the reply handler can strip a cross-channel reply_to.
+        rtRememberRedirect(chat_id, routed.sourceMessageId)
+        // Engaging a NEW top-level topic is a budget reset event (R1#1): seed N so the
+        // in-thread continuation that follows has budget. Bot triggers never seed.
+        if (RT_CFG.autoContinue) seedThreadBudget(rtBudget, chat_id, RT_CFG.budgetN)
+      }
     }
   }
 

@@ -102,6 +102,21 @@ export function createThreadBudgetStore(): ThreadBudgetStore {
 	return { budgets: new Map() };
 }
 
+/**
+ * Seed (reset) a thread's bot-only budget to N. Called ONLY on a genuine reset event:
+ * a new top-level topic the Lead engages (its reply is routed into the thread) or a
+ * non-bot human message. A bot-authored trigger must NEVER seed — see
+ * decideTopicThreadHandling (Codex code review R1#1): a missing entry on a bot trigger
+ * means "exhausted/drop", so process restart / state loss is NOT an implicit reset.
+ */
+export function seedThreadBudget(
+	store: ThreadBudgetStore,
+	threadId: string,
+	budgetN: number,
+): void {
+	store.budgets.set(threadId, budgetN);
+}
+
 export interface TopicThreadHandlingInput {
 	threadId: string;
 	/** Message author is THIS bot. */
@@ -154,8 +169,11 @@ export function decideTopicThreadHandling(
 
 	// (4) member bot trigger → strictly budget-gated. An explicit <@bot> / quote-reply
 	//     from a bot does NOT bypass or reset the budget; it consumes it like any other
-	//     bot trigger. When the budget is exhausted we stop — only a human/reset revives.
-	const remaining = store.budgets.get(input.threadId) ?? cfg.budgetN;
+	//     bot trigger. A MISSING entry means "exhausted" (NOT a fresh budget) — the
+	//     budget is seeded only on a new top-level topic engage or a human message
+	//     (Codex code review R1#1), so process restart / state loss falls on the safe
+	//     side (the thread returns to mention-required until a human/new-topic reset).
+	const remaining = store.budgets.get(input.threadId) ?? 0;
 	if (remaining > 0) {
 		store.budgets.set(input.threadId, remaining - 1);
 		return { handle: true };

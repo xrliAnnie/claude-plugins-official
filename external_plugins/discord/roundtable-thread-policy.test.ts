@@ -14,6 +14,7 @@ import {
 	resolveRoundtableInboundChatId,
 	createThreadBudgetStore,
 	decideTopicThreadHandling,
+	seedThreadBudget,
 	type RoundtableConfig,
 } from "./roundtable-thread-policy";
 
@@ -119,10 +120,17 @@ describe("decideTopicThreadHandling — self-skip & membership fail-closed", () 
 });
 
 describe("decideTopicThreadHandling — bounded bot-only budget (Codex R1#1 core)", () => {
-	test("member bot message (no @) consumes budget; stops after N", () => {
+	test("UNSEEDED thread: a bot trigger drops (missing budget = exhausted, NOT a reset)", () => {
 		const store = createThreadBudgetStore();
+		// No seed (e.g. after a process restart) → a bot trigger must NOT get fresh budget.
+		const input = { threadId: "T", authorIsSelf: false, authorIsBot: true, isExplicitMention: true, authorIsHuman: false, isMember: true };
+		expect(decideTopicThreadHandling(input, store, cfgOn).handle).toBe(false);
+	});
+
+	test("seeded thread: member bot message (no @) consumes budget; stops after N", () => {
+		const store = createThreadBudgetStore();
+		seedThreadBudget(store, "T", cfgOn.budgetN); // new top-level topic engage
 		const input = { threadId: "T", authorIsSelf: false, authorIsBot: true, isExplicitMention: false, authorIsHuman: false, isMember: true };
-		// budgetN=2 → 2 auto-continues then stop
 		expect(decideTopicThreadHandling(input, store, cfgOn).handle).toBe(true);
 		expect(decideTopicThreadHandling(input, store, cfgOn).handle).toBe(true);
 		expect(decideTopicThreadHandling(input, store, cfgOn).handle).toBe(false); // budget exhausted
@@ -130,6 +138,7 @@ describe("decideTopicThreadHandling — bounded bot-only budget (Codex R1#1 core
 
 	test("bot @-mention does NOT bypass/reset budget — still consumes, still stops", () => {
 		const store = createThreadBudgetStore();
+		seedThreadBudget(store, "T", cfgOn.budgetN);
 		// bot author WITH explicit mention of us — must still be budget-gated
 		const input = { threadId: "T", authorIsSelf: false, authorIsBot: true, isExplicitMention: true, authorIsHuman: false, isMember: true };
 		expect(decideTopicThreadHandling(input, store, cfgOn).handle).toBe(true);
@@ -139,11 +148,12 @@ describe("decideTopicThreadHandling — bounded bot-only budget (Codex R1#1 core
 
 	test("non-bot HUMAN message resets budget; bot can continue again", () => {
 		const store = createThreadBudgetStore();
+		seedThreadBudget(store, "T", cfgOn.budgetN);
 		const bot = { threadId: "T", authorIsSelf: false, authorIsBot: true, isExplicitMention: false, authorIsHuman: false, isMember: true };
 		decideTopicThreadHandling(bot, store, cfgOn); // 2→1
 		decideTopicThreadHandling(bot, store, cfgOn); // 1→0
 		expect(decideTopicThreadHandling(bot, store, cfgOn).handle).toBe(false); // exhausted
-		// human (non-bot) speaks → reset
+		// human (non-bot) speaks → reset (a real reset event, unlike a missing entry)
 		const human = { threadId: "T", authorIsSelf: false, authorIsBot: false, isExplicitMention: false, authorIsHuman: true, isMember: true };
 		decideTopicThreadHandling(human, store, cfgOn);
 		// bot can continue again for N more
@@ -151,19 +161,22 @@ describe("decideTopicThreadHandling — bounded bot-only budget (Codex R1#1 core
 	});
 
 	test("2-bot adversarial: A and B always @ each other → total auto-continues bounded, then stops", () => {
-		// Simulate THIS bot (A) receiving B's messages, B always @-mentions A.
+		// Topic seeded ONCE (started once); then THIS bot (A) receives B's messages,
+		// B always @-mentions A. Bounded by budgetN regardless of how many B sends.
 		const store = createThreadBudgetStore();
+		seedThreadBudget(store, "T", cfgOn.budgetN);
 		const fromB = { threadId: "T", authorIsSelf: false, authorIsBot: true, isExplicitMention: true, authorIsHuman: false, isMember: true };
 		let handled = 0;
 		for (let i = 0; i < 50; i++) {
 			if (decideTopicThreadHandling(fromB, store, cfgOn).handle) handled++;
 		}
-		// bounded by budgetN regardless of how many times B mentions A
 		expect(handled).toBe(cfgOn.budgetN);
 	});
 
 	test("per-thread isolation: budget is independent per thread", () => {
 		const store = createThreadBudgetStore();
+		seedThreadBudget(store, "T1", cfgOn.budgetN);
+		seedThreadBudget(store, "T2", cfgOn.budgetN);
 		const bot = (tid: string) => ({ threadId: tid, authorIsSelf: false, authorIsBot: true, isExplicitMention: false, authorIsHuman: false, isMember: true });
 		decideTopicThreadHandling(bot("T1"), store, cfgOn); // T1: 2→1
 		decideTopicThreadHandling(bot("T1"), store, cfgOn); // T1: 1→0
