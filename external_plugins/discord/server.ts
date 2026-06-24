@@ -36,6 +36,15 @@ import { homedir } from 'os'
 import { join, sep } from 'path'
 import { parseIntInRange, type SendWithRetryOpts } from './retry'
 import { sendReplyChunks } from './reply-send'
+import {
+  loadRoundtableConfig,
+  resolveRoundtableInboundChatId,
+  isRoundtableTopicThread,
+  createThreadBudgetStore,
+  decideTopicThreadHandling,
+  seedThreadBudget,
+  type RoundtableConfig,
+} from './roundtable-thread-policy'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -55,6 +64,99 @@ try {
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN
 const STATIC = process.env.DISCORD_ACCESS_MODE === 'static'
+
+// ──────────────────────────────────────────────────────────────────────
+// FLY-314 Phase 2 Part(b) — roundtable per-topic reply-in-thread.
+// All routing/anti-loop DECISIONS live in the pure, unit-tested
+// ./roundtable-thread-policy module; this file only does the Discord I/O.
+// RT_CFG is undefined (feature OFF / byte-compat) unless the roundtable
+// channel id is configured.
+// ──────────────────────────────────────────────────────────────────────
+const RT_CFG: RoundtableConfig | undefined = loadRoundtableConfig(process.env)
+// Per-thread bot-only continuation budget (process-local; cleared on restart).
+const rtBudget = createThreadBudgetStore()
+// threadId -> source message id for top-level messages we redirected into a
+// thread, so the reply handler can strip a cross-channel `reply_to` (R1#5).
+// Bounded (Codex code review R1 finding 4): insertion-ordered, oldest evicted past
+// the cap so a long-running Lead process can't grow it without limit.
+const RT_REDIRECT_MAX = 1000
+const rtRedirectedSource = new Map<string, string>()
+function rtRememberRedirect(threadId: string, sourceMessageId: string): void {
+  rtRedirectedSource.set(threadId, sourceMessageId)
+  if (rtRedirectedSource.size > RT_REDIRECT_MAX) {
+    const oldest = rtRedirectedSource.keys().next().value
+    if (oldest !== undefined) rtRedirectedSource.delete(oldest)
+  }
+}
+// thread ids this bot is confirmed a member of (positive cache only — a newly
+// added member is picked up by re-probing; we never cache "absent" so a lead
+// pulled in after first contact is not permanently locked out).
+const rtMemberThreads = new Set<string>()
+
+const RT_DISCORD_API = 'https://discord.com/api/v10'
+
+// Ensure the topic thread for a roundtable message exists (idempotent). Thread id ==
+// source message id (Discord "thread from message" invariant). The Bridge poller
+// normally creates it; this closes the race so the redirected reply never 404s.
+// Returns TRUE only when the thread is CONFIRMED to exist (2xx create, or the precise
+// "already has a thread" error code 160004) — Codex code review R1 finding 2: the
+// caller must NOT present an unconfirmed thread id to the agent (a 403/429/5xx/timeout
+// or an unrelated 400 would otherwise route the reply at a thread that may not exist).
+async function ensureRoundtableThread(
+  parentChannelId: string,
+  messageId: string,
+): Promise<boolean> {
+  if (!TOKEN) return false
+  try {
+    const res = await fetch(
+      `${RT_DISCORD_API}/channels/${parentChannelId}/messages/${messageId}/threads`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bot ${TOKEN}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Roundtable topic', auto_archive_duration: 4320 }),
+        signal: AbortSignal.timeout(5000),
+      },
+    )
+    if (res.ok) return true // created
+    // "A thread has already been created for this message" → code 160004 (idempotent OK).
+    if (res.status === 400 || res.status === 409) {
+      try {
+        const body = (await res.json()) as { code?: number }
+        if (body?.code === 160004) return true
+      } catch {}
+    }
+    process.stderr.write(`[roundtable] ensureThread ${messageId}: HTTP ${res.status} (unconfirmed)\n`)
+    return false
+  } catch (e) {
+    process.stderr.write(`[roundtable] ensureThread ${messageId} failed: ${e}\n`)
+    return false
+  }
+}
+
+// Fail-closed membership probe for the no-@ continuation gate. 200 => member,
+// 404 => absent, anything else (timeout/5xx/network) => undefined = unknown, and
+// the caller must NOT relax mention-gating (treat as not a member).
+async function isRoundtableThreadMember(
+  threadId: string,
+  botUserId: string,
+): Promise<boolean | undefined> {
+  if (rtMemberThreads.has(threadId)) return true
+  if (!TOKEN) return undefined
+  try {
+    const res = await fetch(
+      `${RT_DISCORD_API}/channels/${threadId}/thread-members/${botUserId}`,
+      { headers: { Authorization: `Bot ${TOKEN}` }, signal: AbortSignal.timeout(5000) },
+    )
+    if (res.status === 200) {
+      rtMemberThreads.add(threadId)
+      return true
+    }
+    if (res.status === 404) return false
+    return undefined // unknown → fail-closed
+  } catch {
+    return undefined
+  }
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // FLY-162 Layer 2 — preventive routing guard (Flywheel fork addition)
@@ -104,7 +206,11 @@ interface GuardDeny {
   guidance?: string
 }
 
-async function callReplyGuard(chatId: string, text: string): Promise<GuardDeny | null> {
+async function callReplyGuard(
+  chatId: string,
+  text: string,
+  opts?: { roundtableThread?: boolean },
+): Promise<GuardDeny | null> {
   const bridgeUrl = process.env.BRIDGE_URL
   const apiToken = process.env.TEAMLEAD_API_TOKEN
   const leadId = process.env.LEAD_ID
@@ -161,6 +267,17 @@ async function callReplyGuard(chatId: string, text: string): Promise<GuardDeny |
     if (isCoreChannel(chatId)) {
       process.stderr.write(
         `[reply-guard] Bridge unavailable (${msg}); fail-open on core channel (FLY-173)\n`,
+      )
+      return null
+    }
+    // FLY-314 R1#3: a roundtable topic thread is also fail-open — its discussion
+    // legitimately carries FLY/GEO ids and a transient Bridge outage must not block
+    // it. Same shape as the core-channel exemption; healthy path stays
+    // Bridge-authoritative (the Bridge classifies an unregistered roundtable thread
+    // as "other" → allow), so this only matters in the Bridge-unavailable catch path.
+    if (opts?.roundtableThread) {
+      process.stderr.write(
+        `[reply-guard] Bridge unavailable (${msg}); fail-open on roundtable topic thread (FLY-314)\n`,
       )
       return null
     }
@@ -501,6 +618,41 @@ async function gate(msg: Message): Promise<GateResult> {
   if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
     return { action: 'drop' }
   }
+  // FLY-314 Part(b): inside a roundtable TOPIC THREAD, members may continue the
+  // discussion WITHOUT being @-mentioned, bounded by the anti-loop budget. ALL
+  // decision logic (incl "bot @ consumes budget, never bypasses") is in the pure
+  // policy module. RT_CFG unset OR autoContinue off → falls back to mention-required
+  // (byte-compat: roundtable policy is requireMention=true).
+  if (
+    RT_CFG &&
+    msg.channel.isThread() &&
+    isRoundtableTopicThread(
+      { isThread: true, parentId: msg.channel.parentId ?? null },
+      RT_CFG,
+    )
+  ) {
+    const threadId = msg.channelId
+    const botUserId = client.user?.id ?? ''
+    const authorIsBot = msg.author.bot
+    const mentioned = await isMentioned(msg, access.mentionPatterns)
+    const isMember = RT_CFG.autoContinue
+      ? await isRoundtableThreadMember(threadId, botUserId)
+      : undefined
+    const decision = decideTopicThreadHandling(
+      {
+        threadId,
+        authorIsSelf: msg.author.id === botUserId,
+        authorIsBot,
+        authorIsHuman: !authorIsBot,
+        isExplicitMention: mentioned,
+        isMember,
+      },
+      rtBudget,
+      RT_CFG,
+    )
+    return decision.handle ? { action: 'deliver', access } : { action: 'drop' }
+  }
+
   if (requireMention && !(await isMentioned(msg, access.mentionPatterns))) {
     return { action: 'drop' }
   }
@@ -857,11 +1009,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           return { content: [{ type: 'text', text: resolved.error }], isError: true }
         }
         const text = resolved.text
-        const reply_to = args.reply_to as string | undefined
+        let reply_to = args.reply_to as string | undefined
         const files = (args.files as string[] | undefined) ?? []
 
+        // FLY-314 R1#5: when a top-level roundtable message was redirected into its
+        // topic thread, a reply_to pointing at the ORIGINAL parent-channel source
+        // message is a cross-channel reference that Discord rejects. Strip it — post
+        // into the thread without a quote-reply.
+        if (reply_to && rtRedirectedSource.get(chat_id) === reply_to) {
+          reply_to = undefined
+        }
+
         // FLY-162 Layer 2: deny issue content posted at the chat-channel top level.
-        const guardDeny = await callReplyGuard(chat_id, text)
+        // FLY-314 R1#3: a roundtable topic thread is an explicit fail-open class (like
+        // the FLY-173 core-channel) so a transient Bridge outage cannot block in-thread
+        // discussion that naturally carries FLY/GEO issue ids.
+        const guardDeny = await callReplyGuard(chat_id, text, {
+          roundtableThread:
+            !!RT_CFG &&
+            (rtRedirectedSource.has(chat_id) || rtMemberThreads.has(chat_id)),
+        })
         if (guardDeny) return guardDenyResult(guardDeny)
 
         const ch = await fetchAllowedChannel(chat_id)
@@ -1155,7 +1322,37 @@ async function handleInbound(msg: Message): Promise<void> {
     return
   }
 
-  const chat_id = msg.channelId
+  // FLY-314 Part(b): a top-level message in the roundtable parent is delivered with
+  // chat_id rewritten to its topic thread (thread id == message id), so the agent's
+  // reply lands INSIDE the thread, not flat in the parent. Ensure the thread exists
+  // first (idempotent; closes the race with the Bridge poller). Other channels / a
+  // message already inside a thread / feature off → chat_id unchanged (byte-compat).
+  let chat_id = msg.channelId
+  if (RT_CFG) {
+    const routed = resolveRoundtableInboundChatId(
+      {
+        channelId: msg.channelId,
+        messageId: msg.id,
+        isThread: msg.channel.isThread(),
+        parentId: msg.channel.isThread() ? msg.channel.parentId ?? null : null,
+      },
+      RT_CFG,
+    )
+    if (routed.routedToThread && routed.sourceMessageId) {
+      // Only present the topic thread id to the agent once the thread is CONFIRMED to
+      // exist (R1 finding 2) — otherwise the redirected reply could 404. On failure we
+      // leave chat_id at the parent (the message is still answerable there).
+      const confirmed = await ensureRoundtableThread(msg.channelId, routed.sourceMessageId)
+      if (confirmed) {
+        chat_id = routed.chatId
+        // Remember the source so the reply handler can strip a cross-channel reply_to.
+        rtRememberRedirect(chat_id, routed.sourceMessageId)
+        // Engaging a NEW top-level topic is a budget reset event (R1#1): seed N so the
+        // in-thread continuation that follows has budget. Bot triggers never seed.
+        if (RT_CFG.autoContinue) seedThreadBudget(rtBudget, chat_id, RT_CFG.budgetN)
+      }
+    }
+  }
 
   if (msg.channel.type === ChannelType.DM) {
     dmChannelUsers.set(chat_id, msg.author.id)
