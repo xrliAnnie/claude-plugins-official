@@ -15,6 +15,8 @@ import {
 	createThreadBudgetStore,
 	decideTopicThreadHandling,
 	seedThreadBudget,
+	classifyThreadCreate,
+	threadGetConfirmsExistence,
 	type RoundtableConfig,
 } from "./roundtable-thread-policy";
 
@@ -27,16 +29,46 @@ const cfgOn: RoundtableConfig = {
 };
 
 describe("loadRoundtableConfig", () => {
-	test("unset → undefined (byte-compat OFF)", () => {
+	test("nothing set (no env channel, no routing) → undefined (byte-compat OFF)", () => {
 		expect(loadRoundtableConfig({})).toBeUndefined();
+		expect(loadRoundtableConfig({}, {})).toBeUndefined();
 	});
-	test("channel id without reply-in-thread → reply routing off", () => {
+	test("FLY-569: env channel id without reply flag → reply routing DEFAULT-ON", () => {
 		const c = loadRoundtableConfig({ FLYWHEEL_ROUNDTABLE_CHANNEL_ID: RT });
 		expect(c?.channelId).toBe(RT);
+		expect(c?.replyInThread).toBe(true); // was false pre-FLY-569 — now default-on
+		expect(c?.autoContinue).toBe(false); // anti-loop stays default-off
+	});
+	test("FLY-569: explicit opt-out REPLY_IN_THREAD=0 → reply routing OFF", () => {
+		const c = loadRoundtableConfig({
+			FLYWHEEL_ROUNDTABLE_CHANNEL_ID: RT,
+			FLYWHEEL_ROUNDTABLE_REPLY_IN_THREAD: "0",
+		});
+		expect(c?.channelId).toBe(RT);
 		expect(c?.replyInThread).toBe(false);
+	});
+	test("FLY-569: routing channel only (env empty) → channelId from routing + default-on (Belle path)", () => {
+		const c = loadRoundtableConfig({}, { channelId: RT });
+		expect(c?.channelId).toBe(RT);
+		expect(c?.replyInThread).toBe(true);
 		expect(c?.autoContinue).toBe(false);
 	});
-	test("full enable", () => {
+	test("FLY-569: routing channel + explicit opt-out → OFF", () => {
+		const c = loadRoundtableConfig(
+			{ FLYWHEEL_ROUNDTABLE_REPLY_IN_THREAD: "0" },
+			{ channelId: RT },
+		);
+		expect(c?.channelId).toBe(RT);
+		expect(c?.replyInThread).toBe(false);
+	});
+	test("FLY-569: env channel wins over routing channel", () => {
+		const c = loadRoundtableConfig(
+			{ FLYWHEEL_ROUNDTABLE_CHANNEL_ID: RT },
+			{ channelId: "999999999999999999" },
+		);
+		expect(c?.channelId).toBe(RT); // env wins
+	});
+	test("full enable (explicit =1 still works)", () => {
 		const c = loadRoundtableConfig({
 			FLYWHEEL_ROUNDTABLE_CHANNEL_ID: RT,
 			FLYWHEEL_ROUNDTABLE_REPLY_IN_THREAD: "1",
@@ -45,10 +77,41 @@ describe("loadRoundtableConfig", () => {
 		expect(c?.replyInThread).toBe(true);
 		expect(c?.autoContinue).toBe(true);
 	});
-	test("reply-in-thread set but no channel id → undefined (can't identify roundtable)", () => {
+	test("reply flag set but no channel id anywhere → undefined (can't identify roundtable)", () => {
 		expect(
 			loadRoundtableConfig({ FLYWHEEL_ROUNDTABLE_REPLY_IN_THREAD: "1" }),
 		).toBeUndefined();
+		expect(
+			loadRoundtableConfig({ FLYWHEEL_ROUNDTABLE_REPLY_IN_THREAD: "1" }, {}),
+		).toBeUndefined();
+	});
+});
+
+describe("classifyThreadCreate / threadGetConfirmsExistence (FLY-569 R1#2)", () => {
+	test("2xx create → created", () => {
+		expect(classifyThreadCreate(201)).toBe("created");
+		expect(classifyThreadCreate(200)).toBe("created");
+	});
+	test("400/409 with code 160004 (already has thread) → exists", () => {
+		expect(classifyThreadCreate(400, 160004)).toBe("exists");
+		expect(classifyThreadCreate(409, 160004)).toBe("exists");
+	});
+	test("403/404/429/5xx → confirm-via-get (maybe host/Bridge already created it)", () => {
+		expect(classifyThreadCreate(403)).toBe("confirm-via-get");
+		expect(classifyThreadCreate(404)).toBe("confirm-via-get");
+		expect(classifyThreadCreate(429)).toBe("confirm-via-get");
+		expect(classifyThreadCreate(500)).toBe("confirm-via-get");
+		expect(classifyThreadCreate(503)).toBe("confirm-via-get");
+	});
+	test("other 4xx (e.g. 400 without 160004) → failed", () => {
+		expect(classifyThreadCreate(400)).toBe("failed");
+		expect(classifyThreadCreate(401)).toBe("failed");
+	});
+	test("threadGetConfirmsExistence: only 200 confirms", () => {
+		expect(threadGetConfirmsExistence(200)).toBe(true);
+		expect(threadGetConfirmsExistence(404)).toBe(false);
+		expect(threadGetConfirmsExistence(403)).toBe(false);
+		expect(threadGetConfirmsExistence(500)).toBe(false);
 	});
 });
 
