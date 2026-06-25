@@ -28,14 +28,27 @@ export interface RoundtableConfig {
 	budgetN: number;
 }
 
-/** Parse the roundtable env. Returns undefined (feature OFF / byte-compat) when the
- * roundtable channel id is not configured — the plugin then behaves exactly as before. */
+/** Parse the roundtable config. Returns undefined (feature OFF / byte-compat) when no
+ * roundtable channel id is resolvable from either source — the plugin then behaves
+ * exactly as before (vanilla non-Flywheel installs are unaffected).
+ *
+ * FLY-569: `routing` carries a SHARED NON-TOKEN default (the channel id read from
+ * ~/.flywheel/roundtable.json by server.ts). `env` still WINS — wrapper-launched
+ * dept leads + the QA Room keep their exact behavior. reply-in-thread is now
+ * DEFAULT-ON whenever a channel is resolved (opt-out only via explicit "0"), so
+ * token-isolated companion leads (Belle/atlas/rafiki) — which never set the env —
+ * reply into the thread without any per-lead config. `autoContinue` is UNCHANGED
+ * (still explicit "1", default-off) to preserve the FLY-220/FLY-314 anti-loop. */
 export function loadRoundtableConfig(
 	env: Record<string, string | undefined>,
+	routing?: { channelId?: string },
 ): RoundtableConfig | undefined {
-	const channelId = (env.FLYWHEEL_ROUNDTABLE_CHANNEL_ID ?? "").trim();
+	const channelId =
+		(env.FLYWHEEL_ROUNDTABLE_CHANNEL_ID ?? "").trim() ||
+		(routing?.channelId ?? "").trim();
 	if (!channelId) return undefined;
-	const replyInThread = env.FLYWHEEL_ROUNDTABLE_REPLY_IN_THREAD === "1";
+	// DEFAULT-ON: on unless explicitly disabled with "0" (was: required "1").
+	const replyInThread = env.FLYWHEEL_ROUNDTABLE_REPLY_IN_THREAD !== "0";
 	const autoContinue = env.FLYWHEEL_ROUNDTABLE_THREAD_AUTOCONTINUE === "1";
 	const rawN = Number.parseInt(
 		(env.FLYWHEEL_ROUNDTABLE_THREAD_BUDGET ?? "").trim(),
@@ -43,6 +56,37 @@ export function loadRoundtableConfig(
 	);
 	const budgetN = Number.isFinite(rawN) && rawN > 0 ? rawN : 2;
 	return { channelId, replyInThread, autoContinue, budgetN };
+}
+
+/**
+ * FLY-569 R1#2 — classify the POST .../threads create response (PURE).
+ *
+ * An independently-launched companion bot may have View/Send in the roundtable
+ * parent but NOT `Create Public Threads`. The FLY-314 auto-thread manager / host
+ * bot creates the topic thread; a member bot only needs to send into it. So a
+ * failed create is NOT necessarily fatal — the thread may already exist. The
+ * server orchestrates: created/exists → route into the thread; confirm-via-get →
+ * GET the thread (id == message id) with a bounded retry for the manager race;
+ * failed → fall back to the parent channel (the prior safe behavior).
+ */
+export function classifyThreadCreate(
+	status: number,
+	bodyCode?: number,
+): "created" | "exists" | "confirm-via-get" | "failed" {
+	if (status >= 200 && status < 300) return "created";
+	// "A thread has already been created for this message" → code 160004.
+	if ((status === 400 || status === 409) && bodyCode === 160004) return "exists";
+	// 403 (no create perm), 404 (race / not yet), 429 (rate limited), 5xx (transient)
+	// → the thread may still exist (host/Bridge made it); confirm via GET.
+	if (status === 403 || status === 404 || status === 429 || status >= 500)
+		return "confirm-via-get";
+	return "failed"; // other 4xx (e.g. 400 without 160004) → real failure.
+}
+
+/** FLY-569 R1#2 — a GET /channels/{threadId} that returns 200 confirms the thread
+ * exists; anything else does not (PURE). */
+export function threadGetConfirmsExistence(status: number): boolean {
+	return status === 200;
 }
 
 export interface InboundChannelInfo {

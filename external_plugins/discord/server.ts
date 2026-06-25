@@ -43,8 +43,11 @@ import {
   createThreadBudgetStore,
   decideTopicThreadHandling,
   seedThreadBudget,
+  classifyThreadCreate,
+  threadGetConfirmsExistence,
   type RoundtableConfig,
 } from './roundtable-thread-policy'
+import { loadSharedRoundtableRouting } from './roundtable-shared-routing'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -70,9 +73,19 @@ const STATIC = process.env.DISCORD_ACCESS_MODE === 'static'
 // All routing/anti-loop DECISIONS live in the pure, unit-tested
 // ./roundtable-thread-policy module; this file only does the Discord I/O.
 // RT_CFG is undefined (feature OFF / byte-compat) unless the roundtable
-// channel id is configured.
+// channel id is resolvable.
+//
+// FLY-569 — reply-in-thread is now DEFAULT-ON for ALL Claude leads (incl.
+// token-isolated companion daemons like Belle/atlas/rafiki, which `unset` the
+// Flywheel env). The roundtable channel id is resolved from a SHARED NON-TOKEN
+// file (~/.flywheel/roundtable.json, channelId only) when the per-lead env does
+// not set it — env still WINS so wrapper leads + the QA Room are unchanged, and
+// a vanilla install with no file/env stays OFF. NO token is ever re-injected.
 // ──────────────────────────────────────────────────────────────────────
-const RT_CFG: RoundtableConfig | undefined = loadRoundtableConfig(process.env)
+const RT_CFG: RoundtableConfig | undefined = loadRoundtableConfig(
+  process.env,
+  loadSharedRoundtableRouting(),
+)
 // Per-thread bot-only continuation budget (process-local; cleared on restart).
 const rtBudget = createThreadBudgetStore()
 // threadId -> source message id for top-level messages we redirected into a
@@ -95,18 +108,46 @@ const rtMemberThreads = new Set<string>()
 
 const RT_DISCORD_API = 'https://discord.com/api/v10'
 
-// Ensure the topic thread for a roundtable message exists (idempotent). Thread id ==
-// source message id (Discord "thread from message" invariant). The Bridge poller
-// normally creates it; this closes the race so the redirected reply never 404s.
-// Returns TRUE only when the thread is CONFIRMED to exist (2xx create, or the precise
-// "already has a thread" error code 160004) — Codex code review R1 finding 2: the
-// caller must NOT present an unconfirmed thread id to the agent (a 403/429/5xx/timeout
-// or an unrelated 400 would otherwise route the reply at a thread that may not exist).
+// FLY-569 R1#2 — GET-confirm bounded retry. A companion Claude lead (Belle/atlas)
+// may have View/Send in the roundtable parent but NOT `Create Public Threads`; the
+// FLY-314 auto-thread manager / host bot creates the topic thread and a member bot
+// only needs to send into it. So a failed create is not necessarily fatal — confirm
+// the thread (id == message id) exists with a short bounded retry for the race.
+const RT_GET_CONFIRM_RETRIES = 3
+const RT_GET_CONFIRM_DELAY_MS = 400
+
+// GET /channels/{threadId}: 200 confirms the thread exists. Anything else (or a
+// network error) → not confirmed.
+async function roundtableThreadExists(threadId: string): Promise<boolean> {
+  if (!TOKEN) return false
+  try {
+    const res = await fetch(`${RT_DISCORD_API}/channels/${threadId}`, {
+      headers: { Authorization: `Bot ${TOKEN}` },
+      signal: AbortSignal.timeout(5000),
+    })
+    return threadGetConfirmsExistence(res.status)
+  } catch {
+    return false
+  }
+}
+
+// Ensure the topic thread for a roundtable message exists, or CONFIRM an already-
+// created one (idempotent). Thread id == source message id (Discord "thread from
+// message" invariant). Returns TRUE only when the thread is CONFIRMED to exist —
+// Codex code review (FLY-314 R1#2): the caller must NOT present an unconfirmed
+// thread id to the agent. Confirmation paths:
+//   - this bot created it (2xx), or it already had one (code 160004);
+//   - FLY-569 R1#2: create was denied/raced (403/404/429/5xx/network) BUT a host
+//     bot / the Bridge manager created it and GET /channels/{messageId} confirms it
+//     (bounded retry). Otherwise FALSE → caller keeps the parent channel (prior
+//     safe fallback).
 async function ensureRoundtableThread(
   parentChannelId: string,
   messageId: string,
 ): Promise<boolean> {
   if (!TOKEN) return false
+  let createStatus = 0 // 0 = network/timeout on create → treat as "maybe exists"
+  let createCode: number | undefined
   try {
     const res = await fetch(
       `${RT_DISCORD_API}/channels/${parentChannelId}/messages/${messageId}/threads`,
@@ -117,20 +158,36 @@ async function ensureRoundtableThread(
         signal: AbortSignal.timeout(5000),
       },
     )
-    if (res.ok) return true // created
-    // "A thread has already been created for this message" → code 160004 (idempotent OK).
+    createStatus = res.status
     if (res.status === 400 || res.status === 409) {
       try {
         const body = (await res.json()) as { code?: number }
-        if (body?.code === 160004) return true
+        createCode = body?.code
       } catch {}
     }
-    process.stderr.write(`[roundtable] ensureThread ${messageId}: HTTP ${res.status} (unconfirmed)\n`)
-    return false
   } catch (e) {
-    process.stderr.write(`[roundtable] ensureThread ${messageId} failed: ${e}\n`)
+    process.stderr.write(`[roundtable] ensureThread ${messageId} create error: ${e}\n`)
+    createStatus = 0
+  }
+
+  const outcome =
+    createStatus === 0 ? 'confirm-via-get' : classifyThreadCreate(createStatus, createCode)
+  if (outcome === 'created' || outcome === 'exists') return true
+  if (outcome === 'failed') {
+    process.stderr.write(`[roundtable] ensureThread ${messageId}: HTTP ${createStatus} (unconfirmed)\n`)
     return false
   }
+  // confirm-via-get: poll for a host/Bridge-created thread with a bounded retry.
+  for (let i = 0; i < RT_GET_CONFIRM_RETRIES; i++) {
+    if (await roundtableThreadExists(messageId)) return true
+    if (i < RT_GET_CONFIRM_RETRIES - 1) {
+      await new Promise((r) => setTimeout(r, RT_GET_CONFIRM_DELAY_MS))
+    }
+  }
+  process.stderr.write(
+    `[roundtable] ensureThread ${messageId}: create HTTP ${createStatus}, GET-confirm exhausted (unconfirmed)\n`,
+  )
+  return false
 }
 
 // Fail-closed membership probe for the no-@ continuation gate. 200 => member,
