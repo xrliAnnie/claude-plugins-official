@@ -43,6 +43,7 @@ import {
   createThreadBudgetStore,
   decideTopicThreadHandling,
   seedThreadBudget,
+  shouldProbeTopicThreadMembership,
   classifyThreadCreate,
   threadGetConfirmsExistence,
   type RoundtableConfig,
@@ -692,7 +693,14 @@ async function gate(msg: Message): Promise<GateResult> {
     const botUserId = client.user?.id ?? ''
     const authorIsBot = msg.author.bot
     const mentioned = await isMentioned(msg, access.mentionPatterns)
-    const isMember = RT_CFG.autoContinue
+    // FLY-576: probe membership whenever it can affect the decision — not only when
+    // autoContinue is on (the founder's non-@ relaxation needs it). Pure predicate keeps the
+    // only logic testable; this call site is thin glue.
+    const isMember = shouldProbeTopicThreadMembership({
+      authorIsBot,
+      isExplicitMention: mentioned,
+      autoContinue: RT_CFG.autoContinue,
+    })
       ? await isRoundtableThreadMember(threadId, botUserId)
       : undefined
     const decision = decideTopicThreadHandling(

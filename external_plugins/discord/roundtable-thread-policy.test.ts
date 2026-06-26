@@ -15,6 +15,7 @@ import {
 	createThreadBudgetStore,
 	decideTopicThreadHandling,
 	seedThreadBudget,
+	shouldProbeTopicThreadMembership,
 	classifyThreadCreate,
 	threadGetConfirmsExistence,
 	type RoundtableConfig,
@@ -258,5 +259,85 @@ describe("decideTopicThreadHandling — bounded bot-only budget (Codex R1#1 core
 		expect(
 			decideTopicThreadHandling({ threadId: "T", authorIsSelf: false, authorIsBot: true, isExplicitMention: true, authorIsHuman: false, isMember: true }, store, cfg).handle,
 		).toBe(true);
+	});
+});
+
+describe("decideTopicThreadHandling — FLY-576 non-bot (founder) relaxation, DEFAULT-ON", () => {
+	const cfgOff = { ...cfgOn, autoContinue: false }; // production: reply-in-thread on, autoContinue off
+
+	test("human MEMBER, no @, autoContinue OFF → handle (THE FIX: founder surfaces without @)", () => {
+		const store = createThreadBudgetStore();
+		const d = decideTopicThreadHandling(
+			{ threadId: "T", authorIsSelf: false, authorIsBot: false, authorIsHuman: true, isExplicitMention: false, isMember: true },
+			store,
+			cfgOff,
+		);
+		expect(d.handle).toBe(true);
+	});
+
+	test("human NON-member, no @, autoContinue OFF → drop (still needs @ when not a member)", () => {
+		const store = createThreadBudgetStore();
+		const d = decideTopicThreadHandling(
+			{ threadId: "T", authorIsSelf: false, authorIsBot: false, authorIsHuman: true, isExplicitMention: false, isMember: false },
+			store,
+			cfgOff,
+		);
+		expect(d.handle).toBe(false);
+	});
+
+	test("human NON-member, explicit @, autoContinue OFF → handle (explicit @ always works)", () => {
+		const store = createThreadBudgetStore();
+		const d = decideTopicThreadHandling(
+			{ threadId: "T", authorIsSelf: false, authorIsBot: false, authorIsHuman: true, isExplicitMention: true, isMember: false },
+			store,
+			cfgOff,
+		);
+		expect(d.handle).toBe(true);
+	});
+
+	test("human member message resets the bot budget even with autoContinue OFF", () => {
+		const store = createThreadBudgetStore();
+		decideTopicThreadHandling(
+			{ threadId: "T", authorIsSelf: false, authorIsBot: false, authorIsHuman: true, isExplicitMention: false, isMember: true },
+			store,
+			cfgOff,
+		);
+		expect(store.budgets.get("T")).toBe(cfgOff.budgetN);
+	});
+
+	test("human member, no @, autoContinue ON → still handle (unchanged)", () => {
+		const store = createThreadBudgetStore();
+		const d = decideTopicThreadHandling(
+			{ threadId: "T", authorIsSelf: false, authorIsBot: false, authorIsHuman: true, isExplicitMention: false, isMember: true },
+			store,
+			cfgOn,
+		);
+		expect(d.handle).toBe(true);
+	});
+
+	test("bot path UNCHANGED by the non-bot relaxation: bot member no @ autoContinue OFF → drop (no melee)", () => {
+		const store = createThreadBudgetStore();
+		const d = decideTopicThreadHandling(
+			{ threadId: "T", authorIsSelf: false, authorIsBot: true, authorIsHuman: false, isExplicitMention: false, isMember: true },
+			store,
+			cfgOff,
+		);
+		expect(d.handle).toBe(false);
+	});
+});
+
+describe("shouldProbeTopicThreadMembership (FLY-576 R1#1 — pure probe-decision seam)", () => {
+	test("non-bot, no @ → probe (FLY-576 founder path needs membership)", () => {
+		expect(shouldProbeTopicThreadMembership({ authorIsBot: false, isExplicitMention: false, autoContinue: false })).toBe(true);
+	});
+	test("non-bot, explicit @ → skip probe (decided by isExplicitMention; avoid 5s timeout)", () => {
+		expect(shouldProbeTopicThreadMembership({ authorIsBot: false, isExplicitMention: true, autoContinue: false })).toBe(false);
+	});
+	test("bot, autoContinue OFF → skip probe (bot is mention-only, membership unused)", () => {
+		expect(shouldProbeTopicThreadMembership({ authorIsBot: true, isExplicitMention: false, autoContinue: false })).toBe(false);
+		expect(shouldProbeTopicThreadMembership({ authorIsBot: true, isExplicitMention: true, autoContinue: false })).toBe(false);
+	});
+	test("bot, autoContinue ON → probe (budget path needs membership)", () => {
+		expect(shouldProbeTopicThreadMembership({ authorIsBot: true, isExplicitMention: false, autoContinue: true })).toBe(true);
 	});
 });
