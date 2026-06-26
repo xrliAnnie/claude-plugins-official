@@ -193,16 +193,23 @@ export function decideTopicThreadHandling(
 	// (0) never act on our own messages.
 	if (input.authorIsSelf) return { handle: false };
 
-	// (1) kill-switch / feature off → mention-required (byte-compat with the old gate).
-	if (!cfg.autoContinue) {
-		return { handle: input.isExplicitMention };
-	}
-
-	// (2) a non-bot HUMAN message is a reset event: refill the budget so members may
-	//     continue again. Members (or an explicit @) get delivered.
+	// (1) FLY-576: a non-bot HUMAN (founder/operator) is surfaced by DEFAULT — no @ needed,
+	//     independent of `autoContinue`. A member sees every human message in the thread; a
+	//     non-member still needs an explicit @. The human message also RESETS the bot budget
+	//     (a genuine reset event), so any subsequent bot continuation (when `autoContinue` is
+	//     on) starts fresh. A human cannot form a bot-to-bot loop → structurally melee-immune.
+	//     (Pre-FLY-576 this branch was gated behind `autoContinue`, which dropped the
+	//     founder's non-@ messages in production where `autoContinue` is off.)
 	if (!input.authorIsBot) {
 		store.budgets.set(input.threadId, cfg.budgetN);
 		return { handle: input.isMember === true || input.isExplicitMention };
+	}
+
+	// (2) BOT author. Kill-switch / feature off → mention-required (byte-compat with the old
+	//     gate; preserves the FLY-220/FLY-314 anti-loop default — bots never auto-continue
+	//     without an explicit @ unless `autoContinue` is enabled).
+	if (!cfg.autoContinue) {
+		return { handle: input.isExplicitMention };
 	}
 
 	// (3) bot-authored trigger. Only thread MEMBERS auto-continue; fail closed on
@@ -223,4 +230,23 @@ export function decideTopicThreadHandling(
 		return { handle: true };
 	}
 	return { handle: false };
+}
+
+/**
+ * FLY-576 — decide whether the topic-thread membership probe is worth running for THIS
+ * message (PURE, so the acceptance-critical call site stays a thin, untested glue; `server.ts`
+ * is not importable — it ends with `client.login`). Probe only when membership can change the
+ * `decideTopicThreadHandling` outcome:
+ *   - BOT author: membership matters only on the `autoContinue` budget path.
+ *   - NON-BOT human: membership matters only when there is NO explicit @ (an explicit @ is
+ *     handled by `isExplicitMention` regardless of membership — skip the probe + its 5s
+ *     timeout on an already-decided message).
+ */
+export function shouldProbeTopicThreadMembership(input: {
+	authorIsBot: boolean;
+	isExplicitMention: boolean;
+	autoContinue: boolean;
+}): boolean {
+	if (input.authorIsBot) return input.autoContinue;
+	return !input.isExplicitMention;
 }
