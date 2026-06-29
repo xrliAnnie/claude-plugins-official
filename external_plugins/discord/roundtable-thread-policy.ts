@@ -44,8 +44,13 @@ export const DEFAULT_ROUNDTABLE_THREAD_BUDGET = 12;
  * dept leads + the QA Room keep their exact behavior. reply-in-thread is now
  * DEFAULT-ON whenever a channel is resolved (opt-out only via explicit "0"), so
  * token-isolated companion leads (Belle/atlas/rafiki) — which never set the env —
- * reply into the thread without any per-lead config. `autoContinue` is UNCHANGED
- * (still explicit "1", default-off) to preserve the FLY-220/FLY-314 anti-loop. */
+ * reply into the thread without any per-lead config.
+ *
+ * FLY-676: `autoContinue` (no-@ in-thread member-follow) is now ALSO DEFAULT-ON
+ * (opt-out only via explicit `FLYWHEEL_ROUNDTABLE_THREAD_AUTOCONTINUE=0`, the
+ * kill-switch). The per-thread anti-loop budget (default raised 2 → 12) remains the
+ * FLY-220/FLY-314 circuit-breaker — a bot-only loop still terminates in <= budget
+ * steps, reset only by a human message / new topic. */
 export function loadRoundtableConfig(
 	env: Record<string, string | undefined>,
 	routing?: { channelId?: string },
