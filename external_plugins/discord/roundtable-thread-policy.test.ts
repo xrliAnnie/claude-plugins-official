@@ -16,8 +16,10 @@ import {
 	decideTopicThreadHandling,
 	seedThreadBudget,
 	shouldProbeTopicThreadMembership,
+	shouldSeedInitiatorBudget,
 	classifyThreadCreate,
 	threadGetConfirmsExistence,
+	DEFAULT_ROUNDTABLE_THREAD_BUDGET,
 	type RoundtableConfig,
 } from "./roundtable-thread-policy";
 
@@ -28,17 +30,40 @@ const cfgOn: RoundtableConfig = {
 	autoContinue: true,
 	budgetN: 2,
 };
+// FLY-676: production-shape config (member-follow on, default budget 12).
+const cfgOn12: RoundtableConfig = {
+	channelId: RT,
+	replyInThread: true,
+	autoContinue: true,
+	budgetN: DEFAULT_ROUNDTABLE_THREAD_BUDGET,
+};
 
 describe("loadRoundtableConfig", () => {
 	test("nothing set (no env channel, no routing) → undefined (byte-compat OFF)", () => {
 		expect(loadRoundtableConfig({})).toBeUndefined();
 		expect(loadRoundtableConfig({}, {})).toBeUndefined();
 	});
-	test("FLY-569: env channel id without reply flag → reply routing DEFAULT-ON", () => {
+	test("FLY-569/FLY-676: env channel id without flags → reply routing + autoContinue DEFAULT-ON", () => {
 		const c = loadRoundtableConfig({ FLYWHEEL_ROUNDTABLE_CHANNEL_ID: RT });
 		expect(c?.channelId).toBe(RT);
 		expect(c?.replyInThread).toBe(true); // was false pre-FLY-569 — now default-on
-		expect(c?.autoContinue).toBe(false); // anti-loop stays default-off
+		expect(c?.autoContinue).toBe(true); // FLY-676: member-follow now default-on (was false)
+		expect(c?.budgetN).toBe(12); // FLY-676: default budget 2 → 12
+	});
+	test("FLY-676: explicit opt-out THREAD_AUTOCONTINUE=0 → kill-switch (mention-required)", () => {
+		const c = loadRoundtableConfig({
+			FLYWHEEL_ROUNDTABLE_CHANNEL_ID: RT,
+			FLYWHEEL_ROUNDTABLE_THREAD_AUTOCONTINUE: "0",
+		});
+		expect(c?.replyInThread).toBe(true);
+		expect(c?.autoContinue).toBe(false);
+	});
+	test("FLY-676: explicit THREAD_BUDGET overrides the default 12", () => {
+		const c = loadRoundtableConfig({
+			FLYWHEEL_ROUNDTABLE_CHANNEL_ID: RT,
+			FLYWHEEL_ROUNDTABLE_THREAD_BUDGET: "5",
+		});
+		expect(c?.budgetN).toBe(5);
 	});
 	test("FLY-569: explicit opt-out REPLY_IN_THREAD=0 → reply routing OFF", () => {
 		const c = loadRoundtableConfig({
@@ -48,11 +73,11 @@ describe("loadRoundtableConfig", () => {
 		expect(c?.channelId).toBe(RT);
 		expect(c?.replyInThread).toBe(false);
 	});
-	test("FLY-569: routing channel only (env empty) → channelId from routing + default-on (Belle path)", () => {
+	test("FLY-569/FLY-676: routing channel only (env empty) → channelId from routing + reply+autoContinue default-on (Belle path)", () => {
 		const c = loadRoundtableConfig({}, { channelId: RT });
 		expect(c?.channelId).toBe(RT);
 		expect(c?.replyInThread).toBe(true);
-		expect(c?.autoContinue).toBe(false);
+		expect(c?.autoContinue).toBe(true); // FLY-676: default-on
 	});
 	test("FLY-569: routing channel + explicit opt-out → OFF", () => {
 		const c = loadRoundtableConfig(
@@ -339,5 +364,66 @@ describe("shouldProbeTopicThreadMembership (FLY-576 R1#1 — pure probe-decision
 	});
 	test("bot, autoContinue ON → probe (budget path needs membership)", () => {
 		expect(shouldProbeTopicThreadMembership({ authorIsBot: true, isExplicitMention: false, autoContinue: true })).toBe(true);
+	});
+});
+
+describe("FLY-676 — member-follow default-on + non-member @ semantics", () => {
+	test("member bot, no @, autoContinue ON, budget seeded to default 12 → follows up to 12 then stops", () => {
+		const store = createThreadBudgetStore();
+		seedThreadBudget(store, "T", DEFAULT_ROUNDTABLE_THREAD_BUDGET);
+		const bot = { threadId: "T", authorIsSelf: false, authorIsBot: true, authorIsHuman: false, isExplicitMention: false, isMember: true };
+		let handled = 0;
+		for (let i = 0; i < 100; i++) {
+			if (decideTopicThreadHandling(bot, store, cfgOn12).handle) handled++;
+		}
+		expect(handled).toBe(DEFAULT_ROUNDTABLE_THREAD_BUDGET); // 12 no-@ continuations, then mention-required
+	});
+
+	test("non-member bot + explicit @ → handle (one reply; top-level @ semantics, NOT dropped)", () => {
+		const store = createThreadBudgetStore();
+		const d = decideTopicThreadHandling(
+			{ threadId: "T", authorIsSelf: false, authorIsBot: true, authorIsHuman: false, isExplicitMention: true, isMember: false },
+			store,
+			cfgOn12,
+		);
+		expect(d.handle).toBe(true);
+		expect(store.budgets.has("T")).toBe(false); // non-member @ is NOT budget-tracked (unbudgeted, like top-level)
+	});
+
+	test("non-member bot, no @ → drop (never drawn into a thread without an @)", () => {
+		const store = createThreadBudgetStore();
+		expect(
+			decideTopicThreadHandling({ threadId: "T", authorIsSelf: false, authorIsBot: true, authorIsHuman: false, isExplicitMention: false, isMember: false }, store, cfgOn12).handle,
+		).toBe(false);
+	});
+
+	test("unknown membership + explicit @ → handle (top-level @ semantics); + no @ → drop (no relax without proof)", () => {
+		const store = createThreadBudgetStore();
+		expect(
+			decideTopicThreadHandling({ threadId: "T", authorIsSelf: false, authorIsBot: true, authorIsHuman: false, isExplicitMention: true, isMember: undefined }, store, cfgOn12).handle,
+		).toBe(true);
+		expect(
+			decideTopicThreadHandling({ threadId: "T", authorIsSelf: false, authorIsBot: true, authorIsHuman: false, isExplicitMention: false, isMember: undefined }, store, cfgOn12).handle,
+		).toBe(false);
+	});
+
+	test("member bot, UNSEEDED budget (initiator pre-seed), explicit @ → drop (missing = exhausted, @ does not revive)", () => {
+		const store = createThreadBudgetStore();
+		// proves the safe side: a member with no seeded budget drops even an explicit @ (restart/replay safety).
+		expect(
+			decideTopicThreadHandling({ threadId: "T", authorIsSelf: false, authorIsBot: true, authorIsHuman: false, isExplicitMention: true, isMember: true }, store, cfgOn12).handle,
+		).toBe(false);
+	});
+});
+
+describe("shouldSeedInitiatorBudget (FLY-676 — initiator-seed pure seam)", () => {
+	test("send to roundtable parent + autoContinue ON → seed", () => {
+		expect(shouldSeedInitiatorBudget({ sentToChannelId: RT, cfg: cfgOn12 })).toBe(true);
+	});
+	test("send to a non-parent channel → never seed (only top-level topic posts)", () => {
+		expect(shouldSeedInitiatorBudget({ sentToChannelId: "other", cfg: cfgOn12 })).toBe(false);
+	});
+	test("autoContinue OFF (kill-switch) → never seed", () => {
+		expect(shouldSeedInitiatorBudget({ sentToChannelId: RT, cfg: { ...cfgOn12, autoContinue: false } })).toBe(false);
 	});
 });

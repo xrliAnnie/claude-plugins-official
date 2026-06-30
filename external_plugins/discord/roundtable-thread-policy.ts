@@ -24,9 +24,16 @@ export interface RoundtableConfig {
 	replyInThread: boolean;
 	/** Allow no-@ continuation inside topic threads (kill-switch: false = mention-required). */
 	autoContinue: boolean;
-	/** Per-thread bot-only continuation budget (small; conservative default 2). */
+	/** Per-thread bot-only continuation budget (default DEFAULT_ROUNDTABLE_THREAD_BUDGET). */
 	budgetN: number;
 }
+
+/** FLY-676 — default per-thread bot-only anti-loop budget. Raised from 2 → 12 so a natural
+ * multi-turn back-and-forth between thread members is not cut off, while a runaway bot-only
+ * loop still terminates in <= 12 steps per Lead (reset only by a human message / new topic).
+ * The budget is the structural FLY-220 circuit-breaker; the small 2 was a QA-only conservative
+ * default that, once member-follow went default-on (FLY-676), would have truncated real talk. */
+export const DEFAULT_ROUNDTABLE_THREAD_BUDGET = 12;
 
 /** Parse the roundtable config. Returns undefined (feature OFF / byte-compat) when no
  * roundtable channel id is resolvable from either source — the plugin then behaves
@@ -37,8 +44,13 @@ export interface RoundtableConfig {
  * dept leads + the QA Room keep their exact behavior. reply-in-thread is now
  * DEFAULT-ON whenever a channel is resolved (opt-out only via explicit "0"), so
  * token-isolated companion leads (Belle/atlas/rafiki) — which never set the env —
- * reply into the thread without any per-lead config. `autoContinue` is UNCHANGED
- * (still explicit "1", default-off) to preserve the FLY-220/FLY-314 anti-loop. */
+ * reply into the thread without any per-lead config.
+ *
+ * FLY-676: `autoContinue` (no-@ in-thread member-follow) is now ALSO DEFAULT-ON
+ * (opt-out only via explicit `FLYWHEEL_ROUNDTABLE_THREAD_AUTOCONTINUE=0`, the
+ * kill-switch). The per-thread anti-loop budget (default raised 2 → 12) remains the
+ * FLY-220/FLY-314 circuit-breaker — a bot-only loop still terminates in <= budget
+ * steps, reset only by a human message / new topic. */
 export function loadRoundtableConfig(
 	env: Record<string, string | undefined>,
 	routing?: { channelId?: string },
@@ -49,12 +61,16 @@ export function loadRoundtableConfig(
 	if (!channelId) return undefined;
 	// DEFAULT-ON: on unless explicitly disabled with "0" (was: required "1").
 	const replyInThread = env.FLYWHEEL_ROUNDTABLE_REPLY_IN_THREAD !== "0";
-	const autoContinue = env.FLYWHEEL_ROUNDTABLE_THREAD_AUTOCONTINUE === "1";
+	// FLY-676 DEFAULT-ON: member-follow (no-@ in-thread continuation) is now on unless
+	// explicitly disabled with "0" (was: required "1"). `=0` is the kill-switch that restores
+	// the pre-FLY-676 mention-required behavior. Mirrors the FLY-569 replyInThread default-on.
+	const autoContinue = env.FLYWHEEL_ROUNDTABLE_THREAD_AUTOCONTINUE !== "0";
 	const rawN = Number.parseInt(
 		(env.FLYWHEEL_ROUNDTABLE_THREAD_BUDGET ?? "").trim(),
 		10,
 	);
-	const budgetN = Number.isFinite(rawN) && rawN > 0 ? rawN : 2;
+	const budgetN =
+		Number.isFinite(rawN) && rawN > 0 ? rawN : DEFAULT_ROUNDTABLE_THREAD_BUDGET;
 	return { channelId, replyInThread, autoContinue, budgetN };
 }
 
@@ -205,31 +221,53 @@ export function decideTopicThreadHandling(
 		return { handle: input.isMember === true || input.isExplicitMention };
 	}
 
-	// (2) BOT author. Kill-switch / feature off → mention-required (byte-compat with the old
-	//     gate; preserves the FLY-220/FLY-314 anti-loop default — bots never auto-continue
-	//     without an explicit @ unless `autoContinue` is enabled).
-	if (!cfg.autoContinue) {
-		return { handle: input.isExplicitMention };
-	}
-
-	// (3) bot-authored trigger. Only thread MEMBERS auto-continue; fail closed on
-	//     unknown/non-member (never relax when membership is not proven).
-	if (input.isMember !== true) {
+	// (2) FLY-676: BOT author who is a PROVEN MEMBER follows the thread WITHOUT a fresh @,
+	//     bounded by the per-thread anti-loop budget. This is the real new behavior — an active
+	//     participant keeps the back-and-forth going (the bug Annie observed: members had to be
+	//     @-mentioned every line). Default-on; `autoContinue=0` (kill-switch) routes to (3).
+	//     An explicit @ also CONSUMES budget — it never bypasses or resets it (FLY-314 R1#1);
+	//     a MISSING entry means "exhausted" (NOT a fresh budget), so a process restart / state
+	//     loss / an un-seeded initiator falls on the safe side (the thread returns to
+	//     mention-required until a human / new-topic / initiator-seed reset).
+	if (cfg.autoContinue && input.isMember === true) {
+		const remaining = store.budgets.get(input.threadId) ?? 0;
+		if (remaining > 0) {
+			store.budgets.set(input.threadId, remaining - 1);
+			return { handle: true };
+		}
 		return { handle: false };
 	}
 
-	// (4) member bot trigger → strictly budget-gated. An explicit <@bot> / quote-reply
-	//     from a bot does NOT bypass or reset the budget; it consumes it like any other
-	//     bot trigger. A MISSING entry means "exhausted" (NOT a fresh budget) — the
-	//     budget is seeded only on a new top-level topic engage or a human message
-	//     (Codex code review R1#1), so process restart / state loss falls on the safe
-	//     side (the thread returns to mention-required until a human/new-topic reset).
-	const remaining = store.budgets.get(input.threadId) ?? 0;
-	if (remaining > 0) {
-		store.budgets.set(input.threadId, remaining - 1);
-		return { handle: true };
-	}
-	return { handle: false };
+	// (3) Everyone else — a non-member / unknown-membership bot, OR autoContinue off (the
+	//     kill-switch) — stays mention-required. This is byte-IDENTICAL to the pre-FLY-676
+	//     production path (autoContinue off → all bots gated on isExplicitMention), so FLY-676
+	//     introduces NO new non-member reply surface. A mid-thread @ to a non-member still
+	//     yields the single reply the prompt contract promises (top-level @ semantics —
+	//     unbudgeted, exactly as the parent-channel @ has always been). The budgeted relaxation
+	//     in (2) is reserved for PROVEN members only (fail-closed on unknown membership).
+	return { handle: input.isExplicitMention };
+}
+
+/**
+ * FLY-676 — decide whether to seed the initiator's anti-loop budget for a thread (PURE).
+ *
+ * The Lead that STARTS a top-level roundtable topic filters out its own post (echo immunity),
+ * so it never seeds via the inbound topic-engage path (`server.ts` only seeds when a top-level
+ * inbound is routed to a thread). Under the (2) member-budget path it would then drop the
+ * sibling's first reply — even an explicit @ — because its budget is missing (= exhausted).
+ * Fix: when a Lead sends to the roundtable PARENT channel (a top-level topic; the future thread
+ * id == the sent message id), seed its budget so it can hear the replies it asked for. Only
+ * when autoContinue is on (the budget path is active). `server.ts` is the thin glue that, on a
+ * successful parent-channel send, calls `seedThreadBudget` for the returned message id(s).
+ *
+ * restart-safe: the seed lives only in-process; a restart loses it and the initiator does not
+ * re-post the topic, so there is no spurious re-seed — the thread returns to mention-required.
+ */
+export function shouldSeedInitiatorBudget(input: {
+	sentToChannelId: string;
+	cfg: RoundtableConfig;
+}): boolean {
+	return input.cfg.autoContinue && input.sentToChannelId === input.cfg.channelId;
 }
 
 /**

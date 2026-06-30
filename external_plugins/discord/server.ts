@@ -44,6 +44,7 @@ import {
   decideTopicThreadHandling,
   seedThreadBudget,
   shouldProbeTopicThreadMembership,
+  shouldSeedInitiatorBudget,
   classifyThreadCreate,
   threadGetConfirmsExistence,
   type RoundtableConfig,
@@ -1128,6 +1129,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           replyRetryOpts,
           noteSent,
         )
+
+        // FLY-676 initiator-seed: when THIS Lead posts a top-level topic to the roundtable
+        // parent, seed its anti-loop budget keyed on the sent message id (== the future thread
+        // id), so it can hear siblings' replies in the thread its topic spawns. Without this the
+        // initiator filters its own post (echo immunity) → never seeds → the member-budget path
+        // drops the first reply back (even an explicit @). Thin glue; the decision is the pure
+        // shouldSeedInitiatorBudget predicate. No-op unless autoContinue is on and chat_id is the
+        // roundtable parent.
+        if (RT_CFG && shouldSeedInitiatorBudget({ sentToChannelId: chat_id, cfg: RT_CFG })) {
+          for (const id of sentIds) seedThreadBudget(rtBudget, id, RT_CFG.budgetN)
+        }
 
         const result =
           sentIds.length === 1
