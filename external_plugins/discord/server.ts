@@ -48,6 +48,8 @@ import {
   classifyThreadCreate,
   threadGetConfirmsExistence,
   confirmThreadUnderParent,
+  rememberRoundtableRedirect,
+  shouldStripRoundtableReplyTo,
   type RoundtableConfig,
 } from './roundtable-thread-policy'
 import { loadSharedRoundtableRouting } from './roundtable-shared-routing'
@@ -99,18 +101,16 @@ const rtBudget = createThreadBudgetStore()
 // Bounded (Codex code review R1 finding 4): insertion-ordered, oldest evicted past
 // the cap so a long-running Lead process can't grow it without limit.
 const RT_REDIRECT_MAX = 1000
+// FLY-314 fix (Codex code review R1 MEDIUM): also bound the ids PER hot thread, else a
+// single long-lived active topic accumulates a parent-message id per follow-up forever.
+const RT_REDIRECT_PER_THREAD_MAX = 64
 const rtRedirectedSource = new Map<string, Set<string>>()
 function rtRememberRedirect(threadId: string, ...sourceMessageIds: string[]): void {
-  const existing = rtRedirectedSource.get(threadId)
-  const set = existing ?? new Set<string>()
-  for (const id of sourceMessageIds) if (id) set.add(id)
-  // Re-insert so the most-recently-used thread is treated as newest for eviction.
-  rtRedirectedSource.delete(threadId)
-  rtRedirectedSource.set(threadId, set)
-  if (rtRedirectedSource.size > RT_REDIRECT_MAX) {
-    const oldest = rtRedirectedSource.keys().next().value
-    if (oldest !== undefined) rtRedirectedSource.delete(oldest)
-  }
+  // Bookkeeping is a PURE + BOUNDED policy helper (unit-tested without Discord).
+  rememberRoundtableRedirect(rtRedirectedSource, threadId, sourceMessageIds, {
+    maxThreads: RT_REDIRECT_MAX,
+    maxPerThread: RT_REDIRECT_PER_THREAD_MAX,
+  })
 }
 // thread ids this bot is confirmed a member of (positive cache only — a newly
 // added member is picked up by re-probing; we never cache "absent" so a lead
@@ -1122,7 +1122,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // topic thread, a reply_to pointing at the ORIGINAL parent-channel source
         // message is a cross-channel reference that Discord rejects. Strip it — post
         // into the thread without a quote-reply.
-        if (reply_to && rtRedirectedSource.get(chat_id)?.has(reply_to)) {
+        if (shouldStripRoundtableReplyTo(rtRedirectedSource, chat_id, reply_to)) {
           reply_to = undefined
         }
 

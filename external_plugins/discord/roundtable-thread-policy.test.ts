@@ -22,6 +22,8 @@ import {
 	confirmThreadUnderParent,
 	deriveRoundtableThreadName,
 	isTopicNoise,
+	rememberRoundtableRedirect,
+	shouldStripRoundtableReplyTo,
 	DEFAULT_ROUNDTABLE_THREAD_BUDGET,
 	type RoundtableConfig,
 } from "./roundtable-thread-policy";
@@ -511,5 +513,52 @@ describe("deriveRoundtableThreadName / isTopicNoise / confirmThreadUnderParent �
 		expect(confirmThreadUnderParent({ type: 0, parent_id: RT }, RT)).toBe(false); // not a thread
 		expect(confirmThreadUnderParent({ type: 11, parent_id: "other" }, RT)).toBe(false); // wrong parent
 		expect(confirmThreadUnderParent(null, RT)).toBe(false);
+	});
+});
+
+describe("rememberRoundtableRedirect / shouldStripRoundtableReplyTo — FLY-314 fix (bounded, testable)", () => {
+	test("remembers BOTH the topic source id and the follow-up id; strip matches either", () => {
+		const map = new Map<string, Set<string>>();
+		rememberRoundtableRedirect(map, "T1", ["root", "followup"], {
+			maxThreads: 10,
+			maxPerThread: 10,
+		});
+		expect(shouldStripRoundtableReplyTo(map, "T1", "root")).toBe(true);
+		expect(shouldStripRoundtableReplyTo(map, "T1", "followup")).toBe(true);
+		expect(shouldStripRoundtableReplyTo(map, "T1", "other")).toBe(false);
+		expect(shouldStripRoundtableReplyTo(map, "T1", undefined)).toBe(false);
+		expect(shouldStripRoundtableReplyTo(map, "unknown", "root")).toBe(false);
+	});
+
+	test("bounds the ids PER hot thread (oldest evicted) — Codex R1 MEDIUM", () => {
+		const map = new Map<string, Set<string>>();
+		for (let i = 0; i < 100; i++)
+			rememberRoundtableRedirect(map, "T1", [`id${i}`], {
+				maxThreads: 10,
+				maxPerThread: 3,
+			});
+		expect(map.get("T1")!.size).toBe(3);
+		expect(shouldStripRoundtableReplyTo(map, "T1", "id0")).toBe(false); // evicted
+		expect(shouldStripRoundtableReplyTo(map, "T1", "id99")).toBe(true); // newest kept
+	});
+
+	test("bounds the number of threads (oldest thread evicted)", () => {
+		const map = new Map<string, Set<string>>();
+		for (let i = 0; i < 100; i++)
+			rememberRoundtableRedirect(map, `T${i}`, ["x"], {
+				maxThreads: 5,
+				maxPerThread: 10,
+			});
+		expect(map.size).toBe(5);
+	});
+
+	test("skips empty ids", () => {
+		const map = new Map<string, Set<string>>();
+		rememberRoundtableRedirect(map, "T1", ["", "real"], {
+			maxThreads: 10,
+			maxPerThread: 10,
+		});
+		expect(map.get("T1")!.has("real")).toBe(true);
+		expect(map.get("T1")!.size).toBe(1);
 	});
 });

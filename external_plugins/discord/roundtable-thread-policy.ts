@@ -161,6 +161,53 @@ export function isTopicNoise(content: string): boolean {
 	return semantic < MIN_TOPIC_CHARS;
 }
 
+/**
+ * FLY-314 fix — redirect bookkeeping for the `reply_to` strip, extracted PURE + BOUNDED
+ * so it is unit-testable without starting Discord (Codex code review R1 MEDIUM + LOW).
+ *
+ * threadId -> the set of parent-channel message ids redirected into that thread. A
+ * reply into the thread must strip a `reply_to` pointing at ANY of them (a
+ * cross-channel reference Discord rejects). BOTH dimensions are bounded: the number of
+ * threads (`maxThreads`) AND the ids per hot thread (`maxPerThread`, oldest evicted) —
+ * so a single long-lived active topic can't grow the per-thread set without limit.
+ */
+export function rememberRoundtableRedirect(
+	map: Map<string, Set<string>>,
+	threadId: string,
+	sourceMessageIds: string[],
+	opts: { maxThreads: number; maxPerThread: number },
+): void {
+	const set = map.get(threadId) ?? new Set<string>();
+	for (const id of sourceMessageIds) {
+		if (!id) continue;
+		set.add(id);
+		// Insertion-ordered: evict the oldest id past the per-thread cap.
+		while (set.size > opts.maxPerThread) {
+			const oldest = set.values().next().value;
+			if (oldest === undefined) break;
+			set.delete(oldest);
+		}
+	}
+	// Re-insert so this thread is treated as newest (MRU) for thread-level eviction.
+	map.delete(threadId);
+	map.set(threadId, set);
+	while (map.size > opts.maxThreads) {
+		const oldestThread = map.keys().next().value;
+		if (oldestThread === undefined) break;
+		map.delete(oldestThread);
+	}
+}
+
+/** FLY-314 fix — should a reply's `reply_to` be stripped? True iff it targets a
+ * parent-channel id we redirected into this thread (cross-channel ref). PURE. */
+export function shouldStripRoundtableReplyTo(
+	map: Map<string, Set<string>>,
+	chatId: string,
+	replyTo: string | undefined,
+): boolean {
+	return !!replyTo && (map.get(chatId)?.has(replyTo) ?? false);
+}
+
 export interface InboundChannelInfo {
 	channelId: string;
 	messageId: string;
