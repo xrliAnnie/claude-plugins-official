@@ -19,6 +19,11 @@ import {
 	shouldSeedInitiatorBudget,
 	classifyThreadCreate,
 	threadGetConfirmsExistence,
+	confirmThreadUnderParent,
+	deriveRoundtableThreadName,
+	isTopicNoise,
+	rememberRoundtableRedirect,
+	shouldStripRoundtableReplyTo,
 	DEFAULT_ROUNDTABLE_THREAD_BUDGET,
 	type RoundtableConfig,
 } from "./roundtable-thread-policy";
@@ -425,5 +430,135 @@ describe("shouldSeedInitiatorBudget (FLY-676 — initiator-seed pure seam)", () 
 	});
 	test("autoContinue OFF (kill-switch) → never seed", () => {
 		expect(shouldSeedInitiatorBudget({ sentToChannelId: RT, cfg: { ...cfgOn12, autoContinue: false } })).toBe(false);
+	});
+});
+
+describe("resolveRoundtableInboundChatId — FLY-314 fix (follow-up + noise + naming)", () => {
+	test("fresh topic → routed to its own thread, create-or-confirm, descriptive threadName", () => {
+		const r = resolveRoundtableInboundChatId(
+			{
+				channelId: RT,
+				messageId: "M1",
+				isThread: false,
+				parentId: null,
+				content: "<@1> deploy plan sync",
+			},
+			cfgOn,
+		);
+		expect(r.chatId).toBe("M1");
+		expect(r.sourceMessageId).toBe("M1");
+		expect(r.routedToThread).toBe(true);
+		expect(r.confirmOnly).toBeFalsy();
+		expect(r.threadName).toBe("deploy plan sync");
+	});
+
+	test("follow-up (Discord reply) → confirm-only route INTO the referenced thread, no new thread", () => {
+		const r = resolveRoundtableInboundChatId(
+			{
+				channelId: RT,
+				messageId: "M2",
+				isThread: false,
+				parentId: null,
+				referencedMessageId: "M1",
+				content: "agreed, ship it",
+			},
+			cfgOn,
+		);
+		expect(r.chatId).toBe("M1"); // routes into the referenced topic thread
+		expect(r.sourceMessageId).toBe("M1");
+		expect(r.routedToThread).toBe(true);
+		expect(r.confirmOnly).toBe(true); // GET-verify only, never create
+	});
+
+	test("noise (pure emoji) fresh top-level → NOT routed to a thread (reply stays in parent)", () => {
+		for (const content of ["👍👍", "🎉", "<:tada:1>", "ok"]) {
+			const r = resolveRoundtableInboundChatId(
+				{ channelId: RT, messageId: "M3", isThread: false, parentId: null, content },
+				cfgOn,
+			);
+			expect(r.chatId).toBe(RT);
+			expect(r.routedToThread).toBe(false);
+		}
+	});
+
+	test("byte-compat: top-level with no content/ref still routes to its thread (no confirmOnly)", () => {
+		const r = resolveRoundtableInboundChatId(
+			{ channelId: RT, messageId: "M1", isThread: false, parentId: null },
+			cfgOn,
+		);
+		expect(r.chatId).toBe("M1");
+		expect(r.routedToThread).toBe(true);
+		expect(r.confirmOnly).toBeFalsy();
+	});
+});
+
+describe("deriveRoundtableThreadName / isTopicNoise / confirmThreadUnderParent — FLY-314 fix", () => {
+	test("deriveRoundtableThreadName strips markup, falls back to placeholder", () => {
+		expect(
+			deriveRoundtableThreadName("<@1> Flywheel restarted — check runners"),
+		).toBe("Flywheel restarted — check runners");
+		expect(deriveRoundtableThreadName("<@1> <#2>")).toBe("Roundtable topic");
+	});
+
+	test("isTopicNoise: emoji/short = noise, real text = not", () => {
+		expect(isTopicNoise("👍👍")).toBe(true);
+		expect(isTopicNoise("ok")).toBe(true);
+		expect(isTopicNoise("<:tada:1>")).toBe(true);
+		expect(isTopicNoise("deploy plan")).toBe(false);
+		expect(isTopicNoise("重启了")).toBe(false);
+	});
+
+	test("confirmThreadUnderParent: only a thread type under the right parent confirms", () => {
+		expect(confirmThreadUnderParent({ type: 11, parent_id: RT }, RT)).toBe(true);
+		expect(confirmThreadUnderParent({ type: 0, parent_id: RT }, RT)).toBe(false); // not a thread
+		expect(confirmThreadUnderParent({ type: 11, parent_id: "other" }, RT)).toBe(false); // wrong parent
+		expect(confirmThreadUnderParent(null, RT)).toBe(false);
+	});
+});
+
+describe("rememberRoundtableRedirect / shouldStripRoundtableReplyTo — FLY-314 fix (bounded, testable)", () => {
+	test("remembers BOTH the topic source id and the follow-up id; strip matches either", () => {
+		const map = new Map<string, Set<string>>();
+		rememberRoundtableRedirect(map, "T1", ["root", "followup"], {
+			maxThreads: 10,
+			maxPerThread: 10,
+		});
+		expect(shouldStripRoundtableReplyTo(map, "T1", "root")).toBe(true);
+		expect(shouldStripRoundtableReplyTo(map, "T1", "followup")).toBe(true);
+		expect(shouldStripRoundtableReplyTo(map, "T1", "other")).toBe(false);
+		expect(shouldStripRoundtableReplyTo(map, "T1", undefined)).toBe(false);
+		expect(shouldStripRoundtableReplyTo(map, "unknown", "root")).toBe(false);
+	});
+
+	test("bounds the ids PER hot thread (oldest evicted) — Codex R1 MEDIUM", () => {
+		const map = new Map<string, Set<string>>();
+		for (let i = 0; i < 100; i++)
+			rememberRoundtableRedirect(map, "T1", [`id${i}`], {
+				maxThreads: 10,
+				maxPerThread: 3,
+			});
+		expect(map.get("T1")!.size).toBe(3);
+		expect(shouldStripRoundtableReplyTo(map, "T1", "id0")).toBe(false); // evicted
+		expect(shouldStripRoundtableReplyTo(map, "T1", "id99")).toBe(true); // newest kept
+	});
+
+	test("bounds the number of threads (oldest thread evicted)", () => {
+		const map = new Map<string, Set<string>>();
+		for (let i = 0; i < 100; i++)
+			rememberRoundtableRedirect(map, `T${i}`, ["x"], {
+				maxThreads: 5,
+				maxPerThread: 10,
+			});
+		expect(map.size).toBe(5);
+	});
+
+	test("skips empty ids", () => {
+		const map = new Map<string, Set<string>>();
+		rememberRoundtableRedirect(map, "T1", ["", "real"], {
+			maxThreads: 10,
+			maxPerThread: 10,
+		});
+		expect(map.get("T1")!.has("real")).toBe(true);
+		expect(map.get("T1")!.size).toBe(1);
 	});
 });

@@ -47,6 +47,9 @@ import {
   shouldSeedInitiatorBudget,
   classifyThreadCreate,
   threadGetConfirmsExistence,
+  confirmThreadUnderParent,
+  rememberRoundtableRedirect,
+  shouldStripRoundtableReplyTo,
   type RoundtableConfig,
 } from './roundtable-thread-policy'
 import { loadSharedRoundtableRouting } from './roundtable-shared-routing'
@@ -90,18 +93,24 @@ const RT_CFG: RoundtableConfig | undefined = loadRoundtableConfig(
 )
 // Per-thread bot-only continuation budget (process-local; cleared on restart).
 const rtBudget = createThreadBudgetStore()
-// threadId -> source message id for top-level messages we redirected into a
-// thread, so the reply handler can strip a cross-channel `reply_to` (R1#5).
+// threadId -> the SET of parent-channel message ids we redirected into this thread,
+// so the reply handler can strip a cross-channel `reply_to` (R1#5). FLY-314 fix
+// (Codex R3 HIGH#3): a follow-up routed into a topic thread must strip BOTH the root
+// topic source id AND the follow-up's own message id — a reply_to to either
+// parent-channel id is a cross-channel reference Discord rejects.
 // Bounded (Codex code review R1 finding 4): insertion-ordered, oldest evicted past
 // the cap so a long-running Lead process can't grow it without limit.
 const RT_REDIRECT_MAX = 1000
-const rtRedirectedSource = new Map<string, string>()
-function rtRememberRedirect(threadId: string, sourceMessageId: string): void {
-  rtRedirectedSource.set(threadId, sourceMessageId)
-  if (rtRedirectedSource.size > RT_REDIRECT_MAX) {
-    const oldest = rtRedirectedSource.keys().next().value
-    if (oldest !== undefined) rtRedirectedSource.delete(oldest)
-  }
+// FLY-314 fix (Codex code review R1 MEDIUM): also bound the ids PER hot thread, else a
+// single long-lived active topic accumulates a parent-message id per follow-up forever.
+const RT_REDIRECT_PER_THREAD_MAX = 64
+const rtRedirectedSource = new Map<string, Set<string>>()
+function rtRememberRedirect(threadId: string, ...sourceMessageIds: string[]): void {
+  // Bookkeeping is a PURE + BOUNDED policy helper (unit-tested without Discord).
+  rememberRoundtableRedirect(rtRedirectedSource, threadId, sourceMessageIds, {
+    maxThreads: RT_REDIRECT_MAX,
+    maxPerThread: RT_REDIRECT_PER_THREAD_MAX,
+  })
 }
 // thread ids this bot is confirmed a member of (positive cache only — a newly
 // added member is picked up by re-probing; we never cache "absent" so a lead
@@ -120,14 +129,24 @@ const RT_GET_CONFIRM_DELAY_MS = 400
 
 // GET /channels/{threadId}: 200 confirms the thread exists. Anything else (or a
 // network error) → not confirmed.
-async function roundtableThreadExists(threadId: string): Promise<boolean> {
+async function roundtableThreadExists(
+  threadId: string,
+  parentChannelId: string,
+): Promise<boolean> {
   if (!TOKEN) return false
   try {
     const res = await fetch(`${RT_DISCORD_API}/channels/${threadId}`, {
       headers: { Authorization: `Bot ${TOKEN}` },
       signal: AbortSignal.timeout(5000),
     })
-    return threadGetConfirmsExistence(res.status)
+    if (!threadGetConfirmsExistence(res.status)) return false
+    // FLY-314 fix (Codex R4 note 3): a 200 alone doesn't prove this is a topic thread
+    // of THIS roundtable. Verify the body is a thread whose parent is the roundtable
+    // channel before treating the id as a valid reply target.
+    const body = (await res.json().catch(() => null)) as
+      | { type?: unknown; parent_id?: unknown }
+      | null
+    return confirmThreadUnderParent(body, parentChannelId)
   } catch {
     return false
   }
@@ -145,18 +164,39 @@ async function roundtableThreadExists(threadId: string): Promise<boolean> {
 //     safe fallback).
 async function ensureRoundtableThread(
   parentChannelId: string,
-  messageId: string,
+  targetMessageId: string,
+  opts: { confirmOnly?: boolean; desiredName?: string } = {},
 ): Promise<boolean> {
   if (!TOKEN) return false
+
+  // FLY-314 fix: a FOLLOW-UP (Discord reply) routes into an EXISTING topic thread —
+  // confirm-only, NEVER create. Creating a thread from the referenced id would just
+  // move the over-spawn (a second thread on the referenced message). If it can't be
+  // confirmed as a thread under the roundtable parent, the caller keeps the parent.
+  if (opts.confirmOnly) {
+    for (let i = 0; i < RT_GET_CONFIRM_RETRIES; i++) {
+      if (await roundtableThreadExists(targetMessageId, parentChannelId)) return true
+      if (i < RT_GET_CONFIRM_RETRIES - 1) {
+        await new Promise((r) => setTimeout(r, RT_GET_CONFIRM_DELAY_MS))
+      }
+    }
+    return false
+  }
+
   let createStatus = 0 // 0 = network/timeout on create → treat as "maybe exists"
   let createCode: number | undefined
   try {
     const res = await fetch(
-      `${RT_DISCORD_API}/channels/${parentChannelId}/messages/${messageId}/threads`,
+      `${RT_DISCORD_API}/channels/${parentChannelId}/messages/${targetMessageId}/threads`,
       {
         method: 'POST',
         headers: { Authorization: `Bot ${TOKEN}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: 'Roundtable topic', auto_archive_duration: 4320 }),
+        // FLY-314 fix: correct-from-start descriptive name (no more hard-coded
+        // 'Roundtable topic' placeholder). Falls back only when no name was derived.
+        body: JSON.stringify({
+          name: opts.desiredName || 'Roundtable topic',
+          auto_archive_duration: 4320,
+        }),
         signal: AbortSignal.timeout(5000),
       },
     )
@@ -168,7 +208,7 @@ async function ensureRoundtableThread(
       } catch {}
     }
   } catch (e) {
-    process.stderr.write(`[roundtable] ensureThread ${messageId} create error: ${e}\n`)
+    process.stderr.write(`[roundtable] ensureThread ${targetMessageId} create error: ${e}\n`)
     createStatus = 0
   }
 
@@ -176,18 +216,18 @@ async function ensureRoundtableThread(
     createStatus === 0 ? 'confirm-via-get' : classifyThreadCreate(createStatus, createCode)
   if (outcome === 'created' || outcome === 'exists') return true
   if (outcome === 'failed') {
-    process.stderr.write(`[roundtable] ensureThread ${messageId}: HTTP ${createStatus} (unconfirmed)\n`)
+    process.stderr.write(`[roundtable] ensureThread ${targetMessageId}: HTTP ${createStatus} (unconfirmed)\n`)
     return false
   }
   // confirm-via-get: poll for a host/Bridge-created thread with a bounded retry.
   for (let i = 0; i < RT_GET_CONFIRM_RETRIES; i++) {
-    if (await roundtableThreadExists(messageId)) return true
+    if (await roundtableThreadExists(targetMessageId, parentChannelId)) return true
     if (i < RT_GET_CONFIRM_RETRIES - 1) {
       await new Promise((r) => setTimeout(r, RT_GET_CONFIRM_DELAY_MS))
     }
   }
   process.stderr.write(
-    `[roundtable] ensureThread ${messageId}: create HTTP ${createStatus}, GET-confirm exhausted (unconfirmed)\n`,
+    `[roundtable] ensureThread ${targetMessageId}: create HTTP ${createStatus}, GET-confirm exhausted (unconfirmed)\n`,
   )
   return false
 }
@@ -1082,7 +1122,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // topic thread, a reply_to pointing at the ORIGINAL parent-channel source
         // message is a cross-channel reference that Discord rejects. Strip it — post
         // into the thread without a quote-reply.
-        if (reply_to && rtRedirectedSource.get(chat_id) === reply_to) {
+        if (shouldStripRoundtableReplyTo(rtRedirectedSource, chat_id, reply_to)) {
           reply_to = undefined
         }
 
@@ -1412,6 +1452,9 @@ async function handleInbound(msg: Message): Promise<void> {
         messageId: msg.id,
         isThread: msg.channel.isThread(),
         parentId: msg.channel.isThread() ? msg.channel.parentId ?? null : null,
+        // FLY-314 fix: reply target → follow-up routing; content → naming + noise gate.
+        referencedMessageId: msg.reference?.messageId ?? null,
+        content: msg.content,
       },
       RT_CFG,
     )
@@ -1419,14 +1462,23 @@ async function handleInbound(msg: Message): Promise<void> {
       // Only present the topic thread id to the agent once the thread is CONFIRMED to
       // exist (R1 finding 2) — otherwise the redirected reply could 404. On failure we
       // leave chat_id at the parent (the message is still answerable there).
-      const confirmed = await ensureRoundtableThread(msg.channelId, routed.sourceMessageId)
+      // FLY-314 fix: a follow-up is confirm-only (never creates); a fresh topic gets a
+      // correct-from-start descriptive name.
+      const confirmed = await ensureRoundtableThread(msg.channelId, routed.sourceMessageId, {
+        confirmOnly: routed.confirmOnly,
+        desiredName: routed.threadName,
+      })
       if (confirmed) {
         chat_id = routed.chatId
-        // Remember the source so the reply handler can strip a cross-channel reply_to.
-        rtRememberRedirect(chat_id, routed.sourceMessageId)
+        // Remember BOTH the routed topic source AND this message's own id so a
+        // reply_to to either parent-channel id is stripped (FLY-314 Codex R3 HIGH#3).
+        rtRememberRedirect(chat_id, routed.sourceMessageId, msg.id)
         // Engaging a NEW top-level topic is a budget reset event (R1#1): seed N so the
-        // in-thread continuation that follows has budget. Bot triggers never seed.
-        if (RT_CFG.autoContinue) seedThreadBudget(rtBudget, chat_id, RT_CFG.budgetN)
+        // in-thread continuation that follows has budget. FLY-314 fix (Codex R2 HIGH#2):
+        // a FOLLOW-UP (confirmOnly) must NOT seed — a bot-authored follow-up cannot
+        // reset a spent budget. Bot triggers never seed.
+        if (RT_CFG.autoContinue && !routed.confirmOnly)
+          seedThreadBudget(rtBudget, chat_id, RT_CFG.budgetN)
       }
     }
   }

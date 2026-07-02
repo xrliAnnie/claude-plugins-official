@@ -105,12 +105,119 @@ export function threadGetConfirmsExistence(status: number): boolean {
 	return status === 200;
 }
 
+/** Discord thread channel types (10 announcement, 11 public, 12 private). */
+const THREAD_TYPES = new Set([10, 11, 12]);
+
+/**
+ * FLY-314 fix (Codex R4 note 3) — a GET /channels/{id} 200 alone does NOT prove the
+ * fetched channel is a topic thread of THIS roundtable. Verify the body: it must be a
+ * thread type AND its parent must be the configured roundtable channel. Used by the
+ * plugin's confirm-only follow-up route (never present an unconfirmed / wrong-parent
+ * id to the agent) and hardens the create-vs-confirm race path. PURE.
+ */
+export function confirmThreadUnderParent(
+	body: { type?: unknown; parent_id?: unknown } | null | undefined,
+	parentChannelId: string,
+): boolean {
+	if (!body) return false;
+	return (
+		typeof body.type === "number" &&
+		THREAD_TYPES.has(body.type) &&
+		body.parent_id === parentChannelId
+	);
+}
+
+/** FLY-314 fix — placeholder + minimum semantic chars for a real topic (mirror of the
+ * flywheel `roundtable-text` helpers so all three thread creators agree). */
+export const ROUNDTABLE_PLACEHOLDER_NAME = "Roundtable topic";
+const MIN_TOPIC_CHARS = 3;
+
+function stripDiscordMarkup(content: string): string {
+	return content
+		.replace(/<a?:\w+:\d+>/g, "") // custom emoji <:x:1> / <a:x:1>
+		.replace(/<@[!&]?\d+>/g, "") // user <@1>/<@!1> + role <@&1> mentions
+		.replace(/<#\d+>/g, "") // channel mentions <#1>
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+/** FLY-314 fix — correct-from-start descriptive thread name (mirror of flywheel
+ * `deriveRoundtableThreadName`), so a plugin-created topic thread is never the generic
+ * "Roundtable topic" placeholder. PURE. */
+export function deriveRoundtableThreadName(content: string): string {
+	const cleaned = stripDiscordMarkup(content).slice(0, 90);
+	return (cleaned || ROUNDTABLE_PLACEHOLDER_NAME).slice(0, 100);
+}
+
+/** FLY-314 fix — is this message too thin to open its own topic thread? Strips
+ * Discord markup + Unicode pictographs, then requires >= MIN_TOPIC_CHARS letter/number
+ * characters (mirror of flywheel `isTopicNoise`, incl. the multi-emoji case). PURE. */
+export function isTopicNoise(content: string): boolean {
+	const stripped = stripDiscordMarkup(content).replace(
+		/\p{Extended_Pictographic}/gu,
+		"",
+	);
+	const semantic = (stripped.match(/[\p{L}\p{N}]/gu) ?? []).length;
+	return semantic < MIN_TOPIC_CHARS;
+}
+
+/**
+ * FLY-314 fix — redirect bookkeeping for the `reply_to` strip, extracted PURE + BOUNDED
+ * so it is unit-testable without starting Discord (Codex code review R1 MEDIUM + LOW).
+ *
+ * threadId -> the set of parent-channel message ids redirected into that thread. A
+ * reply into the thread must strip a `reply_to` pointing at ANY of them (a
+ * cross-channel reference Discord rejects). BOTH dimensions are bounded: the number of
+ * threads (`maxThreads`) AND the ids per hot thread (`maxPerThread`, oldest evicted) —
+ * so a single long-lived active topic can't grow the per-thread set without limit.
+ */
+export function rememberRoundtableRedirect(
+	map: Map<string, Set<string>>,
+	threadId: string,
+	sourceMessageIds: string[],
+	opts: { maxThreads: number; maxPerThread: number },
+): void {
+	const set = map.get(threadId) ?? new Set<string>();
+	for (const id of sourceMessageIds) {
+		if (!id) continue;
+		set.add(id);
+		// Insertion-ordered: evict the oldest id past the per-thread cap.
+		while (set.size > opts.maxPerThread) {
+			const oldest = set.values().next().value;
+			if (oldest === undefined) break;
+			set.delete(oldest);
+		}
+	}
+	// Re-insert so this thread is treated as newest (MRU) for thread-level eviction.
+	map.delete(threadId);
+	map.set(threadId, set);
+	while (map.size > opts.maxThreads) {
+		const oldestThread = map.keys().next().value;
+		if (oldestThread === undefined) break;
+		map.delete(oldestThread);
+	}
+}
+
+/** FLY-314 fix — should a reply's `reply_to` be stripped? True iff it targets a
+ * parent-channel id we redirected into this thread (cross-channel ref). PURE. */
+export function shouldStripRoundtableReplyTo(
+	map: Map<string, Set<string>>,
+	chatId: string,
+	replyTo: string | undefined,
+): boolean {
+	return !!replyTo && (map.get(chatId)?.has(replyTo) ?? false);
+}
+
 export interface InboundChannelInfo {
 	channelId: string;
 	messageId: string;
 	isThread: boolean;
 	/** Parent channel id when the message is in a thread, else null. */
 	parentId: string | null;
+	/** FLY-314 fix: the referenced message id when this is a Discord REPLY (follow-up). */
+	referencedMessageId?: string | null;
+	/** FLY-314 fix: message text → correct-from-start name + noise classification. */
+	content?: string;
 }
 
 export interface InboundChatIdResolution {
@@ -122,24 +229,52 @@ export interface InboundChatIdResolution {
 	sourceMessageId?: string;
 	/** True when a top-level roundtable message was rewritten to its topic thread. */
 	routedToThread: boolean;
+	/**
+	 * FLY-314 fix: how the server must ensure the target thread.
+	 *  - undefined/false → create-or-confirm (a FRESH topic; may POST create).
+	 *  - true → confirm-only (a FOLLOW-UP into an existing thread; GET-verify only,
+	 *    NEVER create — else a follow-up over-spawns on the referenced id).
+	 */
+	confirmOnly?: boolean;
+	/** FLY-314 fix: correct-from-start name to give a freshly-created topic thread. */
+	threadName?: string;
 }
 
-/** R1 reply routing. Top-level roundtable message → its topic thread (id == message id).
- * Everything else (already-in-thread, other channels, feature off) → unchanged. */
+/**
+ * FLY-314 reply routing (fix). For a top-level roundtable message:
+ *  - a FOLLOW-UP (Discord reply) routes into the REFERENCED message's thread
+ *    (confirm-only, never create) so it joins the topic instead of opening a second
+ *    thread; if that thread can't be confirmed the server keeps the parent channel.
+ *  - a NOISE message (pure emoji / short ack) is NOT routed to a thread at all.
+ *  - a fresh topic routes to its own thread (id == message id) with a descriptive
+ *    correct-from-start name.
+ * Everything else (already-in-thread, other channels, feature off) → unchanged.
+ */
 export function resolveRoundtableInboundChatId(
 	info: InboundChannelInfo,
 	cfg: RoundtableConfig,
 ): InboundChatIdResolution {
-	if (
-		cfg.replyInThread &&
-		!info.isThread &&
-		info.channelId === cfg.channelId
-	) {
-		// Thread is created from the message → thread id == message id.
+	if (cfg.replyInThread && !info.isThread && info.channelId === cfg.channelId) {
+		// Follow-up (Discord reply) → route into the referenced topic thread, confirm-only.
+		if (info.referencedMessageId) {
+			return {
+				chatId: info.referencedMessageId,
+				sourceMessageId: info.referencedMessageId,
+				routedToThread: true,
+				confirmOnly: true,
+			};
+		}
+		// Noise (pure emoji / short ack) → do not open a topic thread; reply in parent.
+		if (info.content !== undefined && isTopicNoise(info.content)) {
+			return { chatId: info.channelId, routedToThread: false };
+		}
+		// Fresh topic → its own thread (id == message id), create-or-confirm + name.
 		return {
 			chatId: info.messageId,
 			sourceMessageId: info.messageId,
 			routedToThread: true,
+			confirmOnly: false,
+			threadName: deriveRoundtableThreadName(info.content ?? ""),
 		};
 	}
 	return { chatId: info.channelId, routedToThread: false };
