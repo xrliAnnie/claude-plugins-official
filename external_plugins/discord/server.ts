@@ -773,6 +773,14 @@ async function gate(msg: Message): Promise<GateResult> {
   // FLY-898: a group MAY override the global name-mention patterns. An empty
   // per-group `mentionPatterns: []` makes the core room id-only (only a real
   // <@id> / reply-to-self counts — a bare name in text does not).
+  //
+  // FLY-898-PER-GROUP-MENTION-PATTERNS-ACTIVE — explicit support sentinel. The
+  // flywheel-side preflight (apply-core-room-mention-gate.sh) greps the RUNTIME
+  // server.ts for this exact token before it dares write a group's `mentionPatterns:
+  // []` (id-only). Keep this token ONLY while the gate genuinely routes through
+  // `resolveGroupMentionPatterns` at BOTH isMentioned call sites (above + here) — a
+  // deliberate, controlled marker can't false-positive on a helper definition or a
+  // half-finished impl the way a code-shape grep can (Codex FLY-898 R2 MEDIUM).
   if (
     requireMention &&
     !(await isMentioned(msg, resolveGroupMentionPatterns(policy, access)))
