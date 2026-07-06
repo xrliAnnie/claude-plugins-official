@@ -36,6 +36,7 @@ import { homedir } from 'os'
 import { join, sep } from 'path'
 import { parseIntInRange, type SendWithRetryOpts } from './retry'
 import { sendReplyChunks } from './reply-send'
+import { resolveGroupMentionPatterns } from './mention-patterns'
 import {
   loadRoundtableConfig,
   resolveRoundtableInboundChatId,
@@ -460,6 +461,12 @@ type PendingEntry = {
 type GroupPolicy = {
   requireMention: boolean
   allowFrom: string[]
+  /** FLY-898: per-group name-mention patterns. When present, they OVERRIDE the
+   * global `access.mentionPatterns` for THIS group only. An EMPTY array `[]` makes
+   * the group id-only — a bare NAME in text no longer counts as a mention; only a
+   * real `<@id>` / reply-to-self does (used for a non-CoS lead's core room). Absent
+   * → fall back to the global patterns (byte-compat). */
+  mentionPatterns?: string[]
 }
 
 type Access = {
@@ -733,7 +740,11 @@ async function gate(msg: Message): Promise<GateResult> {
     const threadId = msg.channelId
     const botUserId = client.user?.id ?? ''
     const authorIsBot = msg.author.bot
-    const mentioned = await isMentioned(msg, access.mentionPatterns)
+    // FLY-898: per-group patterns override the global set for this group.
+    const mentioned = await isMentioned(
+      msg,
+      resolveGroupMentionPatterns(policy, access),
+    )
     // FLY-576: probe membership whenever it can affect the decision — not only when
     // autoContinue is on (the founder's non-@ relaxation needs it). Pure predicate keeps the
     // only logic testable; this call site is thin glue.
@@ -759,7 +770,13 @@ async function gate(msg: Message): Promise<GateResult> {
     return decision.handle ? { action: 'deliver', access } : { action: 'drop' }
   }
 
-  if (requireMention && !(await isMentioned(msg, access.mentionPatterns))) {
+  // FLY-898: a group MAY override the global name-mention patterns. An empty
+  // per-group `mentionPatterns: []` makes the core room id-only (only a real
+  // <@id> / reply-to-self counts — a bare name in text does not).
+  if (
+    requireMention &&
+    !(await isMentioned(msg, resolveGroupMentionPatterns(policy, access)))
+  ) {
     return { action: 'drop' }
   }
   return { action: 'deliver', access }
