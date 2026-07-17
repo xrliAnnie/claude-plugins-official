@@ -17,6 +17,11 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
+import {
+  buildInboundMeta,
+  formatHistoryRow,
+  resolveFounderTimezone,
+} from './founder-timezone'
 import { z } from 'zod'
 import {
   Client,
@@ -952,7 +957,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Discord, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="..." founder_local="...">. ts is the UTC machine timestamp. founder_local is that message instant rendered on the founder\'s wall clock in the currently resolved founder timezone; use founder_local, never UTC intuition, when reasoning about her hour, day, sleep, “tomorrow,” or deferring work. It does not claim to preserve the historical timezone where the message was sent. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -1218,6 +1223,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const msgs = await ch.messages.fetch({ limit })
         const me = client.user?.id
         const arr = [...msgs.values()].reverse()
+        const founderTimezone = resolveFounderTimezone()
         const out =
           arr.length === 0
             ? '(no messages)'
@@ -1230,7 +1236,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
                   // messages in an opted-in channel never hit the gate but
                   // still live in channel history).
                   const text = m.content.replace(/[\r\n]+/g, ' ⏎ ')
-                  return `[${m.createdAt.toISOString()}] ${who}: ${text}  (id: ${m.id}${atts})`
+                  return formatHistoryRow(
+                    {
+                      createdAt: m.createdAt,
+                      who,
+                      text,
+                      messageId: m.id,
+                      attachmentsSuffix: atts,
+                    },
+                    founderTimezone,
+                  )
                 })
                 .join('\n')
         return { content: [{ type: 'text', text: out }] }
@@ -1559,14 +1574,17 @@ async function handleInbound(msg: Message): Promise<void> {
     method: 'notifications/claude/channel',
     params: {
       content,
-      meta: {
-        chat_id,
-        message_id: msg.id,
-        user: msg.author.username,
-        user_id: msg.author.id,
-        ts: msg.createdAt.toISOString(),
-        ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
-      },
+      meta: buildInboundMeta(
+        {
+          chat_id,
+          message_id: msg.id,
+          user: msg.author.username,
+          user_id: msg.author.id,
+          ts: msg.createdAt.toISOString(),
+          ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
+        },
+        msg.createdAt,
+      ),
     },
   }).catch(err => {
     process.stderr.write(`discord channel: failed to deliver inbound to Claude: ${err}\n`)
