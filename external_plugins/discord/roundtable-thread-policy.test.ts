@@ -20,9 +20,11 @@ import {
 	classifyThreadCreate,
 	threadGetConfirmsExistence,
 	confirmThreadUnderParent,
+	buildRoundtableThreadCreateBody,
 	deriveRoundtableThreadName,
 	isTopicNoise,
 	rememberRoundtableRedirect,
+	resolveAutoArchiveMinutes,
 	shouldStripRoundtableReplyTo,
 	DEFAULT_ROUNDTABLE_THREAD_BUDGET,
 	type RoundtableConfig,
@@ -513,6 +515,28 @@ describe("deriveRoundtableThreadName / isTopicNoise / confirmThreadUnderParent â
 		expect(confirmThreadUnderParent({ type: 0, parent_id: RT }, RT)).toBe(false); // not a thread
 		expect(confirmThreadUnderParent({ type: 11, parent_id: "other" }, RT)).toBe(false); // wrong parent
 		expect(confirmThreadUnderParent(null, RT)).toBe(false);
+	});
+});
+
+describe("roundtable topic archive policy â€” FLY-802", () => {
+	test("resolves supported Discord channel defaults and falls back to 3 days", () => {
+		for (const minutes of [60, 1440, 4320, 10080]) {
+			expect(resolveAutoArchiveMinutes(minutes)).toBe(minutes);
+		}
+		expect(resolveAutoArchiveMinutes(null)).toBe(4320);
+		expect(resolveAutoArchiveMinutes(undefined)).toBe(4320);
+		expect(resolveAutoArchiveMinutes(30)).toBe(4320);
+	});
+
+	test("builds the create body from the descriptive name and parent default", () => {
+		expect(buildRoundtableThreadCreateBody("Deploy rollback plan", 60)).toEqual({
+			name: "Deploy rollback plan",
+			auto_archive_duration: 60,
+		});
+		expect(buildRoundtableThreadCreateBody(undefined, null)).toEqual({
+			name: "Roundtable topic",
+			auto_archive_duration: 4320,
+		});
 	});
 });
 

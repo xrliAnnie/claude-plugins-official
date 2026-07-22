@@ -132,6 +132,32 @@ export function confirmThreadUnderParent(
 export const ROUNDTABLE_PLACEHOLDER_NAME = "Roundtable topic";
 const MIN_TOPIC_CHARS = 3;
 
+/** Discord only accepts these native thread archive windows (in minutes). */
+export const VALID_AUTO_ARCHIVE_MINUTES = new Set([60, 1440, 4320, 10080]);
+export const DISCORD_API_DEFAULT_AUTO_ARCHIVE_MINUTES = 4320;
+
+/** Resolve a parent channel's default without introducing a channel-specific value. */
+export function resolveAutoArchiveMinutes(
+	channelDefault: number | null | undefined,
+): number {
+	return typeof channelDefault === "number" &&
+		VALID_AUTO_ARCHIVE_MINUTES.has(channelDefault)
+		? channelDefault
+		: DISCORD_API_DEFAULT_AUTO_ARCHIVE_MINUTES;
+}
+
+/** Build the Discord create payload in the pure policy module so it is testable
+ * without importing server.ts and starting the MCP/Discord process. */
+export function buildRoundtableThreadCreateBody(
+	desiredName: string | undefined,
+	channelDefault: number | null | undefined,
+): { name: string; auto_archive_duration: number } {
+	return {
+		name: desiredName || ROUNDTABLE_PLACEHOLDER_NAME,
+		auto_archive_duration: resolveAutoArchiveMinutes(channelDefault),
+	};
+}
+
 function stripDiscordMarkup(content: string): string {
 	return content
 		.replace(/<a?:\w+:\d+>/g, "") // custom emoji <:x:1> / <a:x:1>

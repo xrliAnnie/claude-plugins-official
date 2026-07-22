@@ -49,6 +49,8 @@ import {
   classifyThreadCreate,
   threadGetConfirmsExistence,
   confirmThreadUnderParent,
+  buildRoundtableThreadCreateBody,
+  resolveAutoArchiveMinutes,
   rememberRoundtableRedirect,
   shouldStripRoundtableReplyTo,
   type RoundtableConfig,
@@ -119,6 +121,49 @@ function rtRememberRedirect(threadId: string, ...sourceMessageIds: string[]): vo
 const rtMemberThreads = new Set<string>()
 
 const RT_DISCORD_API = 'https://discord.com/api/v10'
+const RT_ARCHIVE_DEFAULT_TTL_MS = 10 * 60 * 1000
+const rtArchiveDefaultCache = new Map<
+  string,
+  { minutes: number; fetchedAt: number }
+>()
+
+// FLY-802 — a channel's Discord-native default is the policy source for newborn
+// topic threads. The cache is module-scoped so the long-lived plugin process shares
+// it across every ensure call. Refresh failures use stale data when available and
+// otherwise preserve Discord's 3-day API default; thread creation never fails solely
+// because the policy GET failed.
+async function resolveParentArchiveMinutes(parentChannelId: string): Promise<number> {
+  const cached = rtArchiveDefaultCache.get(parentChannelId)
+  const now = Date.now()
+  if (cached && now - cached.fetchedAt < RT_ARCHIVE_DEFAULT_TTL_MS) {
+    return cached.minutes
+  }
+
+  try {
+    if (!TOKEN) throw new Error('Discord bot token unavailable')
+    const res = await fetch(`${RT_DISCORD_API}/channels/${parentChannelId}`, {
+      headers: { Authorization: `Bot ${TOKEN}` },
+      signal: AbortSignal.timeout(5000),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const body = (await res.json()) as {
+      default_auto_archive_duration?: unknown
+    }
+    const channelDefault =
+      typeof body.default_auto_archive_duration === 'number'
+        ? body.default_auto_archive_duration
+        : null
+    const minutes = resolveAutoArchiveMinutes(channelDefault)
+    rtArchiveDefaultCache.set(parentChannelId, { minutes, fetchedAt: now })
+    return minutes
+  } catch (error) {
+    const fallback = cached?.minutes ?? resolveAutoArchiveMinutes(undefined)
+    process.stderr.write(
+      `[roundtable] parent archive default refresh failed for ${parentChannelId}; using ${cached ? 'stale' : 'Discord default'} ${fallback}: ${error}\n`,
+    )
+    return fallback
+  }
+}
 
 // FLY-569 R1#2 — GET-confirm bounded retry. A companion Claude lead (Belle/atlas)
 // may have View/Send in the roundtable parent but NOT `Create Public Threads`; the
@@ -184,6 +229,7 @@ async function ensureRoundtableThread(
     return false
   }
 
+  const archiveMinutes = await resolveParentArchiveMinutes(parentChannelId)
   let createStatus = 0 // 0 = network/timeout on create → treat as "maybe exists"
   let createCode: number | undefined
   try {
@@ -194,10 +240,9 @@ async function ensureRoundtableThread(
         headers: { Authorization: `Bot ${TOKEN}`, 'Content-Type': 'application/json' },
         // FLY-314 fix: correct-from-start descriptive name (no more hard-coded
         // 'Roundtable topic' placeholder). Falls back only when no name was derived.
-        body: JSON.stringify({
-          name: opts.desiredName || 'Roundtable topic',
-          auto_archive_duration: 4320,
-        }),
+        body: JSON.stringify(
+          buildRoundtableThreadCreateBody(opts.desiredName, archiveMinutes),
+        ),
         signal: AbortSignal.timeout(5000),
       },
     )
