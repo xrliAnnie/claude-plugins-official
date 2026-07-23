@@ -14,6 +14,12 @@ export interface SendPayload {
   reply?: { messageReference: string; failIfNotExists: boolean }
 }
 
+/** The Discord response fields used to prove that a reply reference persisted. */
+export interface SentMessage {
+  id: string
+  reference?: { messageId?: string } | null
+}
+
 export interface ReplyChunkOpts {
   files: string[]
   reply_to?: string
@@ -53,20 +59,25 @@ export function buildChunkPayload(
  * the delivered message ids.
  */
 export async function sendReplyChunks(
-  send: (payload: SendPayload) => Promise<{ id: string }>,
+  send: (payload: SendPayload) => Promise<SentMessage>,
   chunks: string[],
   opts: ReplyChunkOpts,
   retryOpts: SendWithRetryOpts,
-  onSent?: (id: string) => void,
+  onSent?: (
+    id: string,
+    payload: SendPayload,
+    sent: SentMessage,
+  ) => void | Promise<void>,
 ): Promise<string[]> {
   const sentIds: string[] = []
   try {
     for (let i = 0; i < chunks.length; i++) {
-      const sent = await sendWithRetry(() => send(buildChunkPayload(i, chunks, opts)), retryOpts)
+      const payload = buildChunkPayload(i, chunks, opts)
+      const sent = await sendWithRetry(() => send(payload), retryOpts)
       // Record delivery before the injected callback so a throwing onSent can
       // never make the catch block under-report what actually went out.
       sentIds.push(sent.id)
-      onSent?.(sent.id)
+      await onSent?.(sent.id, payload, sent)
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)

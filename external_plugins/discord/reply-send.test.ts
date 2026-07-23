@@ -57,6 +57,63 @@ describe('sendReplyChunks', () => {
     expect(seen.map(p => p.content)).toEqual(['a', 'b', 'c'])
   })
 
+  it('reports the exact payload and Discord-returned message to onSent', async () => {
+    const callbacks: Array<{
+      id: string
+      payload: SendPayload
+      sent: { id: string; reference: { messageId: string } }
+    }> = []
+    await sendReplyChunks(
+      async payload => ({
+        id: `sent-${payload.content}`,
+        reference: { messageId: 'inbound-1' },
+      }),
+      ['answer'],
+      { files: [], reply_to: 'inbound-1', replyMode: 'first' },
+      fastRetry,
+      (id, payload, sent) => callbacks.push({
+        id,
+        payload,
+        sent: sent as { id: string; reference: { messageId: string } },
+      }),
+    )
+    expect(callbacks).toEqual([{
+      id: 'sent-answer',
+      payload: {
+        content: 'answer',
+        reply: {
+          messageReference: 'inbound-1',
+          failIfNotExists: false,
+        },
+      },
+      sent: {
+        id: 'sent-answer',
+        reference: { messageId: 'inbound-1' },
+      },
+    }])
+  })
+
+  it('awaits onSent for a referenced first chunk even when a later chunk fails', async () => {
+    const settled: string[] = []
+    await expect(sendReplyChunks(
+      async payload => {
+        if (payload.content === 'tail') throw { code: 'ETIMEDOUT' }
+        return {
+          id: 'reply-1',
+          reference: { messageId: 'inbound-1' },
+        }
+      },
+      ['referenced', 'tail'],
+      { files: [], reply_to: 'inbound-1', replyMode: 'first' },
+      { ...fastRetry, maxRetries: 0 },
+      async (_id, _payload, sent) => {
+        await Promise.resolve()
+        if (sent.reference?.messageId) settled.push(sent.reference.messageId)
+      },
+    )).rejects.toThrow(/after delivering 1 of 2/)
+    expect(settled).toEqual(['inbound-1'])
+  })
+
   it('retries a transient failure within a chunk without duplicating earlier chunks', async () => {
     const sentContent: string[] = []
     let chunk1Attempts = 0
