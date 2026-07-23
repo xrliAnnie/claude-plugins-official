@@ -6,8 +6,8 @@ the Flywheel receipt capability tuple is present:
 1. `chat-receipt begin` runs before typing, reactions, or MCP delivery.
 2. The MCP notification carries `receipt_id=chat:<lead_id>:<message_id>`.
 3. `chat-receipt complete` runs only after that notification resolves.
-4. A successfully sent reply payload with
-   `reply.messageReference=<message_id>` runs `chat-receipt settle`.
+4. A successfully returned Discord message whose persisted
+   `reference.messageId=<message_id>` runs `chat-receipt settle`.
 
 The producer is idempotent because the PR-1 CLI owns the stable receipt id.
 Roundtable cross-channel reference stripping, `replyToMode=off`, and failed
@@ -22,6 +22,8 @@ real handling side effect in those cases.
 event-driven worker runs on Discord ready and after each accept:
 
 - retries at most 5 spool intents per pass;
+- persists failed settlement proofs under `chat-receipt-spool/settle/` and
+  retries them after transient CLI failures or process restarts;
 - scans at most 100 undelivered `chat:` rows per pass in pages of 20;
 - skips message ids still inside the live accept boundary;
 - quarantines rows older than 48 hours before redelivery;

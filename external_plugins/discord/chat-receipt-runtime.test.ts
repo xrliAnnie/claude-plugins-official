@@ -262,6 +262,80 @@ describe('producer accept boundary', () => {
 })
 
 describe('recovery worker', () => {
+  it('persists a failed settle proof and recovers it after process restart', async () => {
+    const dir = tempDir()
+    let settleCalls = 0
+    const failingRuntime = new ChatReceiptRuntime({
+      mode: enabledMode(),
+      stateDir: dir,
+      runCommand: async argv => {
+        if (subcommand(argv) === 'settle') {
+          settleCalls++
+          return result('', 1, 'database busy')
+        }
+        if (subcommand(argv) === 'pending') {
+          return result(JSON.stringify({ rows: [], nextCursor: 0 }))
+        }
+        return result('{}')
+      },
+      notify: async () => {},
+      advise: async () => {},
+      sleep: async () => {},
+    })
+
+    expect(await failingRuntime.settle(
+      begin.messageId,
+      '100000000000000099',
+      begin.chatId,
+    )).toBe(false)
+    await failingRuntime.whenIdle()
+
+    expect(settleCalls).toBe(2)
+    const settleDir = join(dir, 'chat-receipt-spool', 'settle')
+    const settlePath = join(
+      settleDir,
+      `${begin.messageId}.json`,
+    )
+    expect(statSync(settleDir).mode & 0o777).toBe(0o700)
+    expect(statSync(settlePath).mode & 0o777).toBe(0o600)
+    expect(JSON.parse(readFileSync(settlePath, 'utf8'))).toMatchObject({
+      v: 1,
+      messageId: begin.messageId,
+      replyId: '100000000000000099',
+      chatId: begin.chatId,
+      attempts: 1,
+      advisedAt: null,
+    })
+
+    const restartedRuntime = new ChatReceiptRuntime({
+      mode: enabledMode(),
+      stateDir: dir,
+      runCommand: async argv => {
+        if (subcommand(argv) === 'settle') {
+          settleCalls++
+          return result('{}')
+        }
+        if (subcommand(argv) === 'pending') {
+          return result(JSON.stringify({ rows: [], nextCursor: 0 }))
+        }
+        return result('{}')
+      },
+      notify: async () => {},
+      advise: async () => {},
+      sleep: async () => {},
+    })
+    restartedRuntime.kickWorker()
+    await restartedRuntime.whenIdle()
+
+    expect(settleCalls).toBe(3)
+    expect(existsSync(join(
+      dir,
+      'chat-receipt-spool',
+      'settle',
+      `${begin.messageId}.json`,
+    ))).toBe(false)
+  })
+
   it('drains a failed begin idempotently without completing it directly', async () => {
     const dir = tempDir()
     let healthy = false

@@ -53,6 +53,15 @@ interface AdviceMarker {
   advisedAt: string | null
 }
 
+interface SettleIntentV1 {
+  v: 1
+  messageId: string
+  replyId: string
+  chatId?: string
+  attempts: number
+  advisedAt: string | null
+}
+
 interface PassResult {
   progress: boolean
   workRemains: boolean
@@ -90,6 +99,7 @@ export class ChatReceiptRuntime {
   private readonly log: (line: string) => void
   private readonly spoolDir: string
   private readonly metaDir: string
+  private readonly settleDir: string
   private readonly writeIntent: (path: string, intent: SpoolIntentV1) => void
   private readonly activeAccept = new Set<string>()
   private lastChatId: string | undefined
@@ -106,6 +116,7 @@ export class ChatReceiptRuntime {
     this.log = opts.log ?? (line => process.stderr.write(`[chat-receipt] ${line}\n`))
     this.spoolDir = opts.spoolDir ?? join(opts.stateDir, 'chat-receipt-spool')
     this.metaDir = join(this.spoolDir, 'meta')
+    this.settleDir = join(this.spoolDir, 'settle')
     this.writeIntent = opts.writeIntent ?? writeIntentAtomic
   }
 
@@ -173,21 +184,43 @@ export class ChatReceiptRuntime {
     return this.complete(args.messageId)
   }
 
-  async settle(messageId: string, replyId: string): Promise<boolean> {
+  async settle(
+    messageId: string,
+    replyId: string,
+    chatId?: string,
+  ): Promise<boolean> {
     if (this.mode.kind !== 'enabled') return true
-    const command = await this.invoke('settle', [
-      '--lead',
-      this.mode.leadId,
-      '--message-id',
-      messageId,
-      '--reply-id',
-      replyId,
-      '--json',
-    ])
+    const command = await this.invokeSettle(messageId, replyId)
     if (!succeeded(command)) {
       this.log(`settle failed for ${messageId}: ${command.stderr || command.stdout}`)
+      try {
+        this.ensureSettleDir()
+        const path = this.settleIntentPath(messageId)
+        const existing = readSettleIntent(path)
+        const intent: SettleIntentV1 = existing ?? {
+          v: 1,
+          messageId,
+          replyId,
+          ...(chatId ? { chatId } : {}),
+          attempts: 0,
+          advisedAt: null,
+        }
+        writeJsonAtomic(path, intent)
+        this.kickWorker()
+      } catch (error) {
+        this.log(`settle recovery write failed for ${messageId}: ${errorText(error)}`)
+        try {
+          await this.advise(
+            chatId,
+            `Chat receipt settlement proof could not persist its recovery intent for message ${messageId}; operator repair is required.`,
+          )
+        } catch (adviseError) {
+          this.log(`settle recovery advisory also failed: ${errorText(adviseError)}`)
+        }
+      }
       return false
     }
+    rmSync(this.settleIntentPath(messageId), { force: true })
     return true
   }
 
@@ -250,10 +283,11 @@ export class ChatReceiptRuntime {
 
   private async runRecoveryPass(): Promise<PassResult> {
     const spool = await this.drainSpoolPass()
+    const settle = await this.drainSettlePass()
     const pending = await this.reconcilePendingPass()
     return {
-      progress: spool.progress || pending.progress,
-      workRemains: spool.workRemains || pending.workRemains,
+      progress: spool.progress || settle.progress || pending.progress,
+      workRemains: spool.workRemains || settle.workRemains || pending.workRemains,
     }
   }
 
@@ -321,6 +355,55 @@ export class ChatReceiptRuntime {
     intents = this.listIntentFiles()
     if (intents.length === 0) this.removeDepthMarker()
     return { progress, workRemains: intents.length > 0 }
+  }
+
+  private async drainSettlePass(): Promise<PassResult> {
+    let paths = this.listSettleIntentFiles()
+    let progress = false
+    for (const path of paths.slice(0, SPOOL_PER_PASS)) {
+      const intent = readSettleIntent(path)
+      if (!intent) {
+        const corruptPath = `${path}.corrupt`
+        try {
+          renameSync(path, corruptPath)
+        } catch (error) {
+          this.log(`could not preserve corrupt settle intent ${basename(path)}: ${errorText(error)}`)
+        }
+        await this.adviseWithMarker(
+          'settle-corrupt-advised.json',
+          this.lastChatId,
+          `Chat receipt recovery found a corrupt settlement intent (${basename(path)}); the original was preserved with a .corrupt suffix.`,
+        )
+        continue
+      }
+
+      const command = await this.invokeSettle(intent.messageId, intent.replyId)
+      if (succeeded(command)) {
+        rmSync(path, { force: true })
+        progress = true
+        continue
+      }
+
+      intent.attempts += 1
+      if (intent.attempts > FILE_RETRY_ADVISE_AFTER && intent.advisedAt === null) {
+        try {
+          await this.advise(
+            intent.chatId,
+            `Chat receipt settlement recovery has failed ${intent.attempts} times for message ${intent.messageId}.`,
+          )
+          intent.advisedAt = this.now().toISOString()
+        } catch (error) {
+          this.log(`settle retry advisory failed for ${intent.messageId}: ${errorText(error)}`)
+        }
+      }
+      try {
+        writeJsonAtomic(path, intent)
+      } catch (error) {
+        this.log(`could not update settle retry state for ${intent.messageId}: ${errorText(error)}`)
+      }
+    }
+    paths = this.listSettleIntentFiles()
+    return { progress, workRemains: paths.length > 0 }
   }
 
   private async reconcilePendingPass(): Promise<PassResult> {
@@ -432,6 +515,18 @@ export class ChatReceiptRuntime {
     }
   }
 
+  private invokeSettle(messageId: string, replyId: string): Promise<CommandResult> {
+    return this.invoke('settle', [
+      '--lead',
+      this.mode.kind === 'enabled' ? this.mode.leadId : '',
+      '--message-id',
+      messageId,
+      '--reply-id',
+      replyId,
+      '--json',
+    ])
+  }
+
   private ensureSpoolDir(): void {
     mkdirSync(this.spoolDir, { recursive: true, mode: 0o700 })
     chmodSync(this.spoolDir, 0o700)
@@ -441,11 +536,28 @@ export class ChatReceiptRuntime {
     return join(this.spoolDir, `${messageId}.json`)
   }
 
+  private ensureSettleDir(): void {
+    mkdirSync(this.settleDir, { recursive: true, mode: 0o700 })
+    chmodSync(this.settleDir, 0o700)
+  }
+
+  private settleIntentPath(messageId: string): string {
+    return join(this.settleDir, `${messageId}.json`)
+  }
+
   private listIntentFiles(): string[] {
     if (!existsSync(this.spoolDir)) return []
     return readdirSync(this.spoolDir)
       .filter(isIntentFilename)
       .map(name => join(this.spoolDir, name))
+      .sort((a, b) => statSync(a).mtimeMs - statSync(b).mtimeMs)
+  }
+
+  private listSettleIntentFiles(): string[] {
+    if (!existsSync(this.settleDir)) return []
+    return readdirSync(this.settleDir)
+      .filter(isIntentFilename)
+      .map(name => join(this.settleDir, name))
       .sort((a, b) => statSync(a).mtimeMs - statSync(b).mtimeMs)
   }
 
@@ -652,6 +764,26 @@ function readAdviceMarker(path: string): AdviceMarker | undefined {
       (parsed.advisedAt === null || typeof parsed.advisedAt === 'string')
     ) {
       return parsed
+    }
+  } catch {}
+  return undefined
+}
+
+function readSettleIntent(path: string): SettleIntentV1 | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<SettleIntentV1>
+    if (
+      parsed.v === 1 &&
+      typeof parsed.messageId === 'string' &&
+      isIntentFilename(`${parsed.messageId}.json`) &&
+      typeof parsed.replyId === 'string' &&
+      isIntentFilename(`${parsed.replyId}.json`) &&
+      (parsed.chatId === undefined || typeof parsed.chatId === 'string') &&
+      Number.isSafeInteger(parsed.attempts) &&
+      (parsed.attempts as number) >= 0 &&
+      (parsed.advisedAt === null || typeof parsed.advisedAt === 'string')
+    ) {
+      return parsed as SettleIntentV1
     }
   } catch {}
   return undefined

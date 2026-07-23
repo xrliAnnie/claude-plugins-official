@@ -35,7 +35,11 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir } from 'os'
 import { join, sep } from 'path'
 import { parseIntInRange, type SendWithRetryOpts } from './retry'
-import { sendReplyChunks } from './reply-send'
+import {
+  sendReplyChunks,
+  type SendPayload,
+  type SentMessage,
+} from './reply-send'
 import {
   buildBeginArgs,
   receiptInboundInstruction,
@@ -43,7 +47,7 @@ import {
   receiptReplyToolDescription,
   resolveFounderId,
   resolveRecorderMode,
-  sentPayloadCarriesReference,
+  sentMessageCarriesReference,
   type BeginArgs,
 } from './chat-receipt-recorder'
 import { ChatReceiptRuntime } from './chat-receipt-runtime'
@@ -1222,17 +1226,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
         const chunks = chunk(text, limit, mode)
-        let receiptReplyId: string | undefined
+        let receiptSettled = false
         const onSent =
           RECORDER_MODE.kind === 'enabled'
-            ? (id: string, payload: Parameters<typeof sentPayloadCarriesReference>[0]) => {
+            ? async (
+                id: string,
+                _payload: SendPayload,
+                sent: SentMessage,
+              ) => {
                 noteSent(id)
                 if (
-                  !receiptReplyId &&
+                  !receiptSettled &&
                   reply_to &&
-                  sentPayloadCarriesReference(payload, reply_to)
+                  sentMessageCarriesReference(sent, reply_to)
                 ) {
-                  receiptReplyId = id
+                  receiptSettled = true
+                  await chatReceiptRuntime.settle(reply_to, id, chat_id)
                 }
               }
             : noteSent
@@ -1251,9 +1260,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           replyRetryOpts,
           onSent,
         )
-        if (RECORDER_MODE.kind === 'enabled' && reply_to && receiptReplyId) {
-          void chatReceiptRuntime.settle(reply_to, receiptReplyId)
-        }
 
         // FLY-676 initiator-seed: when THIS Lead posts a top-level topic to the roundtable
         // parent, seed its anti-loop budget keyed on the sent message id (== the future thread

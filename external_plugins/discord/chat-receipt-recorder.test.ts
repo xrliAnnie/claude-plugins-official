@@ -9,7 +9,7 @@ import {
   receiptReplyToolDescription,
   resolveFounderId,
   resolveRecorderMode,
-  sentPayloadCarriesReference,
+  sentMessageCarriesReference,
   type BeginArgs,
 } from './chat-receipt-recorder'
 
@@ -208,22 +208,19 @@ describe('spool intent codec', () => {
   })
 })
 
-describe('sentPayloadCarriesReference', () => {
-  it('settles only from the payload that actually carried the inbound reference', () => {
-    expect(sentPayloadCarriesReference({
-      content: 'done',
-      reply: {
-        messageReference: baseMessage.messageId,
-        failIfNotExists: false,
-      },
+describe('sentMessageCarriesReference', () => {
+  it('settles only from the reference Discord persisted on the returned message', () => {
+    expect(sentMessageCarriesReference({
+      id: '100000000000000090',
+      reference: { messageId: baseMessage.messageId },
     }, baseMessage.messageId)).toBe(true)
-    expect(sentPayloadCarriesReference({ content: 'done' }, baseMessage.messageId)).toBe(false)
-    expect(sentPayloadCarriesReference({
-      content: 'done',
-      reply: {
-        messageReference: '100000000000000099',
-        failIfNotExists: false,
-      },
+    expect(sentMessageCarriesReference({
+      id: '100000000000000091',
+      reference: null,
+    }, baseMessage.messageId)).toBe(false)
+    expect(sentMessageCarriesReference({
+      id: '100000000000000092',
+      reference: { messageId: '100000000000000099' },
     }, baseMessage.messageId)).toBe(false)
   })
 })

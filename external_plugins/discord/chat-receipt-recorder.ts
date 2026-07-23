@@ -183,11 +183,11 @@ export function isIntentFilename(name: string): boolean {
   return INTENT_FILENAME.test(name)
 }
 
-export function sentPayloadCarriesReference(
-  payload: { reply?: { messageReference?: string } },
+export function sentMessageCarriesReference(
+  sent: { reference?: { messageId?: string } | null },
   inboundMsgId: string,
 ): boolean {
-  return payload.reply?.messageReference === inboundMsgId
+  return sent.reference?.messageId === inboundMsgId
 }
 
 export function receiptInboundInstruction(mode: RecorderMode): string {
