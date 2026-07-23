@@ -262,7 +262,7 @@ describe('producer accept boundary', () => {
 })
 
 describe('recovery worker', () => {
-  it('does not turn a successful settle into reply failure when stale proof cleanup is corrupt', async () => {
+  it('does not turn a successful settle into reply failure when the intent path is unusable', async () => {
     const dir = tempDir()
     mkdirSync(join(
       dir,
@@ -271,12 +271,15 @@ describe('recovery worker', () => {
       `${begin.messageId}.json`,
     ), { recursive: true })
     const logs: string[] = []
+    const advisories: string[] = []
     const runtime = new ChatReceiptRuntime({
       mode: enabledMode(),
       stateDir: dir,
       runCommand: async () => result('{}'),
       notify: async () => {},
-      advise: async () => {},
+      advise: async (_chatId, text) => {
+        advisories.push(text)
+      },
       log: line => logs.push(line),
     })
 
@@ -286,8 +289,50 @@ describe('recovery worker', () => {
       begin.chatId,
     )).toBe(true)
     expect(logs).toEqual([
+      expect.stringContaining('settle recovery write failed'),
       expect.stringContaining('could not remove stale settle intent'),
     ])
+    expect(advisories).toEqual([
+      expect.stringContaining('could not persist its recovery intent'),
+    ])
+  })
+
+  it('persists the settle proof before the CLI runs (write-ahead)', async () => {
+    const dir = tempDir()
+    const settlePath = join(
+      dir,
+      'chat-receipt-spool',
+      'settle',
+      `${begin.messageId}.json`,
+    )
+    let intentDuringCli: boolean | null = null
+    const runtime = new ChatReceiptRuntime({
+      mode: enabledMode(),
+      stateDir: dir,
+      runCommand: async argv => {
+        if (subcommand(argv) === 'settle') {
+          // Snapshot durability at the moment the CLI starts: a crash while the
+          // CLI is in flight must already find the proof on disk.
+          intentDuringCli = existsSync(settlePath)
+          return result('{}')
+        }
+        if (subcommand(argv) === 'pending') {
+          return result(JSON.stringify({ rows: [], nextCursor: 0 }))
+        }
+        return result('{}')
+      },
+      notify: async () => {},
+      advise: async () => {},
+      sleep: async () => {},
+    })
+
+    expect(await runtime.settle(
+      begin.messageId,
+      '100000000000000099',
+      begin.chatId,
+    )).toBe(true)
+    expect(intentDuringCli).toBe(true)
+    expect(existsSync(settlePath)).toBe(false)
   })
 
   it('persists a failed settle proof and recovers it after process restart', async () => {

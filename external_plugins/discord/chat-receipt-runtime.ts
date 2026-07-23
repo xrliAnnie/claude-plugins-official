@@ -190,34 +190,41 @@ export class ChatReceiptRuntime {
     chatId?: string,
   ): Promise<boolean> {
     if (this.mode.kind !== 'enabled') return true
+    // Write-ahead: Discord has already persisted the reply reference, so the
+    // proof must be durable BEFORE the settle CLI runs — a crash while the CLI
+    // is in flight (or before a failure is observed) must leave a recovery
+    // intent behind. The CLI settle is same-evidence idempotent, so replaying
+    // a durable intent after a crash-past-success is a no-op success.
+    let intentWritten = false
+    try {
+      this.ensureSettleDir()
+      const path = this.settleIntentPath(messageId)
+      const existing = readSettleIntent(path)
+      const intent: SettleIntentV1 = existing ?? {
+        v: 1,
+        messageId,
+        replyId,
+        ...(chatId ? { chatId } : {}),
+        attempts: 0,
+        advisedAt: null,
+      }
+      writeJsonAtomic(path, intent)
+      intentWritten = true
+    } catch (error) {
+      this.log(`settle recovery write failed for ${messageId}: ${errorText(error)}`)
+      try {
+        await this.advise(
+          chatId,
+          `Chat receipt settlement proof could not persist its recovery intent for message ${messageId}; operator repair is required.`,
+        )
+      } catch (adviseError) {
+        this.log(`settle recovery advisory also failed: ${errorText(adviseError)}`)
+      }
+    }
     const command = await this.invokeSettle(messageId, replyId)
     if (!succeeded(command)) {
       this.log(`settle failed for ${messageId}: ${command.stderr || command.stdout}`)
-      try {
-        this.ensureSettleDir()
-        const path = this.settleIntentPath(messageId)
-        const existing = readSettleIntent(path)
-        const intent: SettleIntentV1 = existing ?? {
-          v: 1,
-          messageId,
-          replyId,
-          ...(chatId ? { chatId } : {}),
-          attempts: 0,
-          advisedAt: null,
-        }
-        writeJsonAtomic(path, intent)
-        this.kickWorker()
-      } catch (error) {
-        this.log(`settle recovery write failed for ${messageId}: ${errorText(error)}`)
-        try {
-          await this.advise(
-            chatId,
-            `Chat receipt settlement proof could not persist its recovery intent for message ${messageId}; operator repair is required.`,
-          )
-        } catch (adviseError) {
-          this.log(`settle recovery advisory also failed: ${errorText(adviseError)}`)
-        }
-      }
+      if (intentWritten) this.kickWorker()
       return false
     }
     try {
