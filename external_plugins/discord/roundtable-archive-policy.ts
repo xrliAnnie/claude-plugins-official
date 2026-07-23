@@ -1,5 +1,4 @@
 const DISCORD_API = "https://discord.com/api/v10";
-const DEFAULT_AUTO_ARCHIVE_MINUTES = 4320;
 const DEFAULT_TIMEOUT_MS = 5_000;
 const VALID_AUTO_ARCHIVE_MINUTES = new Set([60, 1440, 4320, 10080]);
 
@@ -19,16 +18,17 @@ export interface RoundtableThreadCreateBody {
  *
  * Discord does not apply `default_auto_archive_duration` to API-created
  * threads, so the plugin must read the parent channel and copy a legal value
- * explicitly. The read is bounded and fail-open: every failure warns and
- * returns Discord's API default so inbound message handling can still create
- * the thread.
+ * explicitly. The read is bounded and fail-closed: every failure warns and
+ * returns null so the caller can leave the message in the parent channel while
+ * the Bridge poller retries. Creating a 4320-minute thread here would make a
+ * transient cold-read failure permanent.
  */
 export async function buildRoundtableThreadCreateBody(
 	parentChannelId: string,
 	name: string,
 	botToken: string,
 	deps: RoundtableArchivePolicyDeps = {},
-): Promise<RoundtableThreadCreateBody> {
+): Promise<RoundtableThreadCreateBody | null> {
 	const fetchImpl = deps.fetchImpl ?? fetch;
 	const timeoutMs =
 		typeof deps.timeoutMs === "number" &&
@@ -44,7 +44,7 @@ export async function buildRoundtableThreadCreateBody(
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-	let archiveMinutes = DEFAULT_AUTO_ARCHIVE_MINUTES;
+	let archiveMinutes: number | undefined;
 	let failure: string | undefined;
 	try {
 		const response = await fetchImpl(
@@ -78,12 +78,13 @@ export async function buildRoundtableThreadCreateBody(
 
 	if (failure) {
 		warn(
-			`[roundtable] parent channel ${parentChannelId} archive default unavailable (${failure}); using ${DEFAULT_AUTO_ARCHIVE_MINUTES}`,
+			`[roundtable] parent channel ${parentChannelId} archive default unavailable (${failure}); refusing to create a fallback thread`,
 		);
+		return null;
 	}
 
 	return {
 		name,
-		auto_archive_duration: archiveMinutes,
+		auto_archive_duration: archiveMinutes!,
 	};
 }

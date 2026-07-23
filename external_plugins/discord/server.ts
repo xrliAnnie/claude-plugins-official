@@ -190,6 +190,12 @@ async function ensureRoundtableThread(
     opts.desiredName || 'Roundtable topic',
     TOKEN,
   )
+  if (!createBody) {
+    process.stderr.write(
+      `[roundtable] ensureThread ${targetMessageId}: parent archive policy unresolved; create held\n`,
+    )
+    return false
+  }
   let createStatus = 0 // 0 = network/timeout on create → treat as "maybe exists"
   let createCode: number | undefined
   try {
