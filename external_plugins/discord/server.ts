@@ -54,6 +54,7 @@ import {
   type RoundtableConfig,
 } from './roundtable-thread-policy'
 import { loadSharedRoundtableRouting } from './roundtable-shared-routing'
+import { buildRoundtableThreadCreateBody } from './roundtable-archive-policy'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -184,6 +185,17 @@ async function ensureRoundtableThread(
     return false
   }
 
+  const createBody = await buildRoundtableThreadCreateBody(
+    parentChannelId,
+    opts.desiredName || 'Roundtable topic',
+    TOKEN,
+  )
+  if (!createBody) {
+    process.stderr.write(
+      `[roundtable] ensureThread ${targetMessageId}: parent archive policy unresolved; create held\n`,
+    )
+    return false
+  }
   let createStatus = 0 // 0 = network/timeout on create → treat as "maybe exists"
   let createCode: number | undefined
   try {
@@ -194,10 +206,7 @@ async function ensureRoundtableThread(
         headers: { Authorization: `Bot ${TOKEN}`, 'Content-Type': 'application/json' },
         // FLY-314 fix: correct-from-start descriptive name (no more hard-coded
         // 'Roundtable topic' placeholder). Falls back only when no name was derived.
-        body: JSON.stringify({
-          name: opts.desiredName || 'Roundtable topic',
-          auto_archive_duration: 4320,
-        }),
+        body: JSON.stringify(createBody),
         signal: AbortSignal.timeout(5000),
       },
     )
