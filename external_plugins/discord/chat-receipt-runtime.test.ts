@@ -105,9 +105,20 @@ describe('real built chat-receipt CLI', () => {
     const before = await Bun.$`sqlite3 ${dbPath} "select count(*) from lead_inbox where id='chat:flywheel-eng-lead:100000000000000011'"`.text()
     expect(before.trim()).toBe('1')
 
-    expect(await runtime.complete(begin.messageId)).toBe(true)
-    const delivered = await Bun.$`sqlite3 -separator '|' ${dbPath} "select delivered_at is not null, processed_at is null from lead_inbox where id='chat:flywheel-eng-lead:100000000000000011'"`.text()
-    expect(delivered.trim()).toBe('1|1')
+    const priorP0 = process.env.FLYWHEEL_RECEIPT_WINDOW_P0_MIN
+    const priorP1 = process.env.FLYWHEEL_RECEIPT_WINDOW_P1_MIN
+    process.env.FLYWHEEL_RECEIPT_WINDOW_P0_MIN = '2'
+    process.env.FLYWHEEL_RECEIPT_WINDOW_P1_MIN = '30'
+    try {
+      expect(await runtime.complete(begin.messageId)).toBe(true)
+    } finally {
+      if (priorP0 === undefined) delete process.env.FLYWHEEL_RECEIPT_WINDOW_P0_MIN
+      else process.env.FLYWHEEL_RECEIPT_WINDOW_P0_MIN = priorP0
+      if (priorP1 === undefined) delete process.env.FLYWHEEL_RECEIPT_WINDOW_P1_MIN
+      else process.env.FLYWHEEL_RECEIPT_WINDOW_P1_MIN = priorP1
+    }
+    const delivered = await Bun.$`sqlite3 -separator '|' ${dbPath} "select delivered_at is not null, processed_at is null, unixepoch(next_unprocessed_at) - unixepoch(delivered_at) from lead_inbox where id='chat:flywheel-eng-lead:100000000000000011'"`.text()
+    expect(delivered.trim()).toBe('1|1|120')
 
     expect(await runtime.settle(begin.messageId, '100000000000000099')).toBe(true)
     const settled = await Bun.$`sqlite3 -separator '|' ${dbPath} "select processed_at is not null, json_extract(processed_evidence, '$.kind'), json_extract(processed_evidence, '$.ref') from lead_inbox where id='chat:flywheel-eng-lead:100000000000000011'"`.text()
