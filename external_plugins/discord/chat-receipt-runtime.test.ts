@@ -262,6 +262,34 @@ describe('producer accept boundary', () => {
 })
 
 describe('recovery worker', () => {
+  it('does not turn a successful settle into reply failure when stale proof cleanup is corrupt', async () => {
+    const dir = tempDir()
+    mkdirSync(join(
+      dir,
+      'chat-receipt-spool',
+      'settle',
+      `${begin.messageId}.json`,
+    ), { recursive: true })
+    const logs: string[] = []
+    const runtime = new ChatReceiptRuntime({
+      mode: enabledMode(),
+      stateDir: dir,
+      runCommand: async () => result('{}'),
+      notify: async () => {},
+      advise: async () => {},
+      log: line => logs.push(line),
+    })
+
+    expect(await runtime.settle(
+      begin.messageId,
+      '100000000000000099',
+      begin.chatId,
+    )).toBe(true)
+    expect(logs).toEqual([
+      expect.stringContaining('could not remove stale settle intent'),
+    ])
+  })
+
   it('persists a failed settle proof and recovers it after process restart', async () => {
     const dir = tempDir()
     let settleCalls = 0

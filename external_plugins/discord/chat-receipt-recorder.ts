@@ -59,7 +59,7 @@ export interface SpoolIntentV1 {
   advisedAt: string | null
 }
 
-const DISCORD_SNOWFLAKE = /^\d+$/
+const DISCORD_SNOWFLAKE = /^\d{17,20}$/
 const INTENT_FILENAME = /^\d{17,20}\.json$/
 const STOCK_INBOUND_INSTRUCTION =
   'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.'
@@ -109,6 +109,7 @@ export function resolveRecorderMode(
 }
 
 function dotenvValue(text: string, key: string): string | undefined {
+  let value: string | undefined
   for (const line of text.split(/\r?\n/)) {
     const match = line.match(/^\s*(?:export\s+)?([A-Za-z_]\w*)\s*=\s*(.*?)\s*$/)
     if (!match || match[1] !== key) continue
@@ -118,11 +119,12 @@ function dotenvValue(text: string, key: string): string | undefined {
       ((raw.startsWith('"') && raw.endsWith('"')) ||
         (raw.startsWith("'") && raw.endsWith("'")))
     ) {
-      return raw.slice(1, -1)
+      value = raw.slice(1, -1)
+    } else {
+      value = raw
     }
-    return raw
   }
-  return undefined
+  return value
 }
 
 function isSnowflake(value: unknown): value is string {
@@ -137,6 +139,21 @@ export function resolveFounderId(input: {
   if (isSnowflake(live)) return live
   const inherited = present(input.env.DISCORD_OWNER_USER_ID)
   return isSnowflake(inherited) ? inherited : undefined
+}
+
+export function resolveFounderIdForMode(
+  mode: RecorderMode,
+  input: {
+    env: Record<string, string | undefined>
+    readEnvFile: () => string
+  },
+): string | undefined {
+  if (mode.kind !== 'enabled') return undefined
+  let envFileText = ''
+  try {
+    envFileText = input.readEnvFile()
+  } catch {}
+  return resolveFounderId({ env: input.env, envFileText })
 }
 
 export function buildBeginArgs(

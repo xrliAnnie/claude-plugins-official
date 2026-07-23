@@ -8,6 +8,7 @@ import {
   receiptReplyToDescription,
   receiptReplyToolDescription,
   resolveFounderId,
+  resolveFounderIdForMode,
   resolveRecorderMode,
   sentMessageCarriesReference,
   type BeginArgs,
@@ -84,11 +85,46 @@ describe('resolveRecorderMode', () => {
 })
 
 describe('resolveFounderId', () => {
+  it('does not read the host Flywheel env outside enabled mode', () => {
+    let reads = 0
+    const input = {
+      env: { DISCORD_OWNER_USER_ID: '100000000000000010' },
+      readEnvFile: () => {
+        reads++
+        return 'DISCORD_OWNER_USER_ID=100000000000000011\n'
+      },
+    }
+    expect(resolveFounderIdForMode(
+      { kind: 'disabled', reason: 'isolated' },
+      input,
+    )).toBeUndefined()
+    expect(resolveFounderIdForMode(
+      { kind: 'broken', missing: ['FLYWHEEL_COMM_DB'] },
+      input,
+    )).toBeUndefined()
+    expect(reads).toBe(0)
+
+    expect(resolveFounderIdForMode(resolveRecorderMode(enabledEnv), input))
+      .toBe('100000000000000011')
+    expect(reads).toBe(1)
+  })
+
   it('prefers the live ~/.flywheel/.env value over inherited process env', () => {
     expect(resolveFounderId({
       env: { DISCORD_OWNER_USER_ID: '100000000000000010' },
       envFileText: 'DISCORD_OWNER_USER_ID=100000000000000011\n',
     })).toBe('100000000000000011')
+  })
+
+  it('uses the last uncommented live assignment during config rotation', () => {
+    expect(resolveFounderId({
+      env: { DISCORD_OWNER_USER_ID: '100000000000000010' },
+      envFileText: [
+        'DISCORD_OWNER_USER_ID=100000000000000011',
+        '# DISCORD_OWNER_USER_ID=100000000000000012',
+        'export DISCORD_OWNER_USER_ID="100000000000000013"',
+      ].join('\n'),
+    })).toBe('100000000000000013')
   })
 
   it('falls back to inherited env and rejects non-snowflakes', () => {
@@ -98,6 +134,10 @@ describe('resolveFounderId', () => {
     })).toBe('100000000000000012')
     expect(resolveFounderId({
       env: { DISCORD_OWNER_USER_ID: 'bad' },
+      envFileText: '',
+    })).toBeUndefined()
+    expect(resolveFounderId({
+      env: { DISCORD_OWNER_USER_ID: '123' },
       envFileText: '',
     })).toBeUndefined()
   })

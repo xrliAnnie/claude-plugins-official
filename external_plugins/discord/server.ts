@@ -45,7 +45,7 @@ import {
   receiptInboundInstruction,
   receiptReplyToDescription,
   receiptReplyToolDescription,
-  resolveFounderId,
+  resolveFounderIdForMode,
   resolveRecorderMode,
   sentMessageCarriesReference,
   type BeginArgs,
@@ -89,11 +89,10 @@ try {
 const TOKEN = process.env.DISCORD_BOT_TOKEN
 const STATIC = process.env.DISCORD_ACCESS_MODE === 'static'
 const RECORDER_MODE = resolveRecorderMode(process.env)
-let flywheelEnvText = ''
-try {
-  flywheelEnvText = readFileSync(join(homedir(), '.flywheel', '.env'), 'utf8')
-} catch {}
-const FOUNDER_ID = resolveFounderId({ env: process.env, envFileText: flywheelEnvText })
+const FOUNDER_ID = resolveFounderIdForMode(RECORDER_MODE, {
+  env: process.env,
+  readEnvFile: () => readFileSync(join(homedir(), '.flywheel', '.env'), 'utf8'),
+})
 if (RECORDER_MODE.kind === 'broken') {
   process.stderr.write(
     `CHAT RECEIPT WIRING BROKEN: missing ${RECORDER_MODE.missing.join(', ')}; inbound delivery remains fail-open\n`,

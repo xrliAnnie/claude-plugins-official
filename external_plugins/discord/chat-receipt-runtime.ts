@@ -220,7 +220,11 @@ export class ChatReceiptRuntime {
       }
       return false
     }
-    rmSync(this.settleIntentPath(messageId), { force: true })
+    try {
+      rmSync(this.settleIntentPath(messageId), { force: true })
+    } catch (error) {
+      this.log(`could not remove stale settle intent for ${messageId}: ${errorText(error)}`)
+    }
     return true
   }
 

@@ -44,9 +44,11 @@ latched only after its Discord send succeeds.
 - `FLYWHEEL_CHAT_RECEIPTS=0`: disabled kill switch.
 - Any other partial tuple: fail-open delivery plus a durable visible warning.
 
-Founder priority resolves `DISCORD_OWNER_USER_ID` from the live
-`~/.flywheel/.env` before inherited process environment. If it is unavailable,
-receipts use P1 and startup logs the downgrade.
+Founder priority resolves the last uncommented `DISCORD_OWNER_USER_ID`
+assignment from the live `~/.flywheel/.env` before inherited process
+environment. The host Flywheel env file is read lazily only in enabled mode, so
+stock and isolated companion/external processes never load it. If founder
+identity is unavailable, receipts use P1 and startup logs the downgrade.
 
 ## Verification
 
