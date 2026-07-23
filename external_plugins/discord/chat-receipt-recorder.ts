@@ -61,6 +61,12 @@ export interface SpoolIntentV1 {
 
 const DISCORD_SNOWFLAKE = /^\d+$/
 const INTENT_FILENAME = /^\d{17,20}\.json$/
+const STOCK_INBOUND_INSTRUCTION =
+  'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.'
+const STOCK_REPLY_TOOL_DESCRIPTION =
+  'Reply on Discord. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or other files.'
+const STOCK_REPLY_TO_DESCRIPTION =
+  'Message ID to thread under. Use message_id from the inbound <channel> block, or an id from fetch_messages.'
 
 function present(value: string | undefined): string | undefined {
   const trimmed = value?.trim()
@@ -182,6 +188,21 @@ export function sentPayloadCarriesReference(
   inboundMsgId: string,
 ): boolean {
   return payload.reply?.messageReference === inboundMsgId
+}
+
+export function receiptInboundInstruction(mode: RecorderMode): string {
+  if (mode.kind !== 'enabled') return STOCK_INBOUND_INSTRUCTION
+  return 'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. A receipted message (meta has receipt_id) must be answered with explicit reply_to=<message_id>. When roundtable routing strips a cross-channel reference, close the receipt with handle-receipt ack instead; a message already inside a topic thread can carry a normal same-channel reply_to. Messages without receipt_id keep normal optional reply_to behavior.'
+}
+
+export function receiptReplyToolDescription(mode: RecorderMode): string {
+  if (mode.kind !== 'enabled') return STOCK_REPLY_TOOL_DESCRIPTION
+  return 'Reply on Discord. Pass chat_id from the inbound message. For a message whose meta has receipt_id, explicitly pass reply_to=<message_id>; if roundtable routing strips that cross-channel reference, use handle-receipt ack instead. A message already inside a topic thread can use a normal same-channel reply_to. Files accepts absolute paths for attachments.'
+}
+
+export function receiptReplyToDescription(mode: RecorderMode): string {
+  if (mode.kind !== 'enabled') return STOCK_REPLY_TO_DESCRIPTION
+  return 'Message ID to thread under. Explicit reply_to is required when the inbound meta has receipt_id so a successful referenced payload can settle it. If roundtable routing strips a cross-channel reference, use handle-receipt ack instead; messages already inside a topic thread can use their same-channel message_id.'
 }
 
 function normalizeSpoolIntent(value: unknown): SpoolIntentV1 {

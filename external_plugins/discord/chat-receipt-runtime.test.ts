@@ -2,11 +2,13 @@ import { afterEach, describe, expect, it } from 'bun:test'
 import {
   chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -77,8 +79,11 @@ function pendingRow(overrides: Record<string, unknown> = {}) {
 describe('real built chat-receipt CLI', () => {
   it('runs begin idempotently, completes delivery, and settles processed_at', async () => {
     const commCli = process.env.FLYWHEEL_COMM_CLI
-    if (!commCli || !existsSync(commCli)) {
-      throw new Error('FLYWHEEL_COMM_CLI must point at the built PR-1 CLI for this integration test')
+    if (!commCli || !existsSync(commCli) || !Bun.which('sqlite3')) {
+      process.stderr.write(
+        'SKIP LOUD: real chat-receipt integration requires FLYWHEEL_COMM_CLI and sqlite3\n',
+      )
+      return
     }
     const dir = tempDir()
     const dbPath = join(dir, 'comm.db')
@@ -159,6 +164,89 @@ describe('begin failure and durable spool', () => {
       chatId: begin.chatId,
       text: expect.stringContaining('could not persist'),
     }])
+  })
+})
+
+describe('broken wiring advisory', () => {
+  it('persists detected-before-send and latches only after a successful visible advisory', async () => {
+    const dir = tempDir()
+    let attempts = 0
+    const runtime = new ChatReceiptRuntime({
+      mode: { kind: 'broken', missing: ['FLYWHEEL_COMM_DB'] },
+      stateDir: dir,
+      notify: async () => {},
+      advise: async () => {
+        attempts++
+        if (attempts === 1) throw new Error('Discord unavailable')
+      },
+      now: () => new Date('2026-07-23T05:00:00.000Z'),
+    })
+
+    await runtime.adviseBroken(begin.chatId)
+    const marker = join(dir, 'chat-receipt-spool', 'meta', 'broken-advised.json')
+    expect(JSON.parse(readFileSync(marker, 'utf8'))).toEqual({
+      detectedAt: '2026-07-23T05:00:00.000Z',
+      advisedAt: null,
+    })
+
+    await runtime.adviseBroken(begin.chatId)
+    await runtime.adviseBroken(begin.chatId)
+    expect(attempts).toBe(2)
+    expect(JSON.parse(readFileSync(marker, 'utf8'))).toEqual({
+      detectedAt: '2026-07-23T05:00:00.000Z',
+      advisedAt: '2026-07-23T05:00:00.000Z',
+    })
+  })
+})
+
+describe('producer accept boundary', () => {
+  it('marks complete only after the inbound notification has resolved', async () => {
+    const dir = tempDir()
+    const order: string[] = []
+    let releaseNotify: (() => void) | undefined
+    const notificationGate = new Promise<void>(resolve => {
+      releaseNotify = resolve
+    })
+    const runtime = new ChatReceiptRuntime({
+      mode: enabledMode(),
+      stateDir: dir,
+      runCommand: async argv => {
+        order.push(subcommand(argv))
+        return result('{}')
+      },
+      notify: async () => {
+        order.push('notify-start')
+        await notificationGate
+        order.push('notify-done')
+      },
+      advise: async () => {},
+    })
+
+    const delivery = runtime.deliver(begin)
+    await Promise.resolve()
+    expect(order).toEqual(['notify-start'])
+    releaseNotify?.()
+    expect(await delivery).toBe(true)
+    expect(order).toEqual(['notify-start', 'notify-done', 'complete'])
+  })
+
+  it('does not complete when notification delivery rejects', async () => {
+    const commands: string[] = []
+    const runtime = new ChatReceiptRuntime({
+      mode: enabledMode(),
+      stateDir: tempDir(),
+      runCommand: async argv => {
+        commands.push(subcommand(argv))
+        return result('{}')
+      },
+      notify: async () => {
+        throw new Error('MCP closed')
+      },
+      advise: async () => {},
+    })
+
+    expect(await runtime.deliver(begin)).toBe(false)
+    expect(commands).toEqual([])
   })
 })
 
@@ -319,5 +407,101 @@ describe('recovery worker', () => {
     expect(readdirSync(join(dir, 'chat-receipt-spool')).filter(name => name.endsWith('.json'))).toEqual([])
     expect(beginCalls).toBe(24)
     expect(pendingCalls).toBeLessThanOrEqual(4)
+  })
+
+  it('preserves a kick that lands during a zero-work pass and drains the new intent', async () => {
+    const dir = tempDir()
+    let healthy = false
+    let beginCalls = 0
+    let releasePending: (() => void) | undefined
+    let announcePending: (() => void) | undefined
+    const pendingStarted = new Promise<void>(resolve => {
+      announcePending = resolve
+    })
+    const pendingGate = new Promise<void>(resolve => {
+      releasePending = resolve
+    })
+    let firstPending = true
+    const runCommand: RunCommand = async argv => {
+      const sub = subcommand(argv)
+      if (sub === 'begin') {
+        beginCalls++
+        return healthy ? result('{}') : result('', 1, 'down')
+      }
+      if (sub === 'pending') {
+        if (firstPending) {
+          firstPending = false
+          announcePending?.()
+          await pendingGate
+        }
+        return result(JSON.stringify({ rows: [], nextCursor: 0 }))
+      }
+      return result('{}')
+    }
+    const runtime = new ChatReceiptRuntime({
+      mode: enabledMode(),
+      stateDir: dir,
+      runCommand,
+      notify: async () => {},
+      advise: async () => {},
+      sleep: async () => {},
+    })
+
+    runtime.kickWorker()
+    await pendingStarted
+    expect(await runtime.begin(begin)).toBe('spooled')
+    healthy = true
+    runtime.kickWorker()
+    releasePending?.()
+    await runtime.whenIdle()
+
+    expect(beginCalls).toBe(2)
+    expect(existsSync(join(dir, 'chat-receipt-spool', `${begin.messageId}.json`))).toBe(false)
+  })
+
+  it('preserves corrupt intents, ignores metadata filenames, and retries the pending advisory', async () => {
+    const dir = tempDir()
+    const spool = join(dir, 'chat-receipt-spool')
+    mkdirSync(spool, { recursive: true })
+    const intent = join(spool, `${begin.messageId}.json`)
+    const unrelated = join(spool, 'depth-advised.json')
+    writeFileSync(intent, '{"v":1,"begin":')
+    writeFileSync(unrelated, 'operator-owned')
+    let advisoryAttempts = 0
+    const runtime = new ChatReceiptRuntime({
+      mode: enabledMode(),
+      stateDir: dir,
+      runCommand: async argv => {
+        if (subcommand(argv) === 'pending') {
+          return result(JSON.stringify({ rows: [], nextCursor: 0 }))
+        }
+        return result('{}')
+      },
+      notify: async () => {},
+      advise: async () => {
+        advisoryAttempts++
+        if (advisoryAttempts === 1) throw new Error('Discord unavailable')
+      },
+      now: () => new Date('2026-07-23T05:00:00.000Z'),
+      sleep: async () => {},
+    })
+
+    runtime.markAccepting(begin.messageId)
+    runtime.finishAccepting(begin.messageId)
+    await runtime.begin({ ...begin, messageId: '100000000000000099' })
+    runtime.kickWorker()
+    await runtime.whenIdle()
+    expect(existsSync(`${intent}.corrupt`)).toBe(true)
+    expect(readFileSync(unrelated, 'utf8')).toBe('operator-owned')
+    expect(JSON.parse(readFileSync(join(spool, 'meta', 'corrupt-advised.json'), 'utf8'))).toMatchObject({
+      advisedAt: null,
+    })
+
+    runtime.kickWorker()
+    await runtime.whenIdle()
+    expect(advisoryAttempts).toBe(2)
+    expect(JSON.parse(readFileSync(join(spool, 'meta', 'corrupt-advised.json'), 'utf8'))).toMatchObject({
+      advisedAt: '2026-07-23T05:00:00.000Z',
+    })
   })
 })

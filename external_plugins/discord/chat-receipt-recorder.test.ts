@@ -4,6 +4,9 @@ import {
   encodeSpoolIntent,
   isIntentFilename,
   parseSpoolIntent,
+  receiptInboundInstruction,
+  receiptReplyToDescription,
+  receiptReplyToolDescription,
   resolveFounderId,
   resolveRecorderMode,
   sentPayloadCarriesReference,
@@ -222,5 +225,32 @@ describe('sentPayloadCarriesReference', () => {
         failIfNotExists: false,
       },
     }, baseMessage.messageId)).toBe(false)
+  })
+})
+
+describe('receipt-aware MCP copy', () => {
+  const stockInbound = 'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.'
+  const stockTool = 'Reply on Discord. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or other files.'
+  const stockReplyTo = 'Message ID to thread under. Use message_id from the inbound <channel> block, or an id from fetch_messages.'
+
+  it('preserves all three stock strings exactly when receipts are not enabled', () => {
+    const disabled = { kind: 'disabled', reason: 'stock' } as const
+    expect(receiptInboundInstruction(disabled)).toBe(stockInbound)
+    expect(receiptReplyToolDescription(disabled)).toBe(stockTool)
+    expect(receiptReplyToDescription(disabled)).toBe(stockReplyTo)
+  })
+
+  it('requires explicit reply_to only for receipted messages and explains roundtable ack', () => {
+    const enabled = resolveRecorderMode(enabledEnv)
+    for (const copy of [
+      receiptInboundInstruction(enabled),
+      receiptReplyToolDescription(enabled),
+      receiptReplyToDescription(enabled),
+    ]) {
+      expect(copy).toContain('receipt_id')
+      expect(copy).toContain('reply_to')
+      expect(copy).toContain('handle-receipt ack')
+      expect(copy).toContain('topic thread')
+    }
   })
 })

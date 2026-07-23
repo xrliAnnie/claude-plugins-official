@@ -57,6 +57,27 @@ describe('sendReplyChunks', () => {
     expect(seen.map(p => p.content)).toEqual(['a', 'b', 'c'])
   })
 
+  it('reports the exact successfully-sent payload to onSent', async () => {
+    const callbacks: Array<{ id: string; payload: SendPayload }> = []
+    await sendReplyChunks(
+      async payload => ({ id: `sent-${payload.content}` }),
+      ['answer'],
+      { files: [], reply_to: 'inbound-1', replyMode: 'first' },
+      fastRetry,
+      (id, payload) => callbacks.push({ id, payload }),
+    )
+    expect(callbacks).toEqual([{
+      id: 'sent-answer',
+      payload: {
+        content: 'answer',
+        reply: {
+          messageReference: 'inbound-1',
+          failIfNotExists: false,
+        },
+      },
+    }])
+  })
+
   it('retries a transient failure within a chunk without duplicating earlier chunks', async () => {
     const sentContent: string[] = []
     let chunk1Attempts = 0

@@ -92,6 +92,7 @@ export class ChatReceiptRuntime {
   private readonly metaDir: string
   private readonly writeIntent: (path: string, intent: SpoolIntentV1) => void
   private readonly activeAccept = new Set<string>()
+  private lastChatId: string | undefined
   private dirty = false
   private workerPromise: Promise<void> | undefined
 
@@ -117,6 +118,7 @@ export class ChatReceiptRuntime {
   }
 
   async begin(args: BeginArgs): Promise<'ok' | 'spooled' | 'spool_failed'> {
+    this.lastChatId = args.chatId
     if (this.mode.kind !== 'enabled') return 'ok'
     const command = await this.invoke('begin', beginFlags(args), args.text)
     if (succeeded(command)) return 'ok'
@@ -156,6 +158,21 @@ export class ChatReceiptRuntime {
     ]))
   }
 
+  async deliver(args: BeginArgs): Promise<boolean> {
+    if (this.mode.kind !== 'enabled') return true
+    try {
+      await withTimeout(
+        this.notify(receiptNotification(args, false)),
+        COMMAND_TIMEOUT_MS,
+        'inbound notification',
+      )
+    } catch (error) {
+      this.log(`inbound notify failed for ${args.messageId}: ${errorText(error)}`)
+      return false
+    }
+    return this.complete(args.messageId)
+  }
+
   async settle(messageId: string, replyId: string): Promise<boolean> {
     if (this.mode.kind !== 'enabled') return true
     const command = await this.invoke('settle', [
@@ -172,6 +189,34 @@ export class ChatReceiptRuntime {
       return false
     }
     return true
+  }
+
+  async adviseBroken(chatId: string): Promise<void> {
+    if (this.mode.kind !== 'broken') return
+    this.lastChatId = chatId
+    try {
+      await this.adviseWithMarker(
+        'broken-advised.json',
+        chatId,
+        `Chat receipt recording is disabled because Flywheel wiring is incomplete (${this.mode.missing.join(', ')}). Delivery continued; operator repair is required.`,
+      )
+    } catch (error) {
+      this.log(`could not persist broken-wiring advisory state: ${errorText(error)}`)
+    }
+  }
+
+  async diagnoseNode(): Promise<void> {
+    if (this.mode.kind !== 'enabled') return
+    try {
+      const result = await this.runCommand(['node', '--version'], {
+        timeoutMs: COMMAND_TIMEOUT_MS,
+      })
+      if (!succeeded(result)) {
+        this.log(`node preflight failed (receipt delivery remains fail-open): ${result.stderr}`)
+      }
+    } catch (error) {
+      this.log(`node preflight spawn failed (receipt delivery remains fail-open): ${errorText(error)}`)
+    }
   }
 
   kickWorker(): void {
@@ -213,6 +258,7 @@ export class ChatReceiptRuntime {
   }
 
   private async drainSpoolPass(): Promise<PassResult> {
+    await this.retryPendingCorruptAdvice()
     let intents = this.listIntentFiles()
     if (intents.length === 0) {
       this.removeDepthMarker()
@@ -221,7 +267,7 @@ export class ChatReceiptRuntime {
     if (intents.length > DEPTH_ADVISE_AFTER) {
       await this.adviseWithMarker(
         'depth-advised.json',
-        undefined,
+        this.lastChatId,
         `Chat receipt recovery backlog has ${intents.length} pending intents.`,
       )
     }
@@ -240,7 +286,7 @@ export class ChatReceiptRuntime {
         }
         await this.adviseWithMarker(
           'corrupt-advised.json',
-          undefined,
+          this.lastChatId,
           `Chat receipt recovery found a corrupt intent file (${basename(path)}); the original was preserved with a .corrupt suffix.`,
         )
         continue
@@ -331,7 +377,11 @@ export class ChatReceiptRuntime {
           }
         }
         try {
-          await this.notify(receiptNotification(replay, true))
+          await withTimeout(
+            this.notify(receiptNotification(replay, true)),
+            COMMAND_TIMEOUT_MS,
+            'redelivery notification',
+          )
         } catch (error) {
           this.log(`redelivery notify failed for ${row.id}: ${errorText(error)}`)
           continue
@@ -424,6 +474,16 @@ export class ChatReceiptRuntime {
 
   private removeDepthMarker(): void {
     rmSync(join(this.metaDir, 'depth-advised.json'), { force: true })
+  }
+
+  private async retryPendingCorruptAdvice(): Promise<void> {
+    const marker = readAdviceMarker(join(this.metaDir, 'corrupt-advised.json'))
+    if (!marker || marker.advisedAt !== null) return
+    await this.adviseWithMarker(
+      'corrupt-advised.json',
+      this.lastChatId,
+      'Chat receipt recovery has a preserved corrupt intent file; operator inspection is required.',
+    )
   }
 }
 
@@ -599,4 +659,22 @@ function readAdviceMarker(path: string): AdviceMarker | undefined {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }

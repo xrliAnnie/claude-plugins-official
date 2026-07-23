@@ -36,6 +36,17 @@ import { homedir } from 'os'
 import { join, sep } from 'path'
 import { parseIntInRange, type SendWithRetryOpts } from './retry'
 import { sendReplyChunks } from './reply-send'
+import {
+  buildBeginArgs,
+  receiptInboundInstruction,
+  receiptReplyToDescription,
+  receiptReplyToolDescription,
+  resolveFounderId,
+  resolveRecorderMode,
+  sentPayloadCarriesReference,
+  type BeginArgs,
+} from './chat-receipt-recorder'
+import { ChatReceiptRuntime } from './chat-receipt-runtime'
 import { resolveGroupMentionPatterns } from './mention-patterns'
 import {
   loadRoundtableConfig,
@@ -73,6 +84,22 @@ try {
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN
 const STATIC = process.env.DISCORD_ACCESS_MODE === 'static'
+const RECORDER_MODE = resolveRecorderMode(process.env)
+let flywheelEnvText = ''
+try {
+  flywheelEnvText = readFileSync(join(homedir(), '.flywheel', '.env'), 'utf8')
+} catch {}
+const FOUNDER_ID = resolveFounderId({ env: process.env, envFileText: flywheelEnvText })
+if (RECORDER_MODE.kind === 'broken') {
+  process.stderr.write(
+    `CHAT RECEIPT WIRING BROKEN: missing ${RECORDER_MODE.missing.join(', ')}; inbound delivery remains fail-open\n`,
+  )
+}
+if (RECORDER_MODE.kind === 'enabled' && !FOUNDER_ID) {
+  process.stderr.write(
+    'chat receipt: DISCORD_OWNER_USER_ID unavailable; all inbound receipts use P1\n',
+  )
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // FLY-314 Phase 2 Part(b) — roundtable per-topic reply-in-thread.
@@ -952,7 +979,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Discord, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      receiptInboundInstruction(RECORDER_MODE),
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -962,6 +989,23 @@ const mcp = new Server(
     ].join('\n'),
   },
 )
+
+const chatReceiptRuntime = new ChatReceiptRuntime({
+  mode: RECORDER_MODE,
+  stateDir: STATE_DIR,
+  notify: notification =>
+    mcp.notification({
+      method: 'notifications/claude/channel',
+      params: notification,
+    }),
+  advise: async (chatId, text) => {
+    if (!chatId) throw new Error('no Discord chat is available for the receipt advisory')
+    const channel = await fetchAllowedChannel(chatId)
+    if (!('send' in channel)) throw new Error(`channel ${chatId} is not sendable`)
+    await channel.send({ content: `⚠️ ${text}` })
+  },
+})
+void chatReceiptRuntime.diagnoseNode()
 
 // Stores full permission details for "See more" expansion keyed by request_id.
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
@@ -1018,8 +1062,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: 'reply',
-      description:
-        'Reply on Discord. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or other files.',
+      description: receiptReplyToolDescription(RECORDER_MODE),
       inputSchema: {
         type: 'object',
         properties: {
@@ -1031,7 +1074,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           message: { type: 'string', description: 'Alias for `text` (prefer `text`).' },
           reply_to: {
             type: 'string',
-            description: 'Message ID to thread under. Use message_id from the inbound <channel> block, or an id from fetch_messages.',
+            description: receiptReplyToDescription(RECORDER_MODE),
           },
           files: {
             type: 'array',
@@ -1179,6 +1222,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
         const chunks = chunk(text, limit, mode)
+        let receiptReplyId: string | undefined
+        const onSent =
+          RECORDER_MODE.kind === 'enabled'
+            ? (id: string, payload: Parameters<typeof sentPayloadCarriesReference>[0]) => {
+                noteSent(id)
+                if (
+                  !receiptReplyId &&
+                  reply_to &&
+                  sentPayloadCarriesReference(payload, reply_to)
+                ) {
+                  receiptReplyId = id
+                }
+              }
+            : noteSent
 
         // FLY-306: send each chunk with bounded retry on transient failures.
         // The loop advances only on a successful send, so chunks already
@@ -1192,8 +1249,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           chunks,
           { files, reply_to, replyMode },
           replyRetryOpts,
-          noteSent,
+          onSent,
         )
+        if (RECORDER_MODE.kind === 'enabled' && reply_to && receiptReplyId) {
+          void chatReceiptRuntime.settle(reply_to, receiptReplyId)
+        }
 
         // FLY-676 initiator-seed: when THIS Lead posts a top-level topic to the roundtable
         // parent, seed its anti-loop budget keyed on the sent message id (== the future thread
@@ -1470,6 +1530,7 @@ async function handleInbound(msg: Message): Promise<void> {
   // first (idempotent; closes the race with the Bridge poller). Other channels / a
   // message already inside a thread / feature off → chat_id unchanged (byte-compat).
   let chat_id = msg.channelId
+  let routedToRoundtable = false
   if (RT_CFG) {
     const routed = resolveRoundtableInboundChatId(
       {
@@ -1495,6 +1556,7 @@ async function handleInbound(msg: Message): Promise<void> {
       })
       if (confirmed) {
         chat_id = routed.chatId
+        routedToRoundtable = true
         // Remember BOTH the routed topic source AND this message's own id so a
         // reply_to to either parent-channel id is stripped (FLY-314 Codex R3 HIGH#3).
         rtRememberRedirect(chat_id, routed.sourceMessageId, msg.id)
@@ -1530,51 +1592,106 @@ async function handleInbound(msg: Message): Promise<void> {
     return
   }
 
-  // Typing keepalive — refreshes every 8s so "Bot is typing..." persists
-  // until the reply tool is called (or the 10-minute safety cap expires).
-  if ('sendTyping' in msg.channel) {
-    startTypingKeepalive(msg.channel as { sendTyping(): Promise<void> }, chat_id)
-  }
-
-  // Ack reaction — lets the user know we're processing. Fire-and-forget.
-  const access = result.access
-  if (access.ackReaction) {
-    void msg.react(access.ackReaction).catch(() => {})
-  }
-
   // Attachments are listed (name/type/size) but not downloaded — the model
   // calls download_attachment when it wants them. Keeps the notification
   // fast and avoids filling inbox/ with images nobody looked at.
   const atts: string[] = []
+  const receiptAttachments: BeginArgs['attachments'] = []
   for (const att of msg.attachments.values()) {
     const kb = (att.size / 1024).toFixed(0)
-    atts.push(`${safeAttName(att)} (${att.contentType ?? 'unknown'}, ${kb}KB)`)
+    const name = safeAttName(att)
+    const type = att.contentType ?? 'unknown'
+    atts.push(`${name} (${type}, ${kb}KB)`)
+    receiptAttachments.push({ name, type, sizeKb: Number(kb) })
   }
 
   // Attachment listing goes in meta only — an in-content annotation is
   // forgeable by any allowlisted sender typing that string.
   const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
+  if (RECORDER_MODE.kind === 'broken') {
+    await chatReceiptRuntime.adviseBroken(chat_id).catch(err => {
+      process.stderr.write(`chat receipt: broken-wiring advisory failed: ${err}\n`)
+    })
+  }
 
-  mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content,
-      meta: {
-        chat_id,
-        message_id: msg.id,
-        user: msg.author.username,
-        user_id: msg.author.id,
+  let receiptArgs: BeginArgs | undefined
+  if (RECORDER_MODE.kind === 'enabled') {
+    receiptArgs = buildBeginArgs(
+      {
+        messageId: msg.id,
+        originChannelId: msg.channelId,
+        authorId: msg.author.id,
+        authorName: msg.author.username,
         ts: msg.createdAt.toISOString(),
-        ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
+        text: content,
+        attachments: receiptAttachments,
       },
-    },
-  }).catch(err => {
-    process.stderr.write(`discord channel: failed to deliver inbound to Claude: ${err}\n`)
-  })
+      {
+        leadId: RECORDER_MODE.leadId,
+        chatId: chat_id,
+        channelKind: msg.channel.type === ChannelType.DM ? 'dm' : 'guild',
+        routedToRoundtable,
+        inRoundtableThread:
+          !!RT_CFG &&
+          isRoundtableTopicThread(
+            {
+              isThread: msg.channel.isThread(),
+              parentId: msg.channel.isThread() ? msg.channel.parentId ?? null : null,
+            },
+            RT_CFG,
+          ),
+      },
+      FOUNDER_ID,
+    )
+    chatReceiptRuntime.markAccepting(msg.id)
+  }
+
+  try {
+    if (receiptArgs) await chatReceiptRuntime.begin(receiptArgs)
+
+    // Typing keepalive — refreshes every 8s so "Bot is typing..." persists
+    // until the reply tool is called (or the 10-minute safety cap expires).
+    if ('sendTyping' in msg.channel) {
+      startTypingKeepalive(msg.channel as { sendTyping(): Promise<void> }, chat_id)
+    }
+
+    // Ack reaction — lets the user know we're processing. Fire-and-forget.
+    const access = result.access
+    if (access.ackReaction) {
+      void msg.react(access.ackReaction).catch(() => {})
+    }
+
+    if (receiptArgs) {
+      await chatReceiptRuntime.deliver(receiptArgs)
+    } else {
+      mcp.notification({
+        method: 'notifications/claude/channel',
+        params: {
+          content,
+          meta: {
+            chat_id,
+            message_id: msg.id,
+            user: msg.author.username,
+            user_id: msg.author.id,
+            ts: msg.createdAt.toISOString(),
+            ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
+          },
+        },
+      }).catch(err => {
+        process.stderr.write(`discord channel: failed to deliver inbound to Claude: ${err}\n`)
+      })
+    }
+  } finally {
+    if (receiptArgs) {
+      chatReceiptRuntime.finishAccepting(msg.id)
+      chatReceiptRuntime.kickWorker()
+    }
+  }
 }
 
 client.once('ready', c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
+  chatReceiptRuntime.kickWorker()
 })
 
 client.login(TOKEN).catch(err => {
