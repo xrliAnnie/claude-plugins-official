@@ -1,0 +1,602 @@
+import { randomUUID } from 'node:crypto'
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
+import { basename, dirname, join } from 'node:path'
+import {
+  encodeSpoolIntent,
+  isIntentFilename,
+  parseSpoolIntent,
+  type BeginArgs,
+  type RecorderMode,
+  type SpoolIntentV1,
+} from './chat-receipt-recorder'
+
+export interface CommandResult {
+  stdout: string
+  stderr: string
+  exitCode: number
+  timedOut: boolean
+}
+
+export type RunCommand = (
+  argv: string[],
+  opts: { stdin?: string; timeoutMs: number },
+) => Promise<CommandResult>
+
+export interface ReceiptNotification {
+  content: string
+  meta: Record<string, string>
+}
+
+export type NotifyFn = (notification: ReceiptNotification) => Promise<void>
+export type AdviseFn = (chatId: string | undefined, text: string) => Promise<void>
+
+interface PendingRow {
+  seq: number
+  id: string
+  createdAt: string
+  envelope: (BeginArgs & { v: 1; receiptId: string }) | null
+  parse_error?: string
+}
+
+interface AdviceMarker {
+  detectedAt: string
+  advisedAt: string | null
+}
+
+interface PassResult {
+  progress: boolean
+  workRemains: boolean
+}
+
+export interface ChatReceiptRuntimeOptions {
+  mode: RecorderMode
+  stateDir: string
+  notify: NotifyFn
+  advise: AdviseFn
+  runCommand?: RunCommand
+  now?: () => Date
+  sleep?: (ms: number) => Promise<void>
+  log?: (line: string) => void
+  spoolDir?: string
+  writeIntent?: (path: string, intent: SpoolIntentV1) => void
+}
+
+const COMMAND_TIMEOUT_MS = 5_000
+const SPOOL_PER_PASS = 5
+const PENDING_PAGE = 20
+const PENDING_PER_PASS = 100
+const PENDING_PAGE_DELAY_MS = 1_000
+const QUARANTINE_AGE_MS = 48 * 60 * 60 * 1_000
+const FILE_RETRY_ADVISE_AFTER = 5
+const DEPTH_ADVISE_AFTER = 10
+
+export class ChatReceiptRuntime {
+  private readonly mode: RecorderMode
+  private readonly notify: NotifyFn
+  private readonly advise: AdviseFn
+  private readonly runCommand: RunCommand
+  private readonly now: () => Date
+  private readonly sleep: (ms: number) => Promise<void>
+  private readonly log: (line: string) => void
+  private readonly spoolDir: string
+  private readonly metaDir: string
+  private readonly writeIntent: (path: string, intent: SpoolIntentV1) => void
+  private readonly activeAccept = new Set<string>()
+  private dirty = false
+  private workerPromise: Promise<void> | undefined
+
+  constructor(opts: ChatReceiptRuntimeOptions) {
+    this.mode = opts.mode
+    this.notify = opts.notify
+    this.advise = opts.advise
+    this.runCommand = opts.runCommand ?? runCommand
+    this.now = opts.now ?? (() => new Date())
+    this.sleep = opts.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)))
+    this.log = opts.log ?? (line => process.stderr.write(`[chat-receipt] ${line}\n`))
+    this.spoolDir = opts.spoolDir ?? join(opts.stateDir, 'chat-receipt-spool')
+    this.metaDir = join(this.spoolDir, 'meta')
+    this.writeIntent = opts.writeIntent ?? writeIntentAtomic
+  }
+
+  markAccepting(messageId: string): void {
+    this.activeAccept.add(messageId)
+  }
+
+  finishAccepting(messageId: string): void {
+    this.activeAccept.delete(messageId)
+  }
+
+  async begin(args: BeginArgs): Promise<'ok' | 'spooled' | 'spool_failed'> {
+    if (this.mode.kind !== 'enabled') return 'ok'
+    const command = await this.invoke('begin', beginFlags(args), args.text)
+    if (succeeded(command)) return 'ok'
+
+    const intent: SpoolIntentV1 = {
+      v: 1,
+      begin: args,
+      attempts: 0,
+      advisedAt: null,
+    }
+    try {
+      this.ensureSpoolDir()
+      this.writeIntent(this.intentPath(args.messageId), intent)
+      return 'spooled'
+    } catch (error) {
+      this.log(`begin failed and spool write failed for ${args.messageId}: ${errorText(error)}`)
+      try {
+        await this.advise(
+          args.chatId,
+          `Chat receipt could not persist its recovery intent for message ${args.messageId}; delivery continued, but receipt recovery needs operator attention.`,
+        )
+      } catch (adviseError) {
+        this.log(`spool failure advisory also failed: ${errorText(adviseError)}`)
+      }
+      return 'spool_failed'
+    }
+  }
+
+  async complete(messageId: string): Promise<boolean> {
+    if (this.mode.kind !== 'enabled') return true
+    return succeeded(await this.invoke('complete', [
+      '--lead',
+      this.mode.leadId,
+      '--message-id',
+      messageId,
+      '--json',
+    ]))
+  }
+
+  async settle(messageId: string, replyId: string): Promise<boolean> {
+    if (this.mode.kind !== 'enabled') return true
+    const command = await this.invoke('settle', [
+      '--lead',
+      this.mode.leadId,
+      '--message-id',
+      messageId,
+      '--reply-id',
+      replyId,
+      '--json',
+    ])
+    if (!succeeded(command)) {
+      this.log(`settle failed for ${messageId}: ${command.stderr || command.stdout}`)
+      return false
+    }
+    return true
+  }
+
+  kickWorker(): void {
+    if (this.mode.kind !== 'enabled') return
+    this.dirty = true
+    this.startWorkerIfNeeded()
+  }
+
+  async whenIdle(): Promise<void> {
+    while (this.workerPromise) await this.workerPromise
+  }
+
+  private startWorkerIfNeeded(): void {
+    if (this.workerPromise) return
+    const running = this.workerLoop()
+    this.workerPromise = running.finally(() => {
+      this.workerPromise = undefined
+      if (this.dirty) this.startWorkerIfNeeded()
+    })
+  }
+
+  private async workerLoop(): Promise<void> {
+    while (true) {
+      this.dirty = false
+      const pass = await this.runRecoveryPass()
+      const kickDuringPass = this.dirty
+      if (!pass.workRemains) break
+      if (!pass.progress && !kickDuringPass) break
+    }
+  }
+
+  private async runRecoveryPass(): Promise<PassResult> {
+    const spool = await this.drainSpoolPass()
+    const pending = await this.reconcilePendingPass()
+    return {
+      progress: spool.progress || pending.progress,
+      workRemains: spool.workRemains || pending.workRemains,
+    }
+  }
+
+  private async drainSpoolPass(): Promise<PassResult> {
+    let intents = this.listIntentFiles()
+    if (intents.length === 0) {
+      this.removeDepthMarker()
+      return { progress: false, workRemains: false }
+    }
+    if (intents.length > DEPTH_ADVISE_AFTER) {
+      await this.adviseWithMarker(
+        'depth-advised.json',
+        undefined,
+        `Chat receipt recovery backlog has ${intents.length} pending intents.`,
+      )
+    }
+
+    let progress = false
+    for (const path of intents.slice(0, SPOOL_PER_PASS)) {
+      let intent: SpoolIntentV1
+      try {
+        intent = parseSpoolIntent(readFileSync(path, 'utf8'))
+      } catch (error) {
+        const corruptPath = `${path}.corrupt`
+        try {
+          renameSync(path, corruptPath)
+        } catch (renameError) {
+          this.log(`could not preserve corrupt intent ${basename(path)}: ${errorText(renameError)}`)
+        }
+        await this.adviseWithMarker(
+          'corrupt-advised.json',
+          undefined,
+          `Chat receipt recovery found a corrupt intent file (${basename(path)}); the original was preserved with a .corrupt suffix.`,
+        )
+        continue
+      }
+
+      const command = await this.invoke('begin', beginFlags(intent.begin), intent.begin.text)
+      if (succeeded(command)) {
+        rmSync(path, { force: true })
+        progress = true
+        continue
+      }
+
+      intent.attempts += 1
+      if (intent.attempts > FILE_RETRY_ADVISE_AFTER && intent.advisedAt === null) {
+        try {
+          await this.advise(
+            intent.begin.chatId,
+            `Chat receipt recovery has failed ${intent.attempts} times for message ${intent.begin.messageId}.`,
+          )
+          intent.advisedAt = this.now().toISOString()
+        } catch (error) {
+          this.log(`retry advisory failed for ${intent.begin.messageId}: ${errorText(error)}`)
+        }
+      }
+      try {
+        this.writeIntent(path, intent)
+      } catch (error) {
+        this.log(`could not update retry state for ${intent.begin.messageId}: ${errorText(error)}`)
+      }
+    }
+
+    intents = this.listIntentFiles()
+    if (intents.length === 0) this.removeDepthMarker()
+    return { progress, workRemains: intents.length > 0 }
+  }
+
+  private async reconcilePendingPass(): Promise<PassResult> {
+    if (this.mode.kind !== 'enabled') return { progress: false, workRemains: false }
+    let cursor = 0
+    let scanned = 0
+    let sawRows = false
+    let progress = false
+
+    while (scanned < PENDING_PER_PASS) {
+      const limit = Math.min(PENDING_PAGE, PENDING_PER_PASS - scanned)
+      const command = await this.invoke('pending', [
+        '--lead',
+        this.mode.leadId,
+        '--cursor',
+        String(cursor),
+        '--limit',
+        String(limit),
+        '--json',
+      ])
+      if (!succeeded(command)) {
+        this.log(`pending scan failed: ${command.stderr || command.stdout}`)
+        break
+      }
+
+      const page = parsePendingPage(command.stdout)
+      if (!page) break
+      if (page.rows.length === 0) break
+      sawRows = true
+      scanned += page.rows.length
+      cursor = page.nextCursor
+
+      for (const row of page.rows) {
+        if (this.activeAccept.has(messageIdFromReceipt(row.id))) continue
+        if (!row.envelope) {
+          this.log(`pending row ${row.id} is not replayable: ${row.parse_error ?? 'missing envelope'}`)
+          continue
+        }
+        const replay = validatedBegin(row.envelope)
+        if (!replay) {
+          this.log(`pending row ${row.id} has an invalid envelope`)
+          continue
+        }
+        if (this.now().getTime() - Date.parse(row.createdAt) > QUARANTINE_AGE_MS) {
+          const quarantine = await this.invoke('quarantine', [
+            '--lead',
+            this.mode.leadId,
+            '--message-id',
+            replay.messageId,
+            '--json',
+          ])
+          if (!succeeded(quarantine)) {
+            this.log(`quarantine failed for ${row.id}: ${quarantine.stderr || quarantine.stdout}`)
+          }
+        }
+        try {
+          await this.notify(receiptNotification(replay, true))
+        } catch (error) {
+          this.log(`redelivery notify failed for ${row.id}: ${errorText(error)}`)
+          continue
+        }
+        if (await this.complete(replay.messageId)) progress = true
+      }
+
+      if (page.rows.length < limit || scanned >= PENDING_PER_PASS) break
+      await this.sleep(PENDING_PAGE_DELAY_MS)
+    }
+
+    return {
+      progress,
+      workRemains: sawRows || scanned >= PENDING_PER_PASS,
+    }
+  }
+
+  private async invoke(
+    subcommand: string,
+    flags: string[],
+    stdin?: string,
+  ): Promise<CommandResult> {
+    if (this.mode.kind !== 'enabled') return emptySuccess()
+    const argv = [
+      'node',
+      this.mode.commCli,
+      'chat-receipt',
+      subcommand,
+      '--db',
+      this.mode.dbPath,
+      ...flags,
+    ]
+    try {
+      const command = await this.runCommand(argv, {
+        ...(stdin !== undefined ? { stdin } : {}),
+        timeoutMs: COMMAND_TIMEOUT_MS,
+      })
+      if (command.timedOut) this.log(`${subcommand} timed out after ${COMMAND_TIMEOUT_MS}ms`)
+      return command
+    } catch (error) {
+      this.log(`${subcommand} spawn failed: ${errorText(error)}`)
+      return {
+        stdout: '',
+        stderr: errorText(error),
+        exitCode: 1,
+        timedOut: false,
+      }
+    }
+  }
+
+  private ensureSpoolDir(): void {
+    mkdirSync(this.spoolDir, { recursive: true, mode: 0o700 })
+    chmodSync(this.spoolDir, 0o700)
+  }
+
+  private intentPath(messageId: string): string {
+    return join(this.spoolDir, `${messageId}.json`)
+  }
+
+  private listIntentFiles(): string[] {
+    if (!existsSync(this.spoolDir)) return []
+    return readdirSync(this.spoolDir)
+      .filter(isIntentFilename)
+      .map(name => join(this.spoolDir, name))
+      .sort((a, b) => statSync(a).mtimeMs - statSync(b).mtimeMs)
+  }
+
+  private async adviseWithMarker(
+    markerName: string,
+    chatId: string | undefined,
+    text: string,
+  ): Promise<void> {
+    mkdirSync(this.metaDir, { recursive: true, mode: 0o700 })
+    chmodSync(this.metaDir, 0o700)
+    const path = join(this.metaDir, markerName)
+    let marker = readAdviceMarker(path)
+    if (!marker) {
+      marker = { detectedAt: this.now().toISOString(), advisedAt: null }
+      writeJsonAtomic(path, marker)
+    }
+    if (marker.advisedAt !== null) return
+    try {
+      await this.advise(chatId, text)
+      marker.advisedAt = this.now().toISOString()
+      writeJsonAtomic(path, marker)
+    } catch (error) {
+      this.log(`${markerName} advisory failed: ${errorText(error)}`)
+    }
+  }
+
+  private removeDepthMarker(): void {
+    rmSync(join(this.metaDir, 'depth-advised.json'), { force: true })
+  }
+}
+
+export function receiptNotification(
+  begin: BeginArgs,
+  redelivery: boolean,
+): ReceiptNotification {
+  const attachments = begin.attachments
+    .map(attachment => `${attachment.name} (${attachment.type}, ${attachment.sizeKb}KB)`)
+    .join('; ')
+  return {
+    content: `${redelivery ? '[redelivery] ' : ''}${begin.text}`,
+    meta: {
+      chat_id: begin.chatId,
+      message_id: begin.messageId,
+      user: begin.authorName,
+      user_id: begin.authorId,
+      ts: begin.ts,
+      receipt_id: `chat:${begin.leadId}:${begin.messageId}`,
+      ...(begin.attachments.length > 0
+        ? {
+            attachment_count: String(begin.attachments.length),
+            attachments,
+          }
+        : {}),
+    },
+  }
+}
+
+export async function runCommand(
+  argv: string[],
+  opts: { stdin?: string; timeoutMs: number },
+): Promise<CommandResult> {
+  const proc = Bun.spawn(argv, {
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: process.env,
+  })
+  const stdoutPromise = new Response(proc.stdout).text()
+  const stderrPromise = new Response(proc.stderr).text()
+  if (opts.stdin !== undefined) proc.stdin.write(opts.stdin)
+  proc.stdin.end()
+
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const outcome = await Promise.race([
+    proc.exited.then(exitCode => ({ exitCode, timedOut: false })),
+    new Promise<{ exitCode: number; timedOut: true }>(resolve => {
+      timer = setTimeout(() => resolve({ exitCode: 1, timedOut: true }), opts.timeoutMs)
+    }),
+  ])
+  if (timer) clearTimeout(timer)
+  if (outcome.timedOut) {
+    proc.kill()
+    await proc.exited.catch(() => {})
+  }
+  const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise])
+  return {
+    stdout,
+    stderr,
+    exitCode: outcome.exitCode,
+    timedOut: outcome.timedOut,
+  }
+}
+
+function beginFlags(begin: BeginArgs): string[] {
+  return [
+    '--lead',
+    begin.leadId,
+    '--chat-id',
+    begin.chatId,
+    '--origin-channel-id',
+    begin.originChannelId,
+    '--message-id',
+    begin.messageId,
+    '--author-id',
+    begin.authorId,
+    '--author-name',
+    begin.authorName,
+    '--priority',
+    String(begin.priority),
+    '--ts',
+    begin.ts,
+    '--msg-kind',
+    begin.msgKind,
+    '--attachments-json',
+    JSON.stringify(begin.attachments),
+    '--content-stdin',
+    '--json',
+  ]
+}
+
+function parsePendingPage(
+  stdout: string,
+): { rows: PendingRow[]; nextCursor: number } | undefined {
+  try {
+    const decoded = JSON.parse(stdout) as {
+      rows?: unknown
+      nextCursor?: unknown
+    }
+    if (!Array.isArray(decoded.rows) || !Number.isSafeInteger(decoded.nextCursor)) {
+      throw new Error('rows/nextCursor shape is invalid')
+    }
+    return {
+      rows: decoded.rows as PendingRow[],
+      nextCursor: decoded.nextCursor as number,
+    }
+  } catch (error) {
+    process.stderr.write(`[chat-receipt] pending JSON is invalid: ${errorText(error)}\n`)
+    return undefined
+  }
+}
+
+function validatedBegin(envelope: PendingRow['envelope']): BeginArgs | undefined {
+  if (!envelope) return undefined
+  try {
+    return parseSpoolIntent(JSON.stringify({
+      v: 1,
+      begin: envelope,
+      attempts: 0,
+      advisedAt: null,
+    })).begin
+  } catch {
+    return undefined
+  }
+}
+
+function messageIdFromReceipt(receiptId: string): string {
+  return receiptId.slice(receiptId.lastIndexOf(':') + 1)
+}
+
+function succeeded(result: CommandResult): boolean {
+  return !result.timedOut && result.exitCode === 0
+}
+
+function emptySuccess(): CommandResult {
+  return { stdout: '', stderr: '', exitCode: 0, timedOut: false }
+}
+
+function writeIntentAtomic(path: string, intent: SpoolIntentV1): void {
+  writeAtomic(path, encodeSpoolIntent(intent))
+}
+
+function writeJsonAtomic(path: string, value: unknown): void {
+  writeAtomic(path, JSON.stringify(value))
+}
+
+function writeAtomic(path: string, content: string): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+  const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`)
+  try {
+    writeFileSync(tmp, content, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+    renameSync(tmp, path)
+    chmodSync(path, 0o600)
+  } catch (error) {
+    rmSync(tmp, { force: true })
+    throw error
+  }
+}
+
+function readAdviceMarker(path: string): AdviceMarker | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as AdviceMarker
+    if (
+      typeof parsed.detectedAt === 'string' &&
+      (parsed.advisedAt === null || typeof parsed.advisedAt === 'string')
+    ) {
+      return parsed
+    }
+  } catch {}
+  return undefined
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
