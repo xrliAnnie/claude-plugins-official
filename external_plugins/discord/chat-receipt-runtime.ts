@@ -11,10 +11,12 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
+import { homedir } from 'node:os'
 import {
   encodeSpoolIntent,
   isIntentFilename,
   parseSpoolIntent,
+  readMailboxDiscordFlag,
   type BeginArgs,
   type RecorderMode,
   type SpoolIntentV1,
@@ -62,6 +64,22 @@ interface SettleIntentV1 {
   advisedAt: string | null
 }
 
+export interface IngestIntentV1 {
+  v: 1
+  begin: BeginArgs
+  firstFailedAt: string
+  nextAttemptAt: string
+  attempts: number
+  advisedAt: string | null
+}
+
+type DiscordLane =
+  | 'inserted_inbox'
+  | 'active_inbox'
+  | 'inserted_external'
+  | 'legacy_external'
+  | 'archived'
+
 interface PassResult {
   progress: boolean
   workRemains: boolean
@@ -78,6 +96,11 @@ export interface ChatReceiptRuntimeOptions {
   log?: (line: string) => void
   spoolDir?: string
   writeIntent?: (path: string, intent: SpoolIntentV1) => void
+  writeIngestIntent?: (path: string, intent: IngestIntentV1) => void
+  readMailboxFlag?: () => { enabled: boolean; readError?: string }
+  founderId?: string
+  setTimer?: (fn: () => void, delayMs: number) => ReturnType<typeof setTimeout>
+  clearTimer?: (timer: ReturnType<typeof setTimeout>) => void
 }
 
 const COMMAND_TIMEOUT_MS = 5_000
@@ -88,6 +111,9 @@ const PENDING_PAGE_DELAY_MS = 1_000
 const QUARANTINE_AGE_MS = 48 * 60 * 60 * 1_000
 const FILE_RETRY_ADVISE_AFTER = 5
 const DEPTH_ADVISE_AFTER = 10
+const INGEST_RETRY_INITIAL_MS = 5_000
+const INGEST_RETRY_MAX_MS = 5 * 60_000
+const INGEST_STALL_ADVISE_MS = 5 * 60_000
 
 export class ChatReceiptRuntime {
   private readonly mode: RecorderMode
@@ -100,11 +126,20 @@ export class ChatReceiptRuntime {
   private readonly spoolDir: string
   private readonly metaDir: string
   private readonly settleDir: string
+  private readonly ingestDir: string
   private readonly writeIntent: (path: string, intent: SpoolIntentV1) => void
+  private readonly writeIngestIntent: (path: string, intent: IngestIntentV1) => void
+  private readonly readMailboxFlag: () => { enabled: boolean; readError?: string }
+  private readonly founderId?: string
+  private readonly setTimer: NonNullable<ChatReceiptRuntimeOptions['setTimer']>
+  private readonly clearTimer: NonNullable<ChatReceiptRuntimeOptions['clearTimer']>
   private readonly activeAccept = new Set<string>()
   private lastChatId: string | undefined
   private dirty = false
   private workerPromise: Promise<void> | undefined
+  private ingestWorkerPromise: Promise<void> | undefined
+  private ingestDirty = false
+  private ingestRetryTimer: ReturnType<typeof setTimeout> | undefined
 
   constructor(opts: ChatReceiptRuntimeOptions) {
     this.mode = opts.mode
@@ -117,7 +152,16 @@ export class ChatReceiptRuntime {
     this.spoolDir = opts.spoolDir ?? join(opts.stateDir, 'chat-receipt-spool')
     this.metaDir = join(this.spoolDir, 'meta')
     this.settleDir = join(this.spoolDir, 'settle')
+    this.ingestDir = join(this.spoolDir, 'ingest')
     this.writeIntent = opts.writeIntent ?? writeIntentAtomic
+    this.writeIngestIntent = opts.writeIngestIntent ?? writeJsonAtomic
+    this.readMailboxFlag = opts.readMailboxFlag ?? (() =>
+      readMailboxDiscordFlag(() =>
+        readFileSync(join(homedir(), '.flywheel', '.env'), 'utf8'),
+      ))
+    this.founderId = opts.founderId
+    this.setTimer = opts.setTimer ?? ((fn, delayMs) => setTimeout(fn, delayMs))
+    this.clearTimer = opts.clearTimer ?? (timer => clearTimeout(timer))
   }
 
   markAccepting(messageId: string): void {
@@ -129,10 +173,36 @@ export class ChatReceiptRuntime {
   }
 
   async begin(args: BeginArgs): Promise<'ok' | 'spooled' | 'spool_failed'> {
+    return (await this.beginWithVerdict(args)).status
+  }
+
+  async acceptInbound(args: BeginArgs): Promise<'mailbox' | 'legacy' | 'skip'> {
+    if (this.mode.kind !== 'enabled') return 'legacy'
+    const flag = this.readMailboxFlag()
+    if (flag.readError) {
+      this.log(JSON.stringify({
+        event: 'discord_mailbox_flag_read_failed',
+        message_id: args.messageId,
+        error: flag.readError,
+      }))
+    }
+    if (flag.enabled) {
+      await this.ingest(args)
+      return 'mailbox'
+    }
+    const begin = await this.beginWithVerdict(args)
+    return begin.lane && begin.lane !== 'inserted_external' ? 'skip' : 'legacy'
+  }
+
+  private async beginWithVerdict(args: BeginArgs): Promise<{
+    status: 'ok' | 'spooled' | 'spool_failed'
+    lane?: DiscordLane
+  }> {
     this.lastChatId = args.chatId
-    if (this.mode.kind !== 'enabled') return 'ok'
+    if (this.mode.kind !== 'enabled') return { status: 'ok' }
     const command = await this.invoke('begin', beginFlags(args), args.text)
-    if (succeeded(command)) return 'ok'
+    const lane = parseLaneVerdict(command.stdout)
+    if (succeeded(command)) return { status: 'ok', ...(lane ? { lane } : {}) }
 
     const intent: SpoolIntentV1 = {
       v: 1,
@@ -143,7 +213,7 @@ export class ChatReceiptRuntime {
     try {
       this.ensureSpoolDir()
       this.writeIntent(this.intentPath(args.messageId), intent)
-      return 'spooled'
+      return { status: 'spooled' }
     } catch (error) {
       this.log(`begin failed and spool write failed for ${args.messageId}: ${errorText(error)}`)
       try {
@@ -154,8 +224,61 @@ export class ChatReceiptRuntime {
       } catch (adviseError) {
         this.log(`spool failure advisory also failed: ${errorText(adviseError)}`)
       }
-      return 'spool_failed'
+      return { status: 'spool_failed' }
     }
+  }
+
+  private async ingest(args: BeginArgs): Promise<void> {
+    this.lastChatId = args.chatId
+    const path = this.ingestIntentPath(args.messageId)
+    let intent = readIngestIntent(path) ?? {
+      v: 1 as const,
+      begin: args,
+      firstFailedAt: this.now().toISOString(),
+      nextAttemptAt: this.now().toISOString(),
+      attempts: 0,
+      advisedAt: null,
+    }
+    try {
+      this.ensureIngestDir()
+      this.writeIngestIntent(path, intent)
+    } catch (error) {
+      this.log(`discord mailbox ingest intent write failed for ${args.messageId}: ${errorText(error)}`)
+      const command = await this.invokeIngest(args)
+      const lane = parseLaneVerdict(command.stdout)
+      if (lane) this.logIngestVerdict(args, lane)
+      if (!lane) {
+        try {
+          await this.advise(
+            args.chatId,
+            `Discord mailbox ingest could not persist recovery for message ${args.messageId}; this message may require manual replay.`,
+          )
+        } catch (adviseError) {
+          this.log(`discord mailbox ingest emergency advisory failed: ${errorText(adviseError)}`)
+        }
+      }
+      return
+    }
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const command = await this.invokeIngest(args)
+      const lane = parseLaneVerdict(command.stdout)
+      if (lane) {
+        this.logIngestVerdict(args, lane)
+        rmSync(path, { force: true })
+        return
+      }
+      intent.attempts += 1
+    }
+    intent = scheduleIngestIntent(intent, this.now())
+    try {
+      this.writeIngestIntent(path, intent)
+    } catch (error) {
+      this.log(`discord mailbox ingest retry state write failed for ${args.messageId}: ${errorText(error)}`)
+      this.scheduleIngestRetry(INGEST_RETRY_INITIAL_MS)
+      return
+    }
+    this.scheduleIngestRetry()
   }
 
   async complete(messageId: string): Promise<boolean> {
@@ -258,19 +381,118 @@ export class ChatReceiptRuntime {
       if (!succeeded(result)) {
         this.log(`node preflight failed (receipt delivery remains fail-open): ${result.stderr}`)
       }
+      const capability = await this.runCommand([
+        'node',
+        this.mode.commCli,
+        'chat-ingest',
+        '--version-probe',
+        '--json',
+      ], { timeoutMs: COMMAND_TIMEOUT_MS })
+      if (succeeded(capability)) {
+        this.log(JSON.stringify({
+          event: 'discord_mailbox_ingest_capability',
+          result: capability.stdout.trim(),
+        }))
+      } else {
+        this.log(`chat-ingest capability probe failed: ${capability.stderr || capability.stdout}`)
+      }
     } catch (error) {
-      this.log(`node preflight spawn failed (receipt delivery remains fail-open): ${errorText(error)}`)
+      this.log(`Discord ingest preflight spawn failed (delivery remains fail-open): ${errorText(error)}`)
     }
   }
 
   kickWorker(): void {
     if (this.mode.kind !== 'enabled') return
+    this.kickIngestWorker()
     this.dirty = true
     this.startWorkerIfNeeded()
   }
 
   async whenIdle(): Promise<void> {
-    while (this.workerPromise) await this.workerPromise
+    while (this.workerPromise || this.ingestWorkerPromise) {
+      await Promise.all([this.workerPromise, this.ingestWorkerPromise])
+    }
+  }
+
+  private kickIngestWorker(): void {
+    if (this.ingestRetryTimer) this.clearTimer(this.ingestRetryTimer)
+    this.ingestRetryTimer = undefined
+    this.ingestDirty = true
+    if (this.ingestWorkerPromise) return
+    const running = this.ingestWorkerLoop()
+    this.ingestWorkerPromise = running.finally(() => {
+      this.ingestWorkerPromise = undefined
+      if (this.ingestDirty) this.kickIngestWorker()
+      else this.scheduleIngestRetry()
+    })
+  }
+
+  private async ingestWorkerLoop(): Promise<void> {
+    while (true) {
+      this.ingestDirty = false
+      const pass = await this.drainIngestPass()
+      if (!pass.workRemains || (!pass.progress && !this.ingestDirty)) break
+    }
+  }
+
+  private async drainIngestPass(): Promise<PassResult> {
+    let paths = this.listIngestIntentFiles()
+    let progress = false
+    for (const path of paths.slice(0, SPOOL_PER_PASS)) {
+      let intent = readIngestIntent(path)
+      if (!intent) {
+        try {
+          renameSync(path, `${path}.corrupt`)
+        } catch (error) {
+          this.log(`could not preserve corrupt ingest intent ${basename(path)}: ${errorText(error)}`)
+        }
+        await this.adviseWithMarker(
+          'ingest-corrupt-advised.json',
+          this.lastChatId,
+          `Discord mailbox recovery found a corrupt ingest intent (${basename(path)}).`,
+        )
+        progress = true
+        continue
+      }
+      if (Date.parse(intent.nextAttemptAt) > this.now().getTime()) continue
+      const command = await this.invokeIngest(intent.begin)
+      const lane = parseLaneVerdict(command.stdout)
+      if (lane) {
+        this.logIngestVerdict(intent.begin, lane)
+        rmSync(path, { force: true })
+        progress = true
+        continue
+      }
+      intent.attempts += 1
+      if (
+        this.now().getTime() - Date.parse(intent.firstFailedAt) >= INGEST_STALL_ADVISE_MS &&
+        intent.advisedAt === null
+      ) {
+        try {
+          await this.advise(
+            intent.begin.chatId,
+            `Discord mailbox ingest is stalled for message ${intent.begin.messageId}; recovery remains queued.`,
+          )
+          intent.advisedAt = this.now().toISOString()
+        } catch (error) {
+          this.log(`discord mailbox ingest stall advisory failed: ${errorText(error)}`)
+        }
+        this.log(JSON.stringify({
+          event: 'discord_mailbox_ingest_stalled',
+          message_id: intent.begin.messageId,
+          attempts: intent.attempts,
+        }))
+      }
+      intent = scheduleIngestIntent(intent, this.now())
+      try {
+        this.writeIngestIntent(path, intent)
+      } catch (error) {
+        this.log(`could not update ingest retry state for ${intent.begin.messageId}: ${errorText(error)}`)
+        this.scheduleIngestRetry(INGEST_RETRY_INITIAL_MS)
+      }
+    }
+    paths = this.listIngestIntentFiles()
+    return { progress, workRemains: paths.length > 0 }
   }
 
   private startWorkerIfNeeded(): void {
@@ -526,6 +748,45 @@ export class ChatReceiptRuntime {
     }
   }
 
+  private async invokeIngest(begin: BeginArgs): Promise<CommandResult> {
+    if (this.mode.kind !== 'enabled') return emptySuccess()
+    const argv = [
+      'node',
+      this.mode.commCli,
+      'chat-ingest',
+      '--db',
+      this.mode.dbPath,
+      ...ingestFlags(begin, this.founderId),
+    ]
+    try {
+      const command = await this.runCommand(argv, {
+        stdin: begin.text,
+        timeoutMs: COMMAND_TIMEOUT_MS,
+      })
+      if (command.timedOut) {
+        this.log(`chat-ingest timed out after ${COMMAND_TIMEOUT_MS}ms`)
+      }
+      return command
+    } catch (error) {
+      this.log(`chat-ingest spawn failed: ${errorText(error)}`)
+      return {
+        stdout: '',
+        stderr: errorText(error),
+        exitCode: 1,
+        timedOut: false,
+      }
+    }
+  }
+
+  private logIngestVerdict(begin: BeginArgs, lane: DiscordLane): void {
+    this.log(JSON.stringify({
+      event: 'discord_mailbox_ingest_verdict',
+      message_id: begin.messageId,
+      channel_id: begin.originChannelId,
+      lane,
+    }))
+  }
+
   private invokeSettle(messageId: string, replyId: string): Promise<CommandResult> {
     return this.invoke('settle', [
       '--lead',
@@ -552,6 +813,15 @@ export class ChatReceiptRuntime {
     chmodSync(this.settleDir, 0o700)
   }
 
+  private ensureIngestDir(): void {
+    mkdirSync(this.ingestDir, { recursive: true, mode: 0o700 })
+    chmodSync(this.ingestDir, 0o700)
+  }
+
+  private ingestIntentPath(messageId: string): string {
+    return join(this.ingestDir, `${messageId}.json`)
+  }
+
   private settleIntentPath(messageId: string): string {
     return join(this.settleDir, `${messageId}.json`)
   }
@@ -570,6 +840,35 @@ export class ChatReceiptRuntime {
       .filter(isIntentFilename)
       .map(name => join(this.settleDir, name))
       .sort((a, b) => statSync(a).mtimeMs - statSync(b).mtimeMs)
+  }
+
+  private listIngestIntentFiles(): string[] {
+    if (!existsSync(this.ingestDir)) return []
+    return readdirSync(this.ingestDir)
+      .filter(isIntentFilename)
+      .map(name => join(this.ingestDir, name))
+      .sort((a, b) => statSync(a).mtimeMs - statSync(b).mtimeMs)
+  }
+
+  private scheduleIngestRetry(minDelayMs = 0): void {
+    if (this.ingestRetryTimer) return
+    const next = this.listIngestIntentFiles()
+      .map(readIngestIntent)
+      .filter((intent): intent is IngestIntentV1 => intent !== undefined)
+      .map(intent => Date.parse(intent.nextAttemptAt))
+      .reduce<number | undefined>(
+        (earliest, candidate) => earliest === undefined || candidate < earliest
+          ? candidate
+          : earliest,
+        undefined,
+      )
+    if (next === undefined) return
+    const delay = Math.max(minDelayMs, next - this.now().getTime())
+    this.ingestRetryTimer = this.setTimer(() => {
+      this.ingestRetryTimer = undefined
+      this.kickIngestWorker()
+    }, delay)
+    ;(this.ingestRetryTimer as { unref?: () => void }).unref?.()
   }
 
   private async adviseWithMarker(
@@ -699,6 +998,32 @@ function beginFlags(begin: BeginArgs): string[] {
   ]
 }
 
+function ingestFlags(begin: BeginArgs, founderId?: string): string[] {
+  return [
+    '--lead',
+    begin.leadId,
+    '--chat-id',
+    begin.chatId,
+    '--origin-channel-id',
+    begin.originChannelId,
+    '--message-id',
+    begin.messageId,
+    '--author-id',
+    begin.authorId,
+    '--author-name',
+    begin.authorName,
+    ...(founderId ? ['--founder-id', founderId] : []),
+    '--ts',
+    begin.ts,
+    '--msg-kind',
+    begin.msgKind,
+    '--attachments-json',
+    JSON.stringify(begin.attachments),
+    '--content-stdin',
+    '--json',
+  ]
+}
+
 function parsePendingPage(
   stdout: string,
 ): { rows: PendingRow[]; nextCursor: number } | undefined {
@@ -740,6 +1065,25 @@ function messageIdFromReceipt(receiptId: string): string {
 
 function succeeded(result: CommandResult): boolean {
   return !result.timedOut && result.exitCode === 0
+}
+
+function parseLaneVerdict(stdout: string): DiscordLane | undefined {
+  const lanes = new Set<DiscordLane>([
+    'inserted_inbox',
+    'active_inbox',
+    'inserted_external',
+    'legacy_external',
+    'archived',
+  ])
+  for (const line of stdout.trim().split(/\r?\n/).reverse()) {
+    try {
+      const lane = (JSON.parse(line) as { lane?: unknown }).lane
+      if (typeof lane === 'string' && lanes.has(lane as DiscordLane)) {
+        return lane as DiscordLane
+      }
+    } catch {}
+  }
+  return undefined
 }
 
 function emptySuccess(): CommandResult {
@@ -798,6 +1142,42 @@ function readSettleIntent(path: string): SettleIntentV1 | undefined {
     }
   } catch {}
   return undefined
+}
+
+function readIngestIntent(path: string): IngestIntentV1 | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<IngestIntentV1>
+    const begin = validatedBegin(parsed.begin as PendingRow['envelope'])
+    if (
+      parsed.v === 1 &&
+      begin &&
+      typeof parsed.firstFailedAt === 'string' &&
+      Number.isFinite(Date.parse(parsed.firstFailedAt)) &&
+      typeof parsed.nextAttemptAt === 'string' &&
+      Number.isFinite(Date.parse(parsed.nextAttemptAt)) &&
+      Number.isSafeInteger(parsed.attempts) &&
+      (parsed.attempts as number) >= 0 &&
+      (parsed.advisedAt === null || typeof parsed.advisedAt === 'string')
+    ) {
+      return { ...parsed, begin } as IngestIntentV1
+    }
+  } catch {}
+  return undefined
+}
+
+function scheduleIngestIntent(
+  intent: IngestIntentV1,
+  now: Date,
+): IngestIntentV1 {
+  const exponent = Math.max(0, intent.attempts - 2)
+  const delay = Math.min(
+    INGEST_RETRY_INITIAL_MS * (2 ** exponent),
+    INGEST_RETRY_MAX_MS,
+  )
+  return {
+    ...intent,
+    nextAttemptAt: new Date(now.getTime() + delay).toISOString(),
+  }
 }
 
 function errorText(error: unknown): string {

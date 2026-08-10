@@ -67,6 +67,7 @@ const STOCK_REPLY_TOOL_DESCRIPTION =
   'Reply on Discord. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or other files.'
 const STOCK_REPLY_TO_DESCRIPTION =
   'Message ID to thread under. Use message_id from the inbound <channel> block, or an id from fetch_messages.'
+const MAILBOX_DISCORD_ENV = 'FLYWHEEL_MAILBOX_DISCORD'
 
 function present(value: string | undefined): string | undefined {
   const trimmed = value?.trim()
@@ -125,6 +126,20 @@ function dotenvValue(text: string, key: string): string | undefined {
     }
   }
   return value
+}
+
+export function readMailboxDiscordFlag(
+  readEnvFile: () => string,
+): { enabled: boolean; readError?: string } {
+  try {
+    const prefix = `${MAILBOX_DISCORD_ENV}=`
+    const line = readEnvFile()
+      .split(/\r?\n/)
+      .find(candidate => candidate.startsWith(prefix))
+    return { enabled: line?.slice(prefix.length) === '1' }
+  } catch (error) {
+    return { enabled: false, readError: (error as Error).message }
+  }
 }
 
 function isSnowflake(value: unknown): value is string {

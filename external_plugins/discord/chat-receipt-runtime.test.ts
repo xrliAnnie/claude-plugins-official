@@ -102,7 +102,7 @@ describe('real built chat-receipt CLI', () => {
     expect(await runtime.begin(begin)).toBe('ok')
     expect(await runtime.begin(begin)).toBe('ok')
 
-    const before = await Bun.$`sqlite3 ${dbPath} "select count(*) from lead_inbox where id='chat:flywheel-eng-lead:100000000000000011'"`.text()
+    const before = await Bun.$`sqlite3 ${dbPath} "select count(*) from mailbox where id='chat:flywheel-eng-lead:100000000000000011'"`.text()
     expect(before.trim()).toBe('1')
 
     const priorP0 = process.env.FLYWHEEL_RECEIPT_WINDOW_P0_MIN
@@ -117,12 +117,44 @@ describe('real built chat-receipt CLI', () => {
       if (priorP1 === undefined) delete process.env.FLYWHEEL_RECEIPT_WINDOW_P1_MIN
       else process.env.FLYWHEEL_RECEIPT_WINDOW_P1_MIN = priorP1
     }
-    const delivered = await Bun.$`sqlite3 -separator '|' ${dbPath} "select delivered_at is not null, processed_at is null, unixepoch(next_unprocessed_at) - unixepoch(delivered_at) from lead_inbox where id='chat:flywheel-eng-lead:100000000000000011'"`.text()
-    expect(delivered.trim()).toBe('1|1|120')
+    const delivered = await Bun.$`sqlite3 -separator '|' ${dbPath} "select state, acked_at is not null from mailbox where id='chat:flywheel-eng-lead:100000000000000011'"`.text()
+    expect(delivered.trim()).toBe('ACKED|1')
 
     expect(await runtime.settle(begin.messageId, '100000000000000099')).toBe(true)
-    const settled = await Bun.$`sqlite3 -separator '|' ${dbPath} "select processed_at is not null, json_extract(processed_evidence, '$.kind'), json_extract(processed_evidence, '$.ref') from lead_inbox where id='chat:flywheel-eng-lead:100000000000000011'"`.text()
-    expect(settled.trim()).toBe('1|discord_explicit_reply|100000000000000099')
+    const settled = await Bun.$`sqlite3 -separator '|' ${dbPath} "select event, json_extract(row_json, '$.kind'), json_extract(row_json, '$.ref') from mailbox_log where subject_id='chat:flywheel-eng-lead:100000000000000011' and event='processed'"`.text()
+    expect(settled.trim()).toBe('processed|discord_explicit_reply|100000000000000099')
+  }, 20_000)
+
+  it('runs the ON path through chat-ingest with one inbox row and no direct notification', async () => {
+    const commCli = process.env.FLYWHEEL_COMM_CLI
+    if (!commCli || !existsSync(commCli) || !Bun.which('sqlite3')) {
+      process.stderr.write(
+        'SKIP LOUD: real chat-ingest integration requires FLYWHEEL_COMM_CLI and sqlite3\n',
+      )
+      return
+    }
+    const dir = tempDir()
+    const dbPath = join(dir, 'comm.db')
+    let notifications = 0
+    const runtime = new ChatReceiptRuntime({
+      mode: {
+        kind: 'enabled',
+        commCli,
+        dbPath,
+        leadId: begin.leadId,
+      },
+      stateDir: dir,
+      founderId: begin.authorId,
+      readMailboxFlag: () => ({ enabled: true }),
+      notify: async () => { notifications++ },
+      advise: async () => {},
+    })
+
+    expect(await runtime.acceptInbound(begin)).toBe('mailbox')
+    expect(await runtime.acceptInbound(begin)).toBe('mailbox')
+    expect(notifications).toBe(0)
+    const row = await Bun.$`sqlite3 -separator '|' ${dbPath} "select count(*), carrier, type, state, from_agent from mailbox where id='chat:flywheel-eng-lead:100000000000000011'"`.text()
+    expect(row.trim()).toBe('1|inbox|discord_chat|QUEUED|founder')
   }, 20_000)
 })
 
@@ -175,6 +207,131 @@ describe('begin failure and durable spool', () => {
       chatId: begin.chatId,
       text: expect.stringContaining('could not persist'),
     }])
+  })
+})
+
+describe('FLY-1574 mailbox cutover', () => {
+  it('uses the OFF direct path only when begin wins the external lane', async () => {
+    const runtime = new ChatReceiptRuntime({
+      mode: enabledMode(),
+      stateDir: tempDir(),
+      readMailboxFlag: () => ({ enabled: false }),
+      runCommand: async () => result(JSON.stringify({ lane: 'inserted_external' })),
+      notify: async () => {},
+      advise: async () => {},
+    })
+    expect(await runtime.acceptInbound(begin)).toBe('legacy')
+
+    const replay = new ChatReceiptRuntime({
+      mode: enabledMode(),
+      stateDir: tempDir(),
+      readMailboxFlag: () => ({ enabled: false }),
+      runCommand: async () => result(JSON.stringify({ lane: 'active_inbox' })),
+      notify: async () => {},
+      advise: async () => {},
+    })
+    expect(await replay.acceptInbound(begin)).toBe('skip')
+  })
+
+  it('writes an isolated ingest intent before the ON CLI and removes it on a verdict', async () => {
+    const dir = tempDir()
+    const intent = join(dir, 'chat-receipt-spool', 'ingest', `${begin.messageId}.json`)
+    let presentDuringCli = false
+    const commands: string[][] = []
+    const runtime = new ChatReceiptRuntime({
+      mode: enabledMode(),
+      stateDir: dir,
+      readMailboxFlag: () => ({ enabled: true }),
+      runCommand: async argv => {
+        commands.push(argv)
+        presentDuringCli = existsSync(intent)
+        return result(JSON.stringify({ lane: 'inserted_inbox' }))
+      },
+      notify: async () => {},
+      advise: async () => {},
+    })
+    expect(await runtime.acceptInbound(begin)).toBe('mailbox')
+    expect(presentDuringCli).toBe(true)
+    expect(commands[0]).toContain('chat-ingest')
+    expect(existsSync(intent)).toBe(false)
+  })
+
+  it('never raw-falls-back on ON ambiguity and schedules one bounded retry', async () => {
+    const dir = tempDir()
+    const intent = join(dir, 'chat-receipt-spool', 'ingest', `${begin.messageId}.json`)
+    const timers: Array<{ fn: () => void; ms: number }> = []
+    let now = new Date('2026-08-10T12:00:00.000Z')
+    let calls = 0
+    const runtime = new ChatReceiptRuntime({
+      mode: enabledMode(),
+      stateDir: dir,
+      readMailboxFlag: () => ({ enabled: true }),
+      runCommand: async () => {
+        calls++
+        return calls <= 2
+          ? result('', 1, 'ambiguous')
+          : result(JSON.stringify({ lane: 'active_inbox' }))
+      },
+      notify: async () => {},
+      advise: async () => {},
+      now: () => now,
+      setTimer: (fn, ms) => {
+        timers.push({ fn, ms })
+        return 1 as unknown as ReturnType<typeof setTimeout>
+      },
+      clearTimer: () => {},
+    })
+    expect(await runtime.acceptInbound(begin)).toBe('mailbox')
+    expect(calls).toBe(2)
+    expect(existsSync(intent)).toBe(true)
+    expect(timers).toHaveLength(1)
+    expect(timers[0]!.ms).toBeGreaterThanOrEqual(4_900)
+    now = new Date('2026-08-10T12:00:06.000Z')
+    timers[0]!.fn()
+    await runtime.whenIdle()
+    expect(calls).toBe(3)
+    expect(existsSync(intent)).toBe(false)
+  })
+
+  it('keeps a minimum retry delay when updating the durable schedule fails', async () => {
+    const timers: number[] = []
+    let writes = 0
+    const runtime = new ChatReceiptRuntime({
+      mode: enabledMode(),
+      stateDir: tempDir(),
+      readMailboxFlag: () => ({ enabled: true }),
+      writeIngestIntent: (path, intent) => {
+        writes++
+        if (writes > 1) throw new Error('disk full')
+        writeFileSync(path, JSON.stringify(intent))
+      },
+      runCommand: async () => result('', 1, 'ambiguous'),
+      notify: async () => {},
+      advise: async () => {},
+      setTimer: (_fn, ms) => {
+        timers.push(ms)
+        return 1 as unknown as ReturnType<typeof setTimeout>
+      },
+      clearTimer: () => {},
+    })
+
+    expect(await runtime.acceptInbound(begin)).toBe('mailbox')
+    expect(timers).toEqual([5_000])
+  })
+
+  it('alerts when neither the write-ahead intent nor an authoritative CLI verdict is available', async () => {
+    const advisories: string[] = []
+    const runtime = new ChatReceiptRuntime({
+      mode: enabledMode(),
+      stateDir: tempDir(),
+      readMailboxFlag: () => ({ enabled: true }),
+      writeIngestIntent: () => { throw new Error('disk full') },
+      runCommand: async () => result('', 1, 'database unavailable'),
+      notify: async () => {},
+      advise: async (_chatId, text) => { advisories.push(text) },
+    })
+    expect(await runtime.acceptInbound(begin)).toBe('mailbox')
+    expect(advisories).toEqual([expect.stringContaining('manual replay')])
   })
 })
 

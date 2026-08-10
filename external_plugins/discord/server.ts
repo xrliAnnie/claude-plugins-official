@@ -1005,6 +1005,7 @@ const mcp = new Server(
 const chatReceiptRuntime = new ChatReceiptRuntime({
   mode: RECORDER_MODE,
   stateDir: STATE_DIR,
+  founderId: FOUNDER_ID,
   notify: notification =>
     mcp.notification({
       method: 'notifications/claude/channel',
@@ -1661,7 +1662,9 @@ async function handleInbound(msg: Message): Promise<void> {
   }
 
   try {
-    if (receiptArgs) await chatReceiptRuntime.begin(receiptArgs)
+    const delivery = receiptArgs
+      ? await chatReceiptRuntime.acceptInbound(receiptArgs)
+      : 'legacy'
 
     // Typing keepalive — refreshes every 8s so "Bot is typing..." persists
     // until the reply tool is called (or the 10-minute safety cap expires).
@@ -1675,9 +1678,9 @@ async function handleInbound(msg: Message): Promise<void> {
       void msg.react(access.ackReaction).catch(() => {})
     }
 
-    if (receiptArgs) {
+    if (receiptArgs && delivery === 'legacy') {
       await chatReceiptRuntime.deliver(receiptArgs)
-    } else {
+    } else if (!receiptArgs) {
       mcp.notification({
         method: 'notifications/claude/channel',
         params: {

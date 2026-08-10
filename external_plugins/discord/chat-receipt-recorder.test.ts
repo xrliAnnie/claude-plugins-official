@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test'
+import flagCases from './mailbox-discord-flag.fixture.json'
 import {
   buildBeginArgs,
   encodeSpoolIntent,
@@ -7,6 +8,7 @@ import {
   receiptInboundInstruction,
   receiptReplyToDescription,
   receiptReplyToolDescription,
+  readMailboxDiscordFlag,
   resolveFounderId,
   resolveFounderIdForMode,
   resolveRecorderMode,
@@ -80,6 +82,19 @@ describe('resolveRecorderMode', () => {
     })).toEqual({
       kind: 'broken',
       missing: ['FLYWHEEL_COMM_DB'],
+    })
+  })
+})
+
+describe('FLYWHEEL_MAILBOX_DISCORD live contract', () => {
+  it('enables only on the exact live dotenv value 1 and fails OFF on read errors', () => {
+    for (const flagCase of flagCases) {
+      expect(readMailboxDiscordFlag(() => flagCase.text)).toEqual({ enabled: flagCase.enabled })
+    }
+    expect(readMailboxDiscordFlag(() => '# FLYWHEEL_MAILBOX_DISCORD=1\n')).toEqual({ enabled: false })
+    expect(readMailboxDiscordFlag(() => { throw new Error('unreadable') })).toEqual({
+      enabled: false,
+      readError: 'unreadable',
     })
   })
 })
