@@ -20,6 +20,14 @@ export interface ReceiptAttachment {
   sizeKb: number
 }
 
+export interface DiscordReplyRoute {
+  kind: 'roundtable_thread_from_message'
+  parentChannelId: string
+  sourceMessageId: string
+  threadId: string
+  threadName?: string
+}
+
 export interface InboundMeta {
   messageId: string
   originChannelId: string
@@ -36,6 +44,7 @@ export interface RoutingMeta {
   channelKind: 'dm' | 'guild'
   routedToRoundtable: boolean
   inRoundtableThread: boolean
+  replyRoute?: DiscordReplyRoute
 }
 
 export interface BeginArgs {
@@ -50,6 +59,8 @@ export interface BeginArgs {
   msgKind: 'dm' | 'guild' | 'roundtable'
   attachments: ReceiptAttachment[]
   text: string
+  replyChannelId?: string
+  replyRoute?: DiscordReplyRoute
 }
 
 export interface SpoolIntentV1 {
@@ -185,6 +196,8 @@ export function buildBeginArgs(
   return {
     leadId: routing.leadId,
     chatId: msgField(routing.chatId, 'chatId'),
+    replyChannelId: msgField(routing.chatId, 'replyChannelId'),
+    ...(routing.replyRoute ? { replyRoute: routing.replyRoute } : {}),
     originChannelId: msgField(msg.originChannelId, 'originChannelId'),
     messageId: msgField(msg.messageId, 'messageId'),
     authorId: msgField(msg.authorId, 'authorId'),
@@ -270,9 +283,17 @@ function normalizeBeginArgs(value: unknown): BeginArgs {
   if (msgKind !== 'dm' && msgKind !== 'guild' && msgKind !== 'roundtable') {
     throw new Error('chat receipt spool msgKind must be dm, guild, or roundtable')
   }
+  const chatId = msgField(begin.chatId, 'chatId')
   return {
     leadId: requiredString(begin.leadId, 'leadId'),
-    chatId: msgField(begin.chatId, 'chatId'),
+    chatId,
+    replyChannelId:
+      begin.replyChannelId === undefined
+        ? chatId
+        : msgField(begin.replyChannelId, 'replyChannelId'),
+    ...(begin.replyRoute === undefined
+      ? {}
+      : { replyRoute: normalizeReplyRoute(begin.replyRoute) }),
     originChannelId: msgField(begin.originChannelId, 'originChannelId'),
     messageId: msgField(begin.messageId, 'messageId'),
     authorId: msgField(begin.authorId, 'authorId'),
@@ -282,6 +303,25 @@ function normalizeBeginArgs(value: unknown): BeginArgs {
     msgKind,
     attachments: normalizeAttachments(begin.attachments),
     text: stringValue(begin.text, 'text'),
+  }
+}
+
+function normalizeReplyRoute(value: unknown): DiscordReplyRoute {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('replyRoute must be an object')
+  }
+  const route = value as Record<string, unknown>
+  if (route.kind !== 'roundtable_thread_from_message') {
+    throw new Error('replyRoute.kind is invalid')
+  }
+  return {
+    kind: route.kind,
+    parentChannelId: msgField(route.parentChannelId, 'replyRoute.parentChannelId'),
+    sourceMessageId: msgField(route.sourceMessageId, 'replyRoute.sourceMessageId'),
+    threadId: msgField(route.threadId, 'replyRoute.threadId'),
+    ...(route.threadName === undefined
+      ? {}
+      : { threadName: requiredString(route.threadName, 'replyRoute.threadName') }),
   }
 }
 

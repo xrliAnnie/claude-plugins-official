@@ -1546,6 +1546,7 @@ async function handleInbound(msg: Message): Promise<void> {
   // message already inside a thread / feature off → chat_id unchanged (byte-compat).
   let chat_id = msg.channelId
   let routedToRoundtable = false
+  let replyRoute: BeginArgs['replyRoute']
   if (RT_CFG) {
     const routed = resolveRoundtableInboundChatId(
       {
@@ -1572,6 +1573,13 @@ async function handleInbound(msg: Message): Promise<void> {
       if (confirmed) {
         chat_id = routed.chatId
         routedToRoundtable = true
+        replyRoute = {
+          kind: 'roundtable_thread_from_message',
+          parentChannelId: msg.channelId,
+          sourceMessageId: routed.sourceMessageId,
+          threadId: routed.chatId,
+          ...(routed.threadName ? { threadName: routed.threadName } : {}),
+        }
         // Remember BOTH the routed topic source AND this message's own id so a
         // reply_to to either parent-channel id is stripped (FLY-314 Codex R3 HIGH#3).
         rtRememberRedirect(chat_id, routed.sourceMessageId, msg.id)
@@ -1646,6 +1654,7 @@ async function handleInbound(msg: Message): Promise<void> {
         chatId: chat_id,
         channelKind: msg.channel.type === ChannelType.DM ? 'dm' : 'guild',
         routedToRoundtable,
+        ...(replyRoute ? { replyRoute } : {}),
         inRoundtableThread:
           !!RT_CFG &&
           isRoundtableTopicThread(

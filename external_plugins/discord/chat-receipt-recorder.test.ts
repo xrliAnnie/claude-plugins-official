@@ -168,11 +168,26 @@ describe('buildBeginArgs', () => {
         channelKind: 'guild',
         routedToRoundtable: false,
         inRoundtableThread: false,
+        replyRoute: {
+          kind: 'roundtable_thread_from_message',
+          parentChannelId: '100000000000000021',
+          sourceMessageId: baseMessage.messageId,
+          threadId: '100000000000000020',
+          threadName: 'mailbox routing',
+        },
       },
       baseMessage.authorId,
     )).toEqual({
       leadId: 'flywheel-eng-lead',
       chatId: '100000000000000020',
+      replyChannelId: '100000000000000020',
+      replyRoute: {
+        kind: 'roundtable_thread_from_message',
+        parentChannelId: '100000000000000021',
+        sourceMessageId: baseMessage.messageId,
+        threadId: '100000000000000020',
+        threadName: 'mailbox routing',
+      },
       originChannelId: baseMessage.originChannelId,
       messageId: baseMessage.messageId,
       authorId: baseMessage.authorId,
@@ -235,6 +250,12 @@ describe('spool intent codec', () => {
       channelKind: 'guild',
       routedToRoundtable: false,
       inRoundtableThread: false,
+      replyRoute: {
+        kind: 'roundtable_thread_from_message',
+        parentChannelId: '100000000000000021',
+        sourceMessageId: baseMessage.messageId,
+        threadId: '100000000000000020',
+      },
     },
     baseMessage.authorId,
   )
@@ -260,6 +281,16 @@ describe('spool intent codec', () => {
     expect(isIntentFilename('meta.json')).toBe(false)
     expect(isIntentFilename('100000000000000001.json.corrupt')).toBe(false)
     expect(isIntentFilename('123.json')).toBe(false)
+  })
+
+  it('upgrades a pre-route spool intent to its original chat id', () => {
+    const { replyChannelId: _, replyRoute: __, ...legacyBegin } = begin
+    expect(parseSpoolIntent(JSON.stringify({
+      v: 1,
+      begin: legacyBegin,
+      attempts: 0,
+      advisedAt: null,
+    })).begin.replyChannelId).toBe(begin.chatId)
   })
 })
 

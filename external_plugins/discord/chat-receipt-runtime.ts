@@ -1013,6 +1013,11 @@ function ingestFlags(begin: BeginArgs, founderId?: string): string[] {
     '--author-name',
     begin.authorName,
     ...(founderId ? ['--founder-id', founderId] : []),
+    '--reply-channel-id',
+    begin.replyChannelId ?? begin.chatId,
+    ...(begin.replyRoute
+      ? ['--reply-route-json', JSON.stringify(begin.replyRoute)]
+      : []),
     '--ts',
     begin.ts,
     '--msg-kind',

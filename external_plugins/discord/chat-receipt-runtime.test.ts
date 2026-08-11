@@ -236,6 +236,17 @@ describe('FLY-1574 mailbox cutover', () => {
   it('writes an isolated ingest intent before the ON CLI and removes it on a verdict', async () => {
     const dir = tempDir()
     const intent = join(dir, 'chat-receipt-spool', 'ingest', `${begin.messageId}.json`)
+    const routedBegin: BeginArgs = {
+      ...begin,
+      replyChannelId: '100000000000000020',
+      replyRoute: {
+        kind: 'roundtable_thread_from_message',
+        parentChannelId: '100000000000000021',
+        sourceMessageId: begin.messageId,
+        threadId: '100000000000000020',
+        threadName: 'mailbox routing',
+      },
+    }
     let presentDuringCli = false
     const commands: string[][] = []
     const runtime = new ChatReceiptRuntime({
@@ -250,9 +261,16 @@ describe('FLY-1574 mailbox cutover', () => {
       notify: async () => {},
       advise: async () => {},
     })
-    expect(await runtime.acceptInbound(begin)).toBe('mailbox')
+    expect(await runtime.acceptInbound(routedBegin)).toBe('mailbox')
     expect(presentDuringCli).toBe(true)
     expect(commands[0]).toContain('chat-ingest')
+    expect(commands[0]).toContain('--reply-channel-id')
+    expect(commands[0]?.[commands[0].indexOf('--reply-channel-id') + 1]).toBe(
+      routedBegin.replyChannelId,
+    )
+    expect(JSON.parse(
+      commands[0]?.[commands[0].indexOf('--reply-route-json') + 1] ?? '',
+    )).toEqual(routedBegin.replyRoute)
     expect(existsSync(intent)).toBe(false)
   })
 
