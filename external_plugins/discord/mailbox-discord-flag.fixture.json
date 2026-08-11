@@ -1,0 +1,6 @@
+[
+  { "name": "missing", "text": "", "enabled": false },
+  { "name": "off", "text": "FLYWHEEL_MAILBOX_DISCORD=0\n", "enabled": false },
+  { "name": "on", "text": "FLYWHEEL_MAILBOX_DISCORD=1\n", "enabled": true },
+  { "name": "malformed", "text": "FLYWHEEL_MAILBOX_DISCORD=true\n", "enabled": false }
+]
