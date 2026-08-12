@@ -42,13 +42,14 @@ import {
 } from './reply-send'
 import {
   buildBeginArgs,
+  assertDiscordBotIdentity,
   receiptInboundInstruction,
   receiptReplyToDescription,
   receiptReplyToolDescription,
   resolveFounderIdForMode,
+  resolveDiscordIdentity,
   resolveRecorderMode,
   sentMessageCarriesReference,
-  shouldBlockDiscordSurface,
   type BeginArgs,
 } from './chat-receipt-recorder'
 import { ChatReceiptRuntime } from './chat-receipt-runtime'
@@ -73,7 +74,11 @@ import { loadSharedRoundtableRouting } from './roundtable-shared-routing'
 import { buildRoundtableThreadCreateBody } from './roundtable-archive-policy'
 
 const INHERITED_ENV = { ...process.env }
-const STATE_DIR = INHERITED_ENV.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
+const DISCORD_IDENTITY = resolveDiscordIdentity(INHERITED_ENV, {
+  homeDir: homedir(),
+  readFile: path => readFileSync(path, 'utf8'),
+})
+const STATE_DIR = DISCORD_IDENTITY.stateDir
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -89,18 +94,14 @@ try {
   }
 } catch {}
 
-const TOKEN = process.env.DISCORD_BOT_TOKEN
+const TOKEN = DISCORD_IDENTITY.kind === 'registry'
+  ? DISCORD_IDENTITY.token
+  : process.env.DISCORD_BOT_TOKEN
 const STATIC = process.env.DISCORD_ACCESS_MODE === 'static'
-const RECORDER_MODE = resolveRecorderMode(INHERITED_ENV, {
-  stateDir: STATE_DIR,
-  readOwnerFile: path => {
-    try {
-      return readFileSync(path, 'utf8')
-    } catch {
-      return undefined
-    }
-  },
-})
+const RECORDER_MODE = resolveRecorderMode(
+  INHERITED_ENV,
+  DISCORD_IDENTITY.kind === 'registry' ? DISCORD_IDENTITY.leadId : undefined,
+)
 const FOUNDER_ID = resolveFounderIdForMode(RECORDER_MODE, {
   env: process.env,
   readEnvFile: () => readFileSync(join(homedir(), '.flywheel', '.env'), 'utf8'),
@@ -110,35 +111,10 @@ if (RECORDER_MODE.kind === 'broken') {
     `CHAT RECEIPT WIRING BROKEN: missing ${RECORDER_MODE.missing.join(', ')}; inbound delivery remains fail-open\n`,
   )
 }
-if (RECORDER_MODE.kind === 'miswired') {
-  process.stderr.write(`${JSON.stringify({
-    event: 'discord_adapter_miswired',
-    lead_id: RECORDER_MODE.leadId,
-    state_dir: RECORDER_MODE.stateDir,
-    pid: process.pid,
-  })}\n`)
-}
 if (RECORDER_MODE.kind === 'enabled' && !FOUNDER_ID) {
   process.stderr.write(
     'chat receipt: DISCORD_OWNER_USER_ID unavailable; all inbound receipts use P1\n',
   )
-}
-
-const blockedSurfaceLogs = new Set<string>()
-function blockMiswiredSurface(surface: string, channelId = 'global'): boolean {
-  if (!shouldBlockDiscordSurface(RECORDER_MODE)) return false
-  const key = `${surface}:${channelId}`
-  if (!blockedSurfaceLogs.has(key)) {
-    blockedSurfaceLogs.add(key)
-    process.stderr.write(`${JSON.stringify({
-      event: 'discord_miswired_surface_blocked',
-      surface,
-      channel_id: channelId,
-      lead_id: RECORDER_MODE.kind === 'miswired' ? RECORDER_MODE.leadId : undefined,
-      state_dir: RECORDER_MODE.kind === 'miswired' ? RECORDER_MODE.stateDir : undefined,
-    })}\n`)
-  }
-  return true
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -897,7 +873,6 @@ async function isMentioned(msg: Message, extraPatterns?: string[]): Promise<bool
 // the DM channel ID. (The skill writes it.)
 
 function checkApprovals(): void {
-  if (blockMiswiredSurface('pairing_poller')) return
   let files: string[]
   try {
     files = readdirSync(APPROVED_DIR)
@@ -1075,7 +1050,6 @@ mcp.setNotificationHandler(
     }),
   }),
   async ({ params }) => {
-    if (blockMiswiredSurface('permission_request')) return
     const { request_id, tool_name, description, input_preview } = params
     pendingPermissions.set(request_id, { tool_name, description, input_preview })
     const access = loadAccess()
@@ -1492,8 +1466,7 @@ client.on('error', err => {
 // Button-click handler for permission requests. customId is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
-client.on('interactionCreate', async (interaction: Interaction) => {
-  if (blockMiswiredSurface('interaction_create', interaction.channelId ?? 'unknown')) return
+async function handleInteractionCreate(interaction: Interaction): Promise<void> {
   if (!interaction.isButton()) return
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(interaction.customId)
   if (!m) return
@@ -1549,10 +1522,9 @@ client.on('interactionCreate', async (interaction: Interaction) => {
   await interaction
     .update({ content: `${interaction.message.content}\n\n${label}`, components: [] })
     .catch(() => {})
-})
+}
 
-client.on('messageCreate', msg => {
-  if (blockMiswiredSurface('message_create', msg.channelId)) return
+function handleMessageCreate(msg: Message): void {
   // Never process our own messages — prevents typing keepalive re-trigger on reply echo.
   if (msg.author.id === client.user?.id) return
   if (msg.author.bot) {
@@ -1560,10 +1532,9 @@ client.on('messageCreate', msg => {
     if (!access.allowBots?.includes(msg.author.id)) return
   }
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
-})
+}
 
 async function handleInbound(msg: Message): Promise<void> {
-  if (blockMiswiredSurface('handle_inbound', msg.channelId)) return
   const result = await gate(msg)
 
   if (result.action === 'drop') return
@@ -1757,6 +1728,11 @@ async function handleInbound(msg: Message): Promise<void> {
 }
 
 client.once('ready', c => {
+  if (DISCORD_IDENTITY.kind === 'registry') {
+    assertDiscordBotIdentity(DISCORD_IDENTITY.expectedBotUserId, c.user.id)
+  }
+  client.on('interactionCreate', handleInteractionCreate)
+  client.on('messageCreate', handleMessageCreate)
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
   chatReceiptRuntime.kickWorker()
 })

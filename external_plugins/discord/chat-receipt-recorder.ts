@@ -1,4 +1,4 @@
-import { basename, join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 
 export type RecorderMode =
   | {
@@ -15,15 +15,29 @@ export type RecorderMode =
       kind: 'broken'
       missing: string[]
     }
-  | {
-      kind: 'miswired'
-      leadId: string
-      stateDir: string
-    }
 
-export interface RecorderOwnershipProbe {
+export type DiscordIdentity = {
+  kind: 'legacy'
   stateDir: string
-  readOwnerFile: (path: string) => string | undefined
+  token: string | undefined
+} | {
+  kind: 'registry'
+  registrySource: 'inline' | string
+  leadId: string
+  stateDir: string
+  token: string
+  expectedBotUserId: string
+}
+
+export interface DiscordIdentityDeps {
+  homeDir: string
+  readFile: (path: string) => string
+}
+
+interface RegistryLead {
+  agentId: string
+  botTokenEnv?: string
+  discordStateDir?: string
 }
 
 export interface ReceiptAttachment {
@@ -91,6 +105,9 @@ const STOCK_REPLY_TOOL_DESCRIPTION =
 const STOCK_REPLY_TO_DESCRIPTION =
   'Message ID to thread under. Use message_id from the inbound <channel> block, or an id from fetch_messages.'
 const MAILBOX_DISCORD_ENV = 'FLYWHEEL_MAILBOX_DISCORD'
+const IDENTITY_MODE_ENV = 'FLYWHEEL_DISCORD_IDENTITY_MODE'
+const EXPECTED_BOT_USER_ID_ENV = 'FLYWHEEL_EXPECTED_DISCORD_BOT_USER_ID'
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 function present(value: string | undefined): string | undefined {
   const trimmed = value?.trim()
@@ -99,13 +116,8 @@ function present(value: string | undefined): string | undefined {
 
 export function resolveRecorderMode(
   env: Record<string, string | undefined>,
-  probe: RecorderOwnershipProbe,
+  canonicalLeadId = present(env.FLYWHEEL_LEAD_ID),
 ): RecorderMode {
-  const leadId = present(env.FLYWHEEL_LEAD_ID)
-  if (leadId && !stateDirBelongsToLead(probe, leadId)) {
-    return { kind: 'miswired', leadId, stateDir: probe.stateDir }
-  }
-
   if (
     present(env.FLYWHEEL_LEAD_COMPANION) === '1' ||
     present(env.FLYWHEEL_LEAD_EXTERNAL) === '1'
@@ -116,7 +128,7 @@ export function resolveRecorderMode(
   const capability = {
     FLYWHEEL_COMM_CLI: present(env.FLYWHEEL_COMM_CLI),
     FLYWHEEL_COMM_DB: present(env.FLYWHEEL_COMM_DB),
-    FLYWHEEL_LEAD_ID: present(env.FLYWHEEL_LEAD_ID),
+    FLYWHEEL_LEAD_ID: canonicalLeadId,
   }
   if (Object.values(capability).every(value => value === undefined)) {
     return { kind: 'disabled', reason: 'stock' }
@@ -138,20 +150,116 @@ export function resolveRecorderMode(
   }
 }
 
-export function shouldBlockDiscordSurface(mode: RecorderMode): boolean {
-  return mode.kind === 'miswired'
+export function resolveDiscordIdentity(
+  env: Record<string, string | undefined>,
+  deps: DiscordIdentityDeps,
+): DiscordIdentity {
+  const leadId = present(env.FLYWHEEL_LEAD_ID)
+  const mode = present(env[IDENTITY_MODE_ENV]) ?? 'legacy'
+  if (mode !== 'legacy' && mode !== 'registry') {
+    throw new Error(`${IDENTITY_MODE_ENV}: identity mode must be legacy or registry`)
+  }
+  const legacyStateDir = present(env.DISCORD_STATE_DIR) ??
+    join(deps.homeDir, '.claude', 'channels', 'discord')
+  if (!leadId || mode === 'legacy') {
+    return {
+      kind: 'legacy',
+      stateDir: legacyStateDir,
+      token: present(env.DISCORD_BOT_TOKEN),
+    }
+  }
+
+  const inline = present(env.FLYWHEEL_PROJECTS)
+  const registryPath = present(env.FLYWHEEL_PROJECTS_FILE) ??
+    join(deps.homeDir, '.flywheel', 'projects.json')
+  const registrySource = inline ? 'inline' as const : registryPath
+  let raw: unknown
+  try {
+    raw = JSON.parse(inline ?? deps.readFile(registryPath))
+  } catch (error) {
+    throw new Error(`Discord identity registry ${registrySource} is invalid: ${(error as Error).message}`)
+  }
+  if (!Array.isArray(raw)) {
+    throw new Error(`Discord identity registry ${registrySource} must be an array`)
+  }
+  const matches: RegistryLead[] = []
+  for (const [projectIndex, project] of raw.entries()) {
+    if (!project || typeof project !== 'object' ||
+        !Array.isArray((project as { leads?: unknown }).leads)) {
+      throw new Error(`Discord identity registry project[${projectIndex}].leads must be an array`)
+    }
+    for (const [leadIndex, candidate] of
+      (project as { leads: unknown[] }).leads.entries()) {
+      const agentId = candidate && typeof candidate === 'object'
+        ? (candidate as { agentId?: unknown }).agentId
+        : undefined
+      if (typeof agentId !== 'string' || !present(agentId)) {
+        throw new Error(
+          `Discord identity registry project[${projectIndex}].leads[${leadIndex}].agentId is invalid`,
+        )
+      }
+      if (agentId === leadId) {
+        matches.push(candidate as RegistryLead)
+      }
+    }
+  }
+  if (matches.length !== 1) {
+    throw new Error(
+      `Discord identity registry must contain exactly one lead with agentId ${JSON.stringify(leadId)}; found ${matches.length}`,
+    )
+  }
+  const lead = matches[0]!
+  if (lead.botTokenEnv !== undefined &&
+      (typeof lead.botTokenEnv !== 'string' || !present(lead.botTokenEnv))) {
+    throw new Error('Discord identity botTokenEnv is invalid')
+  }
+  const tokenEnv = present(lead.botTokenEnv) ?? 'DISCORD_BOT_TOKEN'
+  if (!ENV_NAME.test(tokenEnv)) {
+    throw new Error(`Discord identity botTokenEnv ${JSON.stringify(tokenEnv)} is invalid`)
+  }
+  const namedToken = present(env[tokenEnv])
+  const genericToken = present(env.DISCORD_BOT_TOKEN)
+  if (namedToken && genericToken && namedToken !== genericToken) {
+    throw new Error('Discord identity token conflict between named and generic projection')
+  }
+  const token = namedToken ?? genericToken
+  if (!token) throw new Error('Discord identity token is missing')
+
+  let stateDir = join(deps.homeDir, '.claude', 'channels', `discord-${leadId}`)
+  if (lead.discordStateDir !== undefined) {
+    if (typeof lead.discordStateDir !== 'string' ||
+        !present(lead.discordStateDir) ||
+        // biome-ignore lint/suspicious/noControlCharactersInRegex: config boundary
+        /[\u0000-\u001f\u007f]/.test(lead.discordStateDir) ||
+        !isAbsolute(lead.discordStateDir)) {
+      throw new Error('Discord identity discordStateDir must be an absolute path without control characters')
+    }
+    stateDir = lead.discordStateDir
+  }
+  const inheritedStateDir = present(env.DISCORD_STATE_DIR)
+  if (inheritedStateDir && inheritedStateDir !== stateDir) {
+    throw new Error('Discord identity state conflict with registry-derived state dir')
+  }
+  const expectedBotUserId = present(env[EXPECTED_BOT_USER_ID_ENV])
+  if (!expectedBotUserId || !DISCORD_SNOWFLAKE.test(expectedBotUserId)) {
+    throw new Error(`Discord identity expected bot user id in ${EXPECTED_BOT_USER_ID_ENV} is invalid`)
+  }
+
+  return {
+    kind: 'registry',
+    registrySource,
+    leadId,
+    stateDir,
+    token,
+    expectedBotUserId,
+  }
 }
 
-function stateDirBelongsToLead(
-  probe: RecorderOwnershipProbe,
-  leadId: string,
-): boolean {
-  if (!present(probe.stateDir)) return false
-  if (basename(probe.stateDir) === `discord-${leadId}`) return true
-  try {
-    return present(probe.readOwnerFile(join(probe.stateDir, 'owner'))) === leadId
-  } catch {
-    return false
+export function assertDiscordBotIdentity(expected: string, actual: string): void {
+  if (actual !== expected) {
+    throw new Error(
+      `Discord bot identity mismatch: logged in user ${JSON.stringify(actual)} does not match expected user ${JSON.stringify(expected)}`,
+    )
   }
 }
 
