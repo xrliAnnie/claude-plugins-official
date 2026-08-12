@@ -193,6 +193,31 @@ describe('canonical Discord identity', () => {
     }, { homeDir: '/Users/test', readFile: () => '' })).toThrow(/state.*conflict/i)
   })
 
+  it('fails loud when inherited shared channels are absent from the registry row', () => {
+    expect(resolveDiscordIdentity({
+      ...registryEnv,
+      FLYWHEEL_PROJECTS: projects,
+      FLYWHEEL_LEAD_CROSS_DEPT_CHANNEL_IDS: '100000000000000013',
+    }, { homeDir: '/Users/test', readFile: () => '' })).toMatchObject({
+      channelIds: [
+        '100000000000000012',
+        '100000000000000011',
+        '100000000000000013',
+      ],
+    })
+    const missingSharedChannel = projects.replace(
+      ',"crossDeptChannels":["100000000000000013"]',
+      '',
+    )
+    expect(() => resolveDiscordIdentity({
+      ...registryEnv,
+      FLYWHEEL_PROJECTS: missingSharedChannel,
+      FLYWHEEL_LEAD_CROSS_DEPT_CHANNEL_IDS: '100000000000000013',
+    }, { homeDir: '/Users/test', readFile: () => '' })).toThrow(
+      /shared-channel conflict.*crossDeptChannels/i,
+    )
+  })
+
   it('fails loud on invalid mode, registry, lead cardinality, paths, and expected bot id', () => {
     const deps = { homeDir: '/Users/test', readFile: () => projects }
     expect(() => resolveDiscordIdentity({

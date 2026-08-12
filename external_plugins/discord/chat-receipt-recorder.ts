@@ -263,10 +263,21 @@ export function resolveDiscordIdentity(
        lead.crossDeptChannels.some(channel => !present(channel)))) {
     throw new Error('Discord identity crossDeptChannels is invalid')
   }
+  const registryCrossDeptChannels = lead.crossDeptChannels ?? []
+  const inheritedCrossDeptChannels = (present(
+    env.FLYWHEEL_LEAD_CROSS_DEPT_CHANNEL_IDS,
+  ) ?? '').split(',').map(channel => channel.trim()).filter(Boolean)
+  if (inheritedCrossDeptChannels.some(
+    channel => !registryCrossDeptChannels.includes(channel),
+  )) {
+    throw new Error(
+      'Discord identity shared-channel conflict with registry-derived crossDeptChannels',
+    )
+  }
   const channelIds = [...new Set([
     chatChannel,
     ...(generalChannel ? [generalChannel] : []),
-    ...(lead.crossDeptChannels ?? []),
+    ...registryCrossDeptChannels,
   ])]
 
   return {
