@@ -66,6 +66,9 @@ describe('durable Discord ingest runtime', () => {
     expect(serverSource).not.toContain('.adviseBroken(')
     expect(serverSource).not.toContain('content: `⚠️ ${text}`')
     expect(serverSource).not.toContain('chatIngestRuntime.settle')
+    expect(serverSource).toMatch(
+      /await chatIngestRuntime\.acceptInbound\(ingestArgs\)[\s\S]{0,120}chatIngestRuntime\.kickWorker\(\)/,
+    )
   })
 
   it('always invokes chat-ingest and never invokes a receipt command', async () => {
@@ -193,6 +196,23 @@ describe('durable Discord ingest runtime', () => {
     expect(existsSync(`${intent}.corrupt`)).toBe(true)
     expect(logs.filter(line => line.includes('discord_mailbox_ingest_corrupt_intent'))).toHaveLength(1)
     expect(existsSync(join(dir, 'chat-receipt-spool', 'meta', 'ingest-corrupt-advised.json'))).toBe(false)
+  })
+
+  it('makes no worker progress when a corrupt intent cannot be quarantined', async () => {
+    const dir = tempDir()
+    const ingestDir = join(dir, 'chat-receipt-spool', 'ingest')
+    const intent = join(ingestDir, `${begin.messageId}.json`)
+    mkdirSync(`${intent}.corrupt`, { recursive: true })
+    writeFileSync(intent, '{invalid')
+    const runtime = new ChatIngestRuntime({
+      mode: enabledMode(),
+      stateDir: dir,
+    })
+
+    const pass = await (runtime as unknown as {
+      drainIngestPass(): Promise<{ progress: boolean; workRemains: boolean }>
+    }).drainIngestPass()
+    expect(pass).toEqual({ progress: false, workRemains: true })
   })
 
   it('logs a stalled ingest once and persists the existing latch', async () => {

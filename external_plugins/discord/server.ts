@@ -1630,6 +1630,7 @@ async function handleInbound(msg: Message): Promise<void> {
   const delivery = ingestArgs
     ? await chatIngestRuntime.acceptInbound(ingestArgs)
     : 'legacy'
+  if (ingestArgs) chatIngestRuntime.kickWorker()
 
   // Typing keepalive — refreshes every 8s so "Bot is typing..." persists
   // until the reply tool is called (or the 10-minute safety cap expires).

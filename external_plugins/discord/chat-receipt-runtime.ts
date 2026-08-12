@@ -214,16 +214,20 @@ export class ChatIngestRuntime {
     for (const path of paths.slice(0, INGESTS_PER_PASS)) {
       let intent = readIngestIntent(path)
       if (!intent) {
+        let preserved = false
         try {
           renameSync(path, `${path}.corrupt`)
+          preserved = true
         } catch (error) {
           this.log(`could not preserve corrupt ingest intent ${basename(path)}: ${errorText(error)}`)
         }
-        this.log(JSON.stringify({
-          event: 'discord_mailbox_ingest_corrupt_intent',
-          intent: basename(path),
-        }))
-        progress = true
+        if (preserved) {
+          this.log(JSON.stringify({
+            event: 'discord_mailbox_ingest_corrupt_intent',
+            intent: basename(path),
+          }))
+          progress = true
+        }
         continue
       }
       if (Date.parse(intent.nextAttemptAt) > this.now().getTime()) continue
