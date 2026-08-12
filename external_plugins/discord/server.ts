@@ -69,6 +69,7 @@ import {
   type RoundtableConfig,
 } from './roundtable-thread-policy'
 import { loadSharedRoundtableRouting } from './roundtable-shared-routing'
+import { authenticateDiscordIdentity, DiscordIdentityAssertionError } from './identity-assertion'
 import { buildRoundtableThreadCreateBody } from './roundtable-archive-policy'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
@@ -1364,8 +1365,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   }
 })
 
-await mcp.connect(new StdioServerTransport())
-
 // When Claude Code closes the MCP connection, stdin gets EOF. Without this
 // the gateway stays connected as a zombie holding resources.
 let shuttingDown = false
@@ -1454,73 +1453,75 @@ client.on('error', err => {
 // Button-click handler for permission requests. customId is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
-client.on('interactionCreate', async (interaction: Interaction) => {
-  if (!interaction.isButton()) return
-  const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(interaction.customId)
-  if (!m) return
-  const access = loadAccess()
-  if (!access.allowFrom.includes(interaction.user.id)) {
-    await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
-    return
-  }
-  const [, behavior, request_id] = m
+function registerAuthenticatedInboundHandlers(): void {
+	client.on('interactionCreate', async (interaction: Interaction) => {
+		if (!interaction.isButton()) return
+		const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(interaction.customId)
+		if (!m) return
+		const access = loadAccess()
+		if (!access.allowFrom.includes(interaction.user.id)) {
+			await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
+			return
+		}
+		const [, behavior, request_id] = m
 
-  if (behavior === 'more') {
-    const details = pendingPermissions.get(request_id)
-    if (!details) {
-      await interaction.reply({ content: 'Details no longer available.', ephemeral: true }).catch(() => {})
-      return
-    }
-    const { tool_name, description, input_preview } = details
-    let prettyInput: string
-    try {
-      prettyInput = JSON.stringify(JSON.parse(input_preview), null, 2)
-    } catch {
-      prettyInput = input_preview
-    }
-    const expanded =
-      `🔐 Permission: ${tool_name}\n\n` +
-      `tool_name: ${tool_name}\n` +
-      `description: ${description}\n` +
-      `input_preview:\n${prettyInput}`
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`perm:allow:${request_id}`)
-        .setLabel('Allow')
-        .setEmoji('✅')
-        .setStyle(ButtonStyle.Success),
-      new ButtonBuilder()
-        .setCustomId(`perm:deny:${request_id}`)
-        .setLabel('Deny')
-        .setEmoji('❌')
-        .setStyle(ButtonStyle.Danger),
-    )
-    await interaction.update({ content: expanded, components: [row] }).catch(() => {})
-    return
-  }
+		if (behavior === 'more') {
+			const details = pendingPermissions.get(request_id)
+			if (!details) {
+				await interaction.reply({ content: 'Details no longer available.', ephemeral: true }).catch(() => {})
+				return
+			}
+			const { tool_name, description, input_preview } = details
+			let prettyInput: string
+			try {
+				prettyInput = JSON.stringify(JSON.parse(input_preview), null, 2)
+			} catch {
+				prettyInput = input_preview
+			}
+			const expanded =
+				`🔐 Permission: ${tool_name}\n\n` +
+				`tool_name: ${tool_name}\n` +
+				`description: ${description}\n` +
+				`input_preview:\n${prettyInput}`
+			const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+				new ButtonBuilder()
+					.setCustomId(`perm:allow:${request_id}`)
+					.setLabel('Allow')
+					.setEmoji('✅')
+					.setStyle(ButtonStyle.Success),
+				new ButtonBuilder()
+					.setCustomId(`perm:deny:${request_id}`)
+					.setLabel('Deny')
+					.setEmoji('❌')
+					.setStyle(ButtonStyle.Danger),
+			)
+			await interaction.update({ content: expanded, components: [row] }).catch(() => {})
+			return
+		}
 
-  void mcp.notification({
-    method: 'notifications/claude/channel/permission',
-    params: { request_id, behavior },
-  })
-  pendingPermissions.delete(request_id)
-  const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
-  // Replace buttons with the outcome so the same request can't be answered
-  // twice and the chat history shows what was chosen.
-  await interaction
-    .update({ content: `${interaction.message.content}\n\n${label}`, components: [] })
-    .catch(() => {})
-})
+		void mcp.notification({
+			method: 'notifications/claude/channel/permission',
+			params: { request_id, behavior },
+		})
+		pendingPermissions.delete(request_id)
+		const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
+		// Replace buttons with the outcome so the same request can't be answered
+		// twice and the chat history shows what was chosen.
+		await interaction
+			.update({ content: `${interaction.message.content}\n\n${label}`, components: [] })
+			.catch(() => {})
+	})
 
-client.on('messageCreate', msg => {
-  // Never process our own messages — prevents typing keepalive re-trigger on reply echo.
-  if (msg.author.id === client.user?.id) return
-  if (msg.author.bot) {
-    const access = loadAccess()
-    if (!access.allowBots?.includes(msg.author.id)) return
-  }
-  handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
-})
+	client.on('messageCreate', msg => {
+		// Never process our own messages — prevents typing keepalive re-trigger on reply echo.
+		if (msg.author.id === client.user?.id) return
+		if (msg.author.bot) {
+			const access = loadAccess()
+			if (!access.allowBots?.includes(msg.author.id)) return
+		}
+		handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
+	})
+}
 
 async function handleInbound(msg: Message): Promise<void> {
   const result = await gate(msg)
@@ -1715,12 +1716,45 @@ async function handleInbound(msg: Message): Promise<void> {
   }
 }
 
-client.once('ready', c => {
-  process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
-  chatReceiptRuntime.kickWorker()
-})
+function recordIdentityFailure(code: string, message: string): void {
+  const cli = process.env.FLYWHEEL_COMM_CLI
+  const projectsFile = process.env.FLYWHEEL_PROJECTS_FILE
+  const project = process.env.FLYWHEEL_PROJECT_NAME
+  const lead = process.env.FLYWHEEL_LEAD_ID
+  if (!cli || !projectsFile || !project || !lead) return
+  try {
+    execFileSync('node', [
+      cli,
+      'lead-identity',
+      'record-failure',
+      '--projects-file', projectsFile,
+      '--project', project,
+      '--lead', lead,
+      '--code', code,
+      '--message', message,
+    ], { stdio: 'ignore', timeout: 5000 })
+  } catch {
+    // The identity failure remains fatal even when local diagnostics cannot persist.
+  }
+}
 
-client.login(TOKEN).catch(err => {
-  process.stderr.write(`discord channel: login failed: ${err}\n`)
+try {
+  await authenticateDiscordIdentity({
+    expectedUserId: process.env.DISCORD_EXPECTED_BOT_USER_ID,
+    login: () => client.login(TOKEN),
+    actualUserId: () => client.user?.id,
+    registerInboundHandlers: async () => {
+      await mcp.connect(new StdioServerTransport())
+      registerAuthenticatedInboundHandlers()
+    },
+  })
+  process.stderr.write(`discord channel: gateway connected as ${client.user?.tag ?? client.user?.id}\n`)
+  chatReceiptRuntime.kickWorker()
+} catch (err) {
+  const code = err instanceof DiscordIdentityAssertionError ? err.code : 'identity_discord_login_failed'
+  const message = err instanceof Error ? err.message : String(err)
+  recordIdentityFailure(code, message)
+  process.stderr.write(`discord channel: login identity assertion failed: ${message}\n`)
+  await Promise.resolve(client.destroy()).catch(() => {})
   process.exit(1)
-})
+}
