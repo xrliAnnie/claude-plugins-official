@@ -454,6 +454,11 @@ export class ChatReceiptRuntime {
         progress = true
         continue
       }
+      const ownership = this.quarantineForeignIntent(path, 'ingest', intent.begin)
+      if (ownership !== 'owned') {
+        if (ownership === 'quarantined') progress = true
+        continue
+      }
       if (Date.parse(intent.nextAttemptAt) > this.now().getTime()) continue
       const command = await this.invokeIngest(intent.begin)
       const lane = parseLaneVerdict(command.stdout)
@@ -531,11 +536,12 @@ export class ChatReceiptRuntime {
       this.removeDepthMarker()
       return { progress: false, workRemains: false }
     }
-    if (intents.length > DEPTH_ADVISE_AFTER) {
+    const ownedDepth = this.ownedSpoolDepth(intents)
+    if (ownedDepth > DEPTH_ADVISE_AFTER) {
       await this.adviseWithMarker(
         'depth-advised.json',
         this.lastChatId,
-        `Chat receipt recovery backlog has ${intents.length} pending intents.`,
+        `Chat receipt recovery backlog has ${ownedDepth} pending intents.`,
       )
     }
 
@@ -556,6 +562,12 @@ export class ChatReceiptRuntime {
           this.lastChatId,
           `Chat receipt recovery found a corrupt intent file (${basename(path)}); the original was preserved with a .corrupt suffix.`,
         )
+        continue
+      }
+
+      const ownership = this.quarantineForeignIntent(path, 'legacy', intent.begin)
+      if (ownership !== 'owned') {
+        if (ownership === 'quarantined') progress = true
         continue
       }
 
@@ -855,6 +867,7 @@ export class ChatReceiptRuntime {
     const next = this.listIngestIntentFiles()
       .map(readIngestIntent)
       .filter((intent): intent is IngestIntentV1 => intent !== undefined)
+      .filter(intent => this.intentBelongsToCurrentLead(intent.begin))
       .map(intent => Date.parse(intent.nextAttemptAt))
       .reduce<number | undefined>(
         (earliest, candidate) => earliest === undefined || candidate < earliest
@@ -869,6 +882,56 @@ export class ChatReceiptRuntime {
       this.kickIngestWorker()
     }, delay)
     ;(this.ingestRetryTimer as { unref?: () => void }).unref?.()
+  }
+
+  private ownedSpoolDepth(paths: string[]): number {
+    let count = 0
+    for (const path of paths) {
+      try {
+        if (this.intentBelongsToCurrentLead(
+          parseSpoolIntent(readFileSync(path, 'utf8')).begin,
+        )) count++
+      } catch {}
+    }
+    return count
+  }
+
+  private intentBelongsToCurrentLead(begin: BeginArgs): boolean {
+    return this.mode.kind === 'enabled' && begin.leadId === this.mode.leadId
+  }
+
+  private quarantineForeignIntent(
+    path: string,
+    intentKind: 'legacy' | 'ingest',
+    begin: BeginArgs,
+  ): 'owned' | 'quarantined' | 'blocked' {
+    if (this.intentBelongsToCurrentLead(begin)) return 'owned'
+    if (this.mode.kind !== 'enabled') return 'blocked'
+    let quarantinePath = `${path}.foreign-lead`
+    if (existsSync(quarantinePath)) {
+      quarantinePath = `${quarantinePath}.${this.now().getTime()}`
+    }
+    try {
+      renameSync(path, quarantinePath)
+      this.log(JSON.stringify({
+        event: 'discord_receipt_foreign_intent_quarantined',
+        intent_kind: intentKind,
+        expected_lead_id: this.mode.leadId,
+        actual_lead_id: begin.leadId,
+        file: basename(quarantinePath),
+      }))
+      return 'quarantined'
+    } catch (error) {
+      this.log(JSON.stringify({
+        event: 'discord_receipt_foreign_intent_quarantine_failed',
+        intent_kind: intentKind,
+        expected_lead_id: this.mode.leadId,
+        actual_lead_id: begin.leadId,
+        file: basename(path),
+        error: errorText(error),
+      }))
+      return 'blocked'
+    }
   }
 
   private async adviseWithMarker(

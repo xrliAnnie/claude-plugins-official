@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import flagCases from './mailbox-discord-flag.fixture.json'
 import {
   buildBeginArgs,
@@ -13,6 +14,7 @@ import {
   resolveFounderIdForMode,
   resolveRecorderMode,
   sentMessageCarriesReference,
+  shouldBlockDiscordSurface,
   type BeginArgs,
 } from './chat-receipt-recorder'
 
@@ -20,6 +22,11 @@ const enabledEnv = {
   FLYWHEEL_COMM_CLI: '/opt/flywheel-comm.js',
   FLYWHEEL_COMM_DB: '/tmp/comm.db',
   FLYWHEEL_LEAD_ID: 'flywheel-eng-lead',
+}
+
+const enabledProbe = {
+  stateDir: '/Users/test/.claude/channels/discord-flywheel-eng-lead',
+  readOwnerFile: (_path: string) => undefined,
 }
 
 const baseMessage = {
@@ -36,7 +43,7 @@ const baseMessage = {
 
 describe('resolveRecorderMode', () => {
   it('enables only when the complete Flywheel capability tuple exists', () => {
-    expect(resolveRecorderMode(enabledEnv)).toEqual({
+    expect(resolveRecorderMode(enabledEnv, enabledProbe)).toEqual({
       kind: 'enabled',
       commCli: '/opt/flywheel-comm.js',
       dbPath: '/tmp/comm.db',
@@ -45,7 +52,7 @@ describe('resolveRecorderMode', () => {
   })
 
   it('keeps a stock plugin install byte-compatible and disabled', () => {
-    expect(resolveRecorderMode({})).toEqual({ kind: 'disabled', reason: 'stock' })
+    expect(resolveRecorderMode({}, enabledProbe)).toEqual({ kind: 'disabled', reason: 'stock' })
   })
 
   it('treats companion and external markers as intentional isolation', () => {
@@ -54,11 +61,17 @@ describe('resolveRecorderMode', () => {
       FLYWHEEL_LEAD_ID: 'belle',
       FLYWHEEL_COMM_CLI: '',
       FLYWHEEL_COMM_DB: '  ',
+    }, {
+      stateDir: '/Users/test/.claude/channels/discord-belle',
+      readOwnerFile: () => undefined,
     })).toEqual({ kind: 'disabled', reason: 'isolated' })
 
     expect(resolveRecorderMode({
       FLYWHEEL_LEAD_EXTERNAL: '1',
       FLYWHEEL_LEAD_ID: 'mufasa',
+    }, {
+      stateDir: '/tmp/custom-mufasa-state',
+      readOwnerFile: () => 'mufasa\n',
     })).toEqual({ kind: 'disabled', reason: 'isolated' })
   })
 
@@ -66,12 +79,12 @@ describe('resolveRecorderMode', () => {
     expect(resolveRecorderMode({
       ...enabledEnv,
       FLYWHEEL_CHAT_RECEIPTS: '0',
-    })).toEqual({ kind: 'disabled', reason: 'kill_switch' })
+    }, enabledProbe)).toEqual({ kind: 'disabled', reason: 'kill_switch' })
 
     expect(resolveRecorderMode({
       FLYWHEEL_LEAD_ID: 'flywheel-eng-lead',
       FLYWHEEL_CHAT_RECEIPTS: '0',
-    })).toEqual({ kind: 'disabled', reason: 'kill_switch' })
+    }, enabledProbe)).toEqual({ kind: 'disabled', reason: 'kill_switch' })
   })
 
   it('fails loud for a non-isolated partial capability tuple', () => {
@@ -79,10 +92,99 @@ describe('resolveRecorderMode', () => {
       FLYWHEEL_LEAD_ID: 'flywheel-eng-lead',
       FLYWHEEL_COMM_CLI: '/opt/flywheel-comm.js',
       FLYWHEEL_COMM_DB: '',
-    })).toEqual({
+    }, enabledProbe)).toEqual({
       kind: 'broken',
       missing: ['FLYWHEEL_COMM_DB'],
     })
+  })
+
+  it('fails closed when lead identity and the channel declaration owner disagree', () => {
+    const foreignProbe = {
+      stateDir: '/Users/test/.claude/channels/discord-flywheel-eng-lead',
+      readOwnerFile: () => undefined,
+    }
+    for (const env of [
+      enabledEnv,
+      { ...enabledEnv, FLYWHEEL_CHAT_RECEIPTS: '0' },
+      { ...enabledEnv, FLYWHEEL_COMM_DB: '' },
+      { ...enabledEnv, FLYWHEEL_LEAD_COMPANION: '1' },
+    ]) {
+      const mode = resolveRecorderMode({
+        ...env,
+        FLYWHEEL_LEAD_ID: 'flywheel-product-lead',
+      }, foreignProbe)
+      expect(mode).toEqual({
+        kind: 'miswired',
+        leadId: 'flywheel-product-lead',
+        stateDir: foreignProbe.stateDir,
+      })
+      expect(shouldBlockDiscordSurface(mode)).toBe(true)
+    }
+  })
+
+  it('accepts an owner provisioned for a non-canonical QA state directory', () => {
+    expect(resolveRecorderMode(enabledEnv, {
+      stateDir: '/tmp/flywheel-test-slot-1/discord-state',
+      readOwnerFile: () => 'flywheel-eng-lead\n',
+    })).toEqual({
+      kind: 'enabled',
+      commCli: '/opt/flywheel-comm.js',
+      dbPath: '/tmp/comm.db',
+      leadId: 'flywheel-eng-lead',
+    })
+  })
+
+  it('rejects missing, empty, unreadable, or foreign ownership declarations', () => {
+    for (const stateDir of ['/Users/test/.claude/channels/discord', '']) {
+      expect(resolveRecorderMode(enabledEnv, {
+        stateDir,
+        readOwnerFile: () => undefined,
+      })).toMatchObject({ kind: 'miswired' })
+    }
+    for (const readOwnerFile of [
+      () => undefined,
+      () => 'flywheel-product-lead',
+      () => { throw new Error('unreadable') },
+    ]) {
+      expect(resolveRecorderMode(enabledEnv, {
+        stateDir: '/tmp/custom-state',
+        readOwnerFile,
+      })).toMatchObject({ kind: 'miswired' })
+    }
+  })
+
+  it('uses the inherited environment snapshot rather than later state-dir dotenv values', () => {
+    const inherited = { ...enabledEnv }
+    const live = { ...inherited }
+    live.FLYWHEEL_LEAD_ID = 'flywheel-product-lead'
+    expect(resolveRecorderMode(inherited, enabledProbe)).toMatchObject({
+      kind: 'enabled',
+      leadId: 'flywheel-eng-lead',
+    })
+    expect(resolveRecorderMode(live, enabledProbe)).toMatchObject({
+      kind: 'miswired',
+      leadId: 'flywheel-product-lead',
+    })
+  })
+})
+
+describe('miswired server boundaries', () => {
+  const server = readFileSync(new URL('./server.ts', import.meta.url), 'utf8')
+
+  it('snapshots inherited identity before loading state-dir dotenv', () => {
+    expect(server.indexOf('const INHERITED_ENV = { ...process.env }'))
+      .toBeLessThan(server.indexOf("chmodSync(ENV_FILE, 0o600)"))
+    expect(server).toContain('const RECORDER_MODE = resolveRecorderMode(INHERITED_ENV, {')
+  })
+
+  it('blocks every gated surface before its prior side effects', () => {
+    for (const boundary of [
+      "function checkApprovals(): void {\n  if (blockMiswiredSurface('pairing_poller')) return",
+      "async ({ params }) => {\n    if (blockMiswiredSurface('permission_request')) return",
+      "client.on('interactionCreate', async (interaction: Interaction) => {\n  if (blockMiswiredSurface('interaction_create'",
+      "client.on('messageCreate', msg => {\n  if (blockMiswiredSurface('message_create'",
+      "async function handleInbound(msg: Message): Promise<void> {\n  if (blockMiswiredSurface('handle_inbound'",
+    ]) expect(server).toContain(boundary)
   })
 })
 
@@ -119,7 +221,7 @@ describe('resolveFounderId', () => {
     )).toBeUndefined()
     expect(reads).toBe(0)
 
-    expect(resolveFounderIdForMode(resolveRecorderMode(enabledEnv), input))
+    expect(resolveFounderIdForMode(resolveRecorderMode(enabledEnv, enabledProbe), input))
       .toBe('100000000000000011')
     expect(reads).toBe(1)
   })
@@ -324,7 +426,7 @@ describe('receipt-aware MCP copy', () => {
   })
 
   it('requires explicit reply_to only for receipted messages and explains roundtable ack', () => {
-    const enabled = resolveRecorderMode(enabledEnv)
+    const enabled = resolveRecorderMode(enabledEnv, enabledProbe)
     for (const copy of [
       receiptInboundInstruction(enabled),
       receiptReplyToolDescription(enabled),

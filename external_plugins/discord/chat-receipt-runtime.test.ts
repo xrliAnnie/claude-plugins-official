@@ -17,7 +17,11 @@ import {
   type CommandResult,
   type RunCommand,
 } from './chat-receipt-runtime'
-import type { BeginArgs, RecorderMode } from './chat-receipt-recorder'
+import {
+  encodeSpoolIntent,
+  type BeginArgs,
+  type RecorderMode,
+} from './chat-receipt-recorder'
 
 const tempDirs: string[] = []
 afterEach(() => {
@@ -836,5 +840,99 @@ describe('recovery worker', () => {
     expect(JSON.parse(readFileSync(join(spool, 'meta', 'corrupt-advised.json'), 'utf8'))).toMatchObject({
       advisedAt: '2026-07-23T05:00:00.000Z',
     })
+  })
+
+  it('quarantines foreign-lead legacy and mailbox intents without CLI calls or advisories', async () => {
+    const dir = tempDir()
+    const spool = join(dir, 'chat-receipt-spool')
+    const ingestDir = join(spool, 'ingest')
+    mkdirSync(ingestDir, { recursive: true })
+    const foreignPaths: string[] = []
+    for (let index = 0; index < 11; index++) {
+      const messageId = String(10000000000000100n + BigInt(index))
+      const path = join(spool, `${messageId}.json`)
+      foreignPaths.push(path)
+      writeFileSync(path, encodeSpoolIntent({
+        v: 1,
+        begin: {
+          ...begin,
+          leadId: 'flywheel-product-lead',
+          messageId,
+        },
+        attempts: 0,
+        advisedAt: null,
+      }))
+    }
+    const foreignIngestId = '10000000000000120'
+    const foreignIngestPath = join(ingestDir, `${foreignIngestId}.json`)
+    writeFileSync(foreignIngestPath, JSON.stringify({
+      v: 1,
+      begin: {
+        ...begin,
+        leadId: 'flywheel-product-lead',
+        messageId: foreignIngestId,
+      },
+      firstFailedAt: begin.ts,
+      nextAttemptAt: begin.ts,
+      attempts: 0,
+      advisedAt: null,
+    }))
+    const localLegacyId = '10000000000000130'
+    const localLegacyPath = join(spool, `${localLegacyId}.json`)
+    writeFileSync(localLegacyPath, encodeSpoolIntent({
+      v: 1,
+      begin: { ...begin, messageId: localLegacyId },
+      attempts: 0,
+      advisedAt: null,
+    }))
+    const localIngestId = '10000000000000131'
+    const localIngestPath = join(ingestDir, `${localIngestId}.json`)
+    writeFileSync(localIngestPath, JSON.stringify({
+      v: 1,
+      begin: { ...begin, messageId: localIngestId },
+      firstFailedAt: begin.ts,
+      nextAttemptAt: begin.ts,
+      attempts: 0,
+      advisedAt: null,
+    }))
+
+    const calls: string[][] = []
+    const logs: string[] = []
+    let advisoryCalls = 0
+    const runtime = new ChatReceiptRuntime({
+      mode: enabledMode(),
+      stateDir: dir,
+      runCommand: async argv => {
+        calls.push(argv)
+        if (argv.includes('chat-ingest')) {
+          return result(JSON.stringify({ lane: 'inserted_inbox' }))
+        }
+        if (subcommand(argv) === 'pending') {
+          return result(JSON.stringify({ rows: [], nextCursor: 0 }))
+        }
+        return result('{}')
+      },
+      notify: async () => {},
+      advise: async () => { advisoryCalls++ },
+      log: line => { logs.push(line) },
+      now: () => new Date('2026-07-23T05:01:00.000Z'),
+      sleep: async () => {},
+    })
+
+    runtime.kickWorker()
+    await runtime.whenIdle()
+
+    expect(calls.some(argv => argv.includes('flywheel-product-lead'))).toBe(false)
+    expect(calls.some(argv => argv.includes(localLegacyId))).toBe(true)
+    expect(calls.some(argv => argv.includes(localIngestId))).toBe(true)
+    for (const path of [...foreignPaths, foreignIngestPath]) {
+      expect(existsSync(path)).toBe(false)
+      expect(existsSync(`${path}.foreign-lead`)).toBe(true)
+    }
+    expect(existsSync(localLegacyPath)).toBe(false)
+    expect(existsSync(localIngestPath)).toBe(false)
+    expect(advisoryCalls).toBe(0)
+    expect(logs.filter(line => line.includes('discord_receipt_foreign_intent_quarantined')))
+      .toHaveLength(12)
   })
 })

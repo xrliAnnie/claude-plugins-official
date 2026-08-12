@@ -1,3 +1,5 @@
+import { basename, join } from 'node:path'
+
 export type RecorderMode =
   | {
       kind: 'enabled'
@@ -13,6 +15,16 @@ export type RecorderMode =
       kind: 'broken'
       missing: string[]
     }
+  | {
+      kind: 'miswired'
+      leadId: string
+      stateDir: string
+    }
+
+export interface RecorderOwnershipProbe {
+  stateDir: string
+  readOwnerFile: (path: string) => string | undefined
+}
 
 export interface ReceiptAttachment {
   name: string
@@ -87,7 +99,13 @@ function present(value: string | undefined): string | undefined {
 
 export function resolveRecorderMode(
   env: Record<string, string | undefined>,
+  probe: RecorderOwnershipProbe,
 ): RecorderMode {
+  const leadId = present(env.FLYWHEEL_LEAD_ID)
+  if (leadId && !stateDirBelongsToLead(probe, leadId)) {
+    return { kind: 'miswired', leadId, stateDir: probe.stateDir }
+  }
+
   if (
     present(env.FLYWHEEL_LEAD_COMPANION) === '1' ||
     present(env.FLYWHEEL_LEAD_EXTERNAL) === '1'
@@ -117,6 +135,23 @@ export function resolveRecorderMode(
     commCli: capability.FLYWHEEL_COMM_CLI as string,
     dbPath: capability.FLYWHEEL_COMM_DB as string,
     leadId: capability.FLYWHEEL_LEAD_ID as string,
+  }
+}
+
+export function shouldBlockDiscordSurface(mode: RecorderMode): boolean {
+  return mode.kind === 'miswired'
+}
+
+function stateDirBelongsToLead(
+  probe: RecorderOwnershipProbe,
+  leadId: string,
+): boolean {
+  if (!present(probe.stateDir)) return false
+  if (basename(probe.stateDir) === `discord-${leadId}`) return true
+  try {
+    return present(probe.readOwnerFile(join(probe.stateDir, 'owner'))) === leadId
+  } catch {
+    return false
   }
 }
 
