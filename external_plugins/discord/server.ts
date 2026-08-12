@@ -72,7 +72,8 @@ import { loadSharedRoundtableRouting } from './roundtable-shared-routing'
 import { authenticateDiscordIdentity, DiscordIdentityAssertionError } from './identity-assertion'
 import { buildRoundtableThreadCreateBody } from './roundtable-archive-policy'
 
-const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
+const configuredStateDir = process.env.DISCORD_STATE_DIR?.trim()
+const STATE_DIR = configuredStateDir || join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -90,9 +91,7 @@ try {
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN
 const STATIC = process.env.DISCORD_ACCESS_MODE === 'static'
-const MANAGED_IDENTITY = Boolean(
-  process.env.FLYWHEEL_LEAD_ID?.trim() || process.env.DISCORD_STATE_DIR?.trim(),
-)
+const MANAGED_IDENTITY = process.env.DISCORD_IDENTITY_MODE?.trim() === 'managed'
 const RECORDER_MODE = resolveRecorderMode(process.env)
 const FOUNDER_ID = resolveFounderIdForMode(RECORDER_MODE, {
   env: process.env,
@@ -1040,6 +1039,7 @@ mcp.setNotificationHandler(
     }),
   }),
   async ({ params }) => {
+    if (!identityReady) return
     const { request_id, tool_name, description, input_preview } = params
     pendingPermissions.set(request_id, { tool_name, description, input_preview })
     const access = loadAccess()
@@ -1752,8 +1752,14 @@ function recordIdentityFailure(code: string, message: string): void {
 }
 
 // Complete the MCP handshake promptly, but keep every Discord-touching tool and
-// inbound/poller handler behind the authenticated identity boundary.
-await mcp.connect(new StdioServerTransport())
+// notification/inbound/poller handler behind the authenticated identity boundary.
+try {
+  await mcp.connect(new StdioServerTransport())
+} catch (err) {
+  const message = err instanceof Error ? err.message : String(err)
+  process.stderr.write(`discord channel: MCP transport startup failed: ${message}\n`)
+  process.exit(1)
+}
 try {
   await authenticateDiscordIdentity({
     managed: MANAGED_IDENTITY,
