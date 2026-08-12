@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'bun:test'
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -54,6 +55,19 @@ function result(stdout = '', exitCode = 0, stderr = ''): CommandResult {
 }
 
 describe('durable Discord ingest runtime', () => {
+  it('has no receipt or Discord advisory injection surface', () => {
+    const runtimeSource = readFileSync(join(import.meta.dir, 'chat-receipt-runtime.ts'), 'utf8')
+    const serverSource = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+
+    expect(runtimeSource).not.toMatch(/\bAdviseFn\b/)
+    expect(runtimeSource).not.toContain('advise:')
+    expect(runtimeSource).not.toContain('adviseBroken')
+    expect(serverSource).not.toContain('advise: async')
+    expect(serverSource).not.toContain('.adviseBroken(')
+    expect(serverSource).not.toContain('content: `⚠️ ${text}`')
+    expect(serverSource).not.toContain('chatIngestRuntime.settle')
+  })
+
   it('always invokes chat-ingest and never invokes a receipt command', async () => {
     const commands: string[][] = []
     const runtime = new ChatIngestRuntime({
@@ -63,7 +77,6 @@ describe('durable Discord ingest runtime', () => {
         commands.push(argv)
         return result(JSON.stringify({ lane: 'inserted_inbox' }))
       },
-      advise: async () => {},
     })
 
     expect(await runtime.acceptInbound(begin)).toBe('mailbox')
@@ -84,7 +97,6 @@ describe('durable Discord ingest runtime', () => {
         presentDuringCli = existsSync(intent)
         return result(JSON.stringify({ lane: 'active_inbox' }))
       },
-      advise: async () => {},
     })
 
     expect(await runtime.acceptInbound(begin)).toBe('mailbox')
@@ -107,7 +119,6 @@ describe('durable Discord ingest runtime', () => {
           ? result('', 1, 'ambiguous')
           : result(JSON.stringify({ lane: 'active_inbox' }))
       },
-      advise: async () => {},
       now: () => now,
       setTimer: (fn, ms) => {
         timers.push({ fn, ms })
@@ -139,7 +150,6 @@ describe('durable Discord ingest runtime', () => {
         writeFileSync(path, JSON.stringify(intent))
       },
       runCommand: async () => result('', 1, 'ambiguous'),
-      advise: async () => {},
       setTimer: (_fn, ms) => {
         timers.push(ms)
         return 1 as unknown as ReturnType<typeof setTimeout>
@@ -151,31 +161,82 @@ describe('durable Discord ingest runtime', () => {
     expect(timers).toEqual([5_000])
   })
 
-  it('preserves stock direct delivery and latches broken-wiring advice', async () => {
+  it('logs an unrecoverable ingest when neither durability nor immediate delivery works', async () => {
+    const logs: string[] = []
+    const runtime = new ChatIngestRuntime({
+      mode: enabledMode(),
+      stateDir: tempDir(),
+      writeIngestIntent: () => { throw new Error('disk full') },
+      runCommand: async () => result('', 1, 'mailbox unavailable'),
+      log: line => logs.push(line),
+    })
+
+    await runtime.acceptInbound(begin)
+    expect(logs.filter(line => line.includes('discord_mailbox_ingest_unrecoverable'))).toHaveLength(1)
+  })
+
+  it('logs corrupt recovery intents once without creating an advisory marker', async () => {
+    const dir = tempDir()
+    const ingestDir = join(dir, 'chat-receipt-spool', 'ingest')
+    const intent = join(ingestDir, `${begin.messageId}.json`)
+    const logs: string[] = []
+    mkdirSync(ingestDir, { recursive: true })
+    writeFileSync(intent, '{invalid')
+    const runtime = new ChatIngestRuntime({
+      mode: enabledMode(),
+      stateDir: dir,
+      log: line => logs.push(line),
+    })
+
+    runtime.kickWorker()
+    await runtime.whenIdle()
+    expect(existsSync(`${intent}.corrupt`)).toBe(true)
+    expect(logs.filter(line => line.includes('discord_mailbox_ingest_corrupt_intent'))).toHaveLength(1)
+    expect(existsSync(join(dir, 'chat-receipt-spool', 'meta', 'ingest-corrupt-advised.json'))).toBe(false)
+  })
+
+  it('logs a stalled ingest once and persists the existing latch', async () => {
+    const dir = tempDir()
+    const ingestDir = join(dir, 'chat-receipt-spool', 'ingest')
+    const intentPath = join(ingestDir, `${begin.messageId}.json`)
+    const now = new Date('2026-08-11T05:06:00.000Z')
+    const logs: string[] = []
+    mkdirSync(ingestDir, { recursive: true })
+    writeFileSync(intentPath, JSON.stringify({
+      v: 1,
+      begin,
+      firstFailedAt: '2026-08-11T05:00:00.000Z',
+      nextAttemptAt: '2026-08-11T05:00:00.000Z',
+      attempts: 5,
+      advisedAt: null,
+    }))
+    const runtime = new ChatIngestRuntime({
+      mode: enabledMode(),
+      stateDir: dir,
+      runCommand: async () => result('', 1, 'mailbox unavailable'),
+      now: () => now,
+      log: line => logs.push(line),
+      setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+      clearTimer: () => {},
+    })
+
+    runtime.kickWorker()
+    await runtime.whenIdle()
+    expect(JSON.parse(readFileSync(intentPath, 'utf8')).advisedAt).toBe(now.toISOString())
+    expect(logs.filter(line => line.includes('discord_mailbox_ingest_stalled'))).toHaveLength(1)
+  })
+
+  it('preserves stock and broken-wiring direct delivery', async () => {
     const stock = new ChatIngestRuntime({
       mode: { kind: 'disabled', reason: 'stock' },
       stateDir: tempDir(),
-      advise: async () => {},
     })
     expect(await stock.acceptInbound(begin)).toBe('legacy')
 
-    const dir = tempDir()
-    let attempts = 0
     const broken = new ChatIngestRuntime({
       mode: { kind: 'broken', missing: ['FLYWHEEL_COMM_DB'] },
-      stateDir: dir,
-      advise: async () => { attempts++ },
-      now: () => new Date('2026-08-11T05:00:00.000Z'),
+      stateDir: tempDir(),
     })
-    await broken.adviseBroken(begin.chatId)
-    await broken.adviseBroken(begin.chatId)
-    expect(attempts).toBe(1)
-    expect(JSON.parse(readFileSync(
-      join(dir, 'chat-receipt-spool', 'meta', 'broken-advised.json'),
-      'utf8',
-    ))).toEqual({
-      detectedAt: '2026-08-11T05:00:00.000Z',
-      advisedAt: '2026-08-11T05:00:00.000Z',
-    })
+    expect(await broken.acceptInbound(begin)).toBe('legacy')
   })
 })

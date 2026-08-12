@@ -1001,12 +1001,6 @@ const chatIngestRuntime = new ChatIngestRuntime({
   mode: RECORDER_MODE,
   stateDir: STATE_DIR,
   founderId: FOUNDER_ID,
-  advise: async (chatId, text) => {
-    if (!chatId) throw new Error('no Discord chat is available for the ingest advisory')
-    const channel = await fetchAllowedChannel(chatId)
-    if (!('send' in channel)) throw new Error(`channel ${chatId} is not sendable`)
-    await channel.send({ content: `⚠️ ${text}` })
-  },
 })
 void chatIngestRuntime.diagnoseNode()
 
@@ -1601,12 +1595,6 @@ async function handleInbound(msg: Message): Promise<void> {
   // Attachment listing goes in meta only — an in-content annotation is
   // forgeable by any allowlisted sender typing that string.
   const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
-  if (RECORDER_MODE.kind === 'broken') {
-    await chatIngestRuntime.adviseBroken(chat_id).catch(err => {
-      process.stderr.write(`discord mailbox: broken-wiring advisory failed: ${err}\n`)
-    })
-  }
-
   let ingestArgs: BeginArgs | undefined
   if (RECORDER_MODE.kind === 'enabled') {
     ingestArgs = buildBeginArgs(

@@ -29,13 +29,6 @@ export type RunCommand = (
   opts: { stdin?: string; timeoutMs: number },
 ) => Promise<CommandResult>
 
-export type AdviseFn = (chatId: string | undefined, text: string) => Promise<void>
-
-interface AdviceMarker {
-  detectedAt: string
-  advisedAt: string | null
-}
-
 export interface IngestIntentV1 {
   v: 1
   begin: BeginArgs
@@ -60,7 +53,6 @@ interface PassResult {
 export interface ChatIngestRuntimeOptions {
   mode: RecorderMode
   stateDir: string
-  advise: AdviseFn
   runCommand?: RunCommand
   now?: () => Date
   log?: (line: string) => void
@@ -75,34 +67,29 @@ const COMMAND_TIMEOUT_MS = 5_000
 const INGESTS_PER_PASS = 5
 const INGEST_RETRY_INITIAL_MS = 5_000
 const INGEST_RETRY_MAX_MS = 5 * 60_000
-const INGEST_STALL_ADVISE_MS = 5 * 60_000
+const INGEST_STALL_LOG_MS = 5 * 60_000
 
 export class ChatIngestRuntime {
   private readonly mode: RecorderMode
-  private readonly advise: AdviseFn
   private readonly runCommand: RunCommand
   private readonly now: () => Date
   private readonly log: (line: string) => void
   private readonly spoolDir: string
-  private readonly metaDir: string
   private readonly ingestDir: string
   private readonly writeIngestIntent: (path: string, intent: IngestIntentV1) => void
   private readonly founderId?: string
   private readonly setTimer: NonNullable<ChatIngestRuntimeOptions['setTimer']>
   private readonly clearTimer: NonNullable<ChatIngestRuntimeOptions['clearTimer']>
-  private lastChatId: string | undefined
   private ingestWorkerPromise: Promise<void> | undefined
   private ingestDirty = false
   private ingestRetryTimer: ReturnType<typeof setTimeout> | undefined
 
   constructor(opts: ChatIngestRuntimeOptions) {
     this.mode = opts.mode
-    this.advise = opts.advise
     this.runCommand = opts.runCommand ?? runCommand
     this.now = opts.now ?? (() => new Date())
     this.log = opts.log ?? (line => process.stderr.write(`[discord-ingest] ${line}\n`))
     this.spoolDir = opts.spoolDir ?? join(opts.stateDir, 'chat-receipt-spool')
-    this.metaDir = join(this.spoolDir, 'meta')
     this.ingestDir = join(this.spoolDir, 'ingest')
     this.writeIngestIntent = opts.writeIngestIntent ?? writeJsonAtomic
     this.founderId = opts.founderId
@@ -117,7 +104,6 @@ export class ChatIngestRuntime {
   }
 
   private async ingest(args: BeginArgs): Promise<void> {
-    this.lastChatId = args.chatId
     const path = this.ingestIntentPath(args.messageId)
     let intent = readIngestIntent(path) ?? {
       v: 1 as const,
@@ -136,14 +122,12 @@ export class ChatIngestRuntime {
       const lane = parseLaneVerdict(command.stdout)
       if (lane) this.logIngestVerdict(args, lane)
       if (!lane) {
-        try {
-          await this.advise(
-            args.chatId,
-            `Discord mailbox ingest could not persist recovery for message ${args.messageId}; this message may require manual replay.`,
-          )
-        } catch (adviseError) {
-          this.log(`discord mailbox ingest emergency advisory failed: ${errorText(adviseError)}`)
-        }
+        this.log(JSON.stringify({
+          event: 'discord_mailbox_ingest_unrecoverable',
+          message_id: args.messageId,
+          write_error: errorText(error),
+          command_error: command.stderr || command.stdout,
+        }))
       }
       return
     }
@@ -167,20 +151,6 @@ export class ChatIngestRuntime {
       return
     }
     this.scheduleIngestRetry()
-  }
-
-  async adviseBroken(chatId: string): Promise<void> {
-    if (this.mode.kind !== 'broken') return
-    this.lastChatId = chatId
-    try {
-      await this.adviseWithMarker(
-        'broken-advised.json',
-        chatId,
-        `Discord mailbox ingest is disabled because Flywheel wiring is incomplete (${this.mode.missing.join(', ')}). Delivery continued; operator repair is required.`,
-      )
-    } catch (error) {
-      this.log(`could not persist broken-wiring advisory state: ${errorText(error)}`)
-    }
   }
 
   async diagnoseNode(): Promise<void> {
@@ -249,11 +219,10 @@ export class ChatIngestRuntime {
         } catch (error) {
           this.log(`could not preserve corrupt ingest intent ${basename(path)}: ${errorText(error)}`)
         }
-        await this.adviseWithMarker(
-          'ingest-corrupt-advised.json',
-          this.lastChatId,
-          `Discord mailbox recovery found a corrupt ingest intent (${basename(path)}).`,
-        )
+        this.log(JSON.stringify({
+          event: 'discord_mailbox_ingest_corrupt_intent',
+          intent: basename(path),
+        }))
         progress = true
         continue
       }
@@ -268,18 +237,10 @@ export class ChatIngestRuntime {
       }
       intent.attempts += 1
       if (
-        this.now().getTime() - Date.parse(intent.firstFailedAt) >= INGEST_STALL_ADVISE_MS &&
+        this.now().getTime() - Date.parse(intent.firstFailedAt) >= INGEST_STALL_LOG_MS &&
         intent.advisedAt === null
       ) {
-        try {
-          await this.advise(
-            intent.begin.chatId,
-            `Discord mailbox ingest is stalled for message ${intent.begin.messageId}; recovery remains queued.`,
-          )
-          intent.advisedAt = this.now().toISOString()
-        } catch (error) {
-          this.log(`discord mailbox ingest stall advisory failed: ${errorText(error)}`)
-        }
+        intent.advisedAt = this.now().toISOString()
         this.log(JSON.stringify({
           event: 'discord_mailbox_ingest_stalled',
           message_id: intent.begin.messageId,
@@ -375,28 +336,6 @@ export class ChatIngestRuntime {
     ;(this.ingestRetryTimer as { unref?: () => void }).unref?.()
   }
 
-  private async adviseWithMarker(
-    markerName: string,
-    chatId: string | undefined,
-    text: string,
-  ): Promise<void> {
-    mkdirSync(this.metaDir, { recursive: true, mode: 0o700 })
-    chmodSync(this.metaDir, 0o700)
-    const path = join(this.metaDir, markerName)
-    let marker = readAdviceMarker(path)
-    if (!marker) {
-      marker = { detectedAt: this.now().toISOString(), advisedAt: null }
-      writeJsonAtomic(path, marker)
-    }
-    if (marker.advisedAt !== null) return
-    try {
-      await this.advise(chatId, text)
-      marker.advisedAt = this.now().toISOString()
-      writeJsonAtomic(path, marker)
-    } catch (error) {
-      this.log(`${markerName} advisory failed: ${errorText(error)}`)
-    }
-  }
 }
 
 export async function runCommand(
@@ -504,19 +443,6 @@ function writeJsonAtomic(path: string, value: unknown): void {
     rmSync(tmp, { force: true })
     throw error
   }
-}
-
-function readAdviceMarker(path: string): AdviceMarker | undefined {
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8')) as AdviceMarker
-    if (
-      typeof parsed.detectedAt === 'string' &&
-      (parsed.advisedAt === null || typeof parsed.advisedAt === 'string')
-    ) {
-      return parsed
-    }
-  } catch {}
-  return undefined
 }
 
 function readIngestIntent(path: string): IngestIntentV1 | undefined {
