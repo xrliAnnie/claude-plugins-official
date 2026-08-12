@@ -90,6 +90,9 @@ try {
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN
 const STATIC = process.env.DISCORD_ACCESS_MODE === 'static'
+const MANAGED_IDENTITY = Boolean(
+  process.env.FLYWHEEL_LEAD_ID?.trim() || process.env.DISCORD_STATE_DIR?.trim(),
+)
 const RECORDER_MODE = resolveRecorderMode(process.env)
 const FOUNDER_ID = resolveFounderIdForMode(RECORDER_MODE, {
   env: process.env,
@@ -901,8 +904,6 @@ function checkApprovals(): void {
   }
 }
 
-if (!STATIC) setInterval(checkApprovals, 5000).unref()
-
 // Discord caps messages at 2000 chars (hard limit — larger sends reject).
 // Split long replies, preferring paragraph boundaries when chunkMode is
 // 'newline'.
@@ -1181,7 +1182,14 @@ function resolveOutboundText(
   return { text: raw }
 }
 
+let identityReady = false
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
+  if (!identityReady) {
+    return {
+      content: [{ type: 'text', text: 'Discord identity authentication is not ready' }],
+      isError: true,
+    }
+  }
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   // FLY-29: Any tool call with chat_id resets the idle timer, keeping typing
   // alive while the Lead is actively using Discord tools.
@@ -1454,6 +1462,7 @@ client.on('error', err => {
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
 function registerAuthenticatedInboundHandlers(): void {
+	if (!STATIC) setInterval(checkApprovals, 5000).unref()
 	client.on('interactionCreate', async (interaction: Interaction) => {
 		if (!interaction.isButton()) return
 		const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(interaction.customId)
@@ -1722,8 +1731,12 @@ function recordIdentityFailure(code: string, message: string): void {
   const project = process.env.FLYWHEEL_PROJECT_NAME
   const lead = process.env.FLYWHEEL_LEAD_ID
   if (!cli || !projectsFile || !project || !lead) return
+  const nodeBin =
+    process.env.FLYWHEEL_NODE_BIN ??
+    ['/opt/homebrew/bin/node', '/usr/local/bin/node', '/usr/bin/node'].find(path => existsSync(path)) ??
+    'node'
   try {
-    execFileSync('node', [
+    execFileSync(nodeBin, [
       cli,
       'lead-identity',
       'record-failure',
@@ -1738,13 +1751,17 @@ function recordIdentityFailure(code: string, message: string): void {
   }
 }
 
+// Complete the MCP handshake promptly, but keep every Discord-touching tool and
+// inbound/poller handler behind the authenticated identity boundary.
+await mcp.connect(new StdioServerTransport())
 try {
   await authenticateDiscordIdentity({
+    managed: MANAGED_IDENTITY,
     expectedUserId: process.env.DISCORD_EXPECTED_BOT_USER_ID,
     login: () => client.login(TOKEN),
     actualUserId: () => client.user?.id,
-    registerInboundHandlers: async () => {
-      await mcp.connect(new StdioServerTransport())
+    registerInboundHandlers: () => {
+      identityReady = true
       registerAuthenticatedInboundHandlers()
     },
   })
@@ -1755,6 +1772,6 @@ try {
   const message = err instanceof Error ? err.message : String(err)
   recordIdentityFailure(code, message)
   process.stderr.write(`discord channel: login identity assertion failed: ${message}\n`)
-  await Promise.resolve(client.destroy()).catch(() => {})
-  process.exit(1)
+  setTimeout(() => process.exit(1), 2000)
+  void Promise.resolve(client.destroy()).finally(() => process.exit(1))
 }
