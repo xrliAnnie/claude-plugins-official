@@ -91,7 +91,14 @@ try {
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN
 const STATIC = process.env.DISCORD_ACCESS_MODE === 'static'
-const MANAGED_IDENTITY = process.env.DISCORD_IDENTITY_MODE?.trim() === 'managed'
+const IDENTITY_MODE = process.env.DISCORD_IDENTITY_MODE?.trim()
+if (IDENTITY_MODE && IDENTITY_MODE !== 'managed') {
+  process.stderr.write(
+    `discord channel: unsupported DISCORD_IDENTITY_MODE=${JSON.stringify(IDENTITY_MODE)}\n`,
+  )
+  process.exit(1)
+}
+const MANAGED_IDENTITY = IDENTITY_MODE === 'managed'
 const RECORDER_MODE = resolveRecorderMode(process.env)
 const FOUNDER_ID = resolveFounderIdForMode(RECORDER_MODE, {
   env: process.env,
@@ -1039,7 +1046,12 @@ mcp.setNotificationHandler(
     }),
   }),
   async ({ params }) => {
-    if (!identityReady) return
+    if (!identityReady) {
+      process.stderr.write(
+        `discord channel: dropped permission_request ${params.request_id} before identity authentication\n`,
+      )
+      return
+    }
     const { request_id, tool_name, description, input_preview } = params
     pendingPermissions.set(request_id, { tool_name, description, input_preview })
     const access = loadAccess()
