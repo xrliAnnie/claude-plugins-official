@@ -1,3 +1,5 @@
+import { isAbsolute, join } from 'node:path'
+
 export type RecorderMode =
   | {
       kind: 'enabled'
@@ -7,14 +9,46 @@ export type RecorderMode =
     }
   | {
       kind: 'disabled'
-      reason: 'stock' | 'isolated' | 'kill_switch'
+      reason: 'stock' | 'isolated'
     }
   | {
       kind: 'broken'
       missing: string[]
     }
 
-export interface ReceiptAttachment {
+export type DiscordIdentity = {
+  kind: 'legacy'
+  stateDir: string
+  token: string | undefined
+} | {
+  kind: 'registry'
+  registrySource: 'inline' | string
+  leadId: string
+  stateDir: string
+  token: string
+  expectedBotUserId: string
+  channelIds: string[]
+}
+
+export interface DiscordIdentityDeps {
+  homeDir: string
+  readFile: (path: string) => string
+}
+
+interface RegistryLead {
+  agentId: string
+  chatChannel?: string
+  botTokenEnv?: string
+  discordStateDir?: string
+  crossDeptChannels?: string[]
+}
+
+interface RegistryProject {
+  generalChannel?: string
+  leads: unknown[]
+}
+
+export interface DeliveryAttachment {
   name: string
   type: string
   sizeKb: number
@@ -35,7 +69,7 @@ export interface InboundMeta {
   authorName: string
   ts: string
   text: string
-  attachments: ReceiptAttachment[]
+  attachments: DeliveryAttachment[]
 }
 
 export interface RoutingMeta {
@@ -57,7 +91,7 @@ export interface BeginArgs {
   priority: 0 | 1
   ts: string
   msgKind: 'dm' | 'guild' | 'roundtable'
-  attachments: ReceiptAttachment[]
+  attachments: DeliveryAttachment[]
   text: string
   replyChannelId?: string
   replyRoute?: DiscordReplyRoute
@@ -78,7 +112,11 @@ const STOCK_REPLY_TOOL_DESCRIPTION =
   'Reply on Discord. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or other files.'
 const STOCK_REPLY_TO_DESCRIPTION =
   'Message ID to thread under. Use message_id from the inbound <channel> block, or an id from fetch_messages.'
-const MAILBOX_DISCORD_ENV = 'FLYWHEEL_MAILBOX_DISCORD'
+const IDENTITY_MODE_ENV = 'FLYWHEEL_DISCORD_IDENTITY_MODE'
+const EXPECTED_BOT_USER_ID_ENV = 'FLYWHEEL_EXPECTED_DISCORD_BOT_USER_ID'
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
+const SECRET_KEY = /^(botToken|announcerBotToken|token|secret|password|apiKey)$/i
+const SECRET_VALUE = /^(?:mfa\.|gh[pousr]_|sk-)|^[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}$/
 
 function present(value: string | undefined): string | undefined {
   const trimmed = value?.trim()
@@ -87,6 +125,7 @@ function present(value: string | undefined): string | undefined {
 
 export function resolveRecorderMode(
   env: Record<string, string | undefined>,
+  canonicalLeadId = present(env.FLYWHEEL_LEAD_ID),
 ): RecorderMode {
   if (
     present(env.FLYWHEEL_LEAD_COMPANION) === '1' ||
@@ -98,15 +137,11 @@ export function resolveRecorderMode(
   const capability = {
     FLYWHEEL_COMM_CLI: present(env.FLYWHEEL_COMM_CLI),
     FLYWHEEL_COMM_DB: present(env.FLYWHEEL_COMM_DB),
-    FLYWHEEL_LEAD_ID: present(env.FLYWHEEL_LEAD_ID),
+    FLYWHEEL_LEAD_ID: canonicalLeadId,
   }
   if (Object.values(capability).every(value => value === undefined)) {
     return { kind: 'disabled', reason: 'stock' }
   }
-  if (present(env.FLYWHEEL_CHAT_RECEIPTS) === '0') {
-    return { kind: 'disabled', reason: 'kill_switch' }
-  }
-
   const missing = Object.entries(capability)
     .filter(([, value]) => value === undefined)
     .map(([name]) => name)
@@ -118,6 +153,171 @@ export function resolveRecorderMode(
     dbPath: capability.FLYWHEEL_COMM_DB as string,
     leadId: capability.FLYWHEEL_LEAD_ID as string,
   }
+}
+
+export function resolveDiscordIdentity(
+  env: Record<string, string | undefined>,
+  deps: DiscordIdentityDeps,
+): DiscordIdentity {
+  const leadId = present(env.FLYWHEEL_LEAD_ID)
+  const mode = present(env[IDENTITY_MODE_ENV]) ?? 'legacy'
+  if (mode !== 'legacy' && mode !== 'registry') {
+    throw new Error(`${IDENTITY_MODE_ENV}: identity mode must be legacy or registry`)
+  }
+  const legacyStateDir = present(env.DISCORD_STATE_DIR) ??
+    join(deps.homeDir, '.claude', 'channels', 'discord')
+  if (!leadId || mode === 'legacy') {
+    return {
+      kind: 'legacy',
+      stateDir: legacyStateDir,
+      token: present(env.DISCORD_BOT_TOKEN),
+    }
+  }
+
+  const inline = present(env.FLYWHEEL_PROJECTS)
+  const registryPath = present(env.FLYWHEEL_PROJECTS_FILE) ??
+    join(deps.homeDir, '.flywheel', 'projects.json')
+  const registrySource = inline ? 'inline' as const : registryPath
+  let raw: unknown
+  try {
+    raw = JSON.parse(inline ?? deps.readFile(registryPath))
+  } catch (error) {
+    throw new Error(`Discord identity registry ${registrySource} is invalid: ${(error as Error).message}`)
+  }
+  if (!Array.isArray(raw)) {
+    throw new Error(`Discord identity registry ${registrySource} must be an array`)
+  }
+  if (containsSecret(raw)) {
+    throw new Error(`Discord identity registry ${registrySource} contains a literal or secret-shaped value`)
+  }
+  const matches: { lead: RegistryLead; project: RegistryProject }[] = []
+  for (const [projectIndex, project] of raw.entries()) {
+    if (!project || typeof project !== 'object' ||
+        !Array.isArray((project as { leads?: unknown }).leads)) {
+      throw new Error(`Discord identity registry project[${projectIndex}].leads must be an array`)
+    }
+    for (const [leadIndex, candidate] of
+      (project as { leads: unknown[] }).leads.entries()) {
+      const agentId = candidate && typeof candidate === 'object'
+        ? (candidate as { agentId?: unknown }).agentId
+        : undefined
+      if (typeof agentId !== 'string' || !present(agentId)) {
+        throw new Error(
+          `Discord identity registry project[${projectIndex}].leads[${leadIndex}].agentId is invalid`,
+        )
+      }
+      if (agentId === leadId) {
+        matches.push({
+          lead: candidate as RegistryLead,
+          project: project as RegistryProject,
+        })
+      }
+    }
+  }
+  if (matches.length !== 1) {
+    throw new Error(
+      `Discord identity registry must contain exactly one lead with agentId ${JSON.stringify(leadId)}; found ${matches.length}`,
+    )
+  }
+  const { lead, project } = matches[0]!
+  if (lead.botTokenEnv !== undefined &&
+      (typeof lead.botTokenEnv !== 'string' || !present(lead.botTokenEnv))) {
+    throw new Error('Discord identity botTokenEnv is invalid')
+  }
+  const tokenEnv = present(lead.botTokenEnv) ?? 'DISCORD_BOT_TOKEN'
+  if (!ENV_NAME.test(tokenEnv)) {
+    throw new Error(`Discord identity botTokenEnv ${JSON.stringify(tokenEnv)} is invalid`)
+  }
+  const namedToken = present(env[tokenEnv])
+  const genericToken = present(env.DISCORD_BOT_TOKEN)
+  if (namedToken && genericToken && namedToken !== genericToken) {
+    throw new Error('Discord identity token conflict between named and generic projection')
+  }
+  const token = namedToken ?? genericToken
+  if (!token) throw new Error('Discord identity token is missing')
+
+  let stateDir = join(deps.homeDir, '.claude', 'channels', `discord-${leadId}`)
+  if (lead.discordStateDir !== undefined) {
+    if (typeof lead.discordStateDir !== 'string' ||
+        !present(lead.discordStateDir) ||
+        // biome-ignore lint/suspicious/noControlCharactersInRegex: config boundary
+        /[\u0000-\u001f\u007f]/.test(lead.discordStateDir) ||
+        !isAbsolute(lead.discordStateDir)) {
+      throw new Error('Discord identity discordStateDir must be an absolute path without control characters')
+    }
+    stateDir = lead.discordStateDir
+  }
+  const inheritedStateDir = present(env.DISCORD_STATE_DIR)
+  if (inheritedStateDir && inheritedStateDir !== stateDir) {
+    throw new Error('Discord identity state conflict with registry-derived state dir')
+  }
+  const expectedBotUserId = present(env[EXPECTED_BOT_USER_ID_ENV])
+  if (!expectedBotUserId || !DISCORD_SNOWFLAKE.test(expectedBotUserId)) {
+    throw new Error(`Discord identity expected bot user id in ${EXPECTED_BOT_USER_ID_ENV} is invalid`)
+  }
+  const chatChannel = present(lead.chatChannel)
+  if (!chatChannel) throw new Error('Discord identity chatChannel is invalid')
+  const generalChannel = present(project.generalChannel)
+  if (lead.crossDeptChannels !== undefined &&
+      (!Array.isArray(lead.crossDeptChannels) ||
+       lead.crossDeptChannels.some(channel => !present(channel)))) {
+    throw new Error('Discord identity crossDeptChannels is invalid')
+  }
+  const registryCrossDeptChannels = lead.crossDeptChannels ?? []
+  const inheritedCrossDeptChannels = (present(
+    env.FLYWHEEL_LEAD_CROSS_DEPT_CHANNEL_IDS,
+  ) ?? '').split(',').map(channel => channel.trim()).filter(Boolean)
+  if (inheritedCrossDeptChannels.some(
+    channel => !registryCrossDeptChannels.includes(channel),
+  )) {
+    throw new Error(
+      'Discord identity shared-channel conflict with registry-derived crossDeptChannels',
+    )
+  }
+  const channelIds = [...new Set([
+    chatChannel,
+    ...(generalChannel ? [generalChannel] : []),
+    ...registryCrossDeptChannels,
+  ])]
+
+  return {
+    kind: 'registry',
+    registrySource,
+    leadId,
+    stateDir,
+    token,
+    expectedBotUserId,
+    channelIds,
+  }
+}
+
+export function canIngestDiscordChat(
+  identity: DiscordIdentity,
+  input: {
+    channelKind: 'dm' | 'guild'
+    channelId: string
+    parentChannelId?: string | null
+  },
+): boolean {
+  if (identity.kind === 'legacy' || input.channelKind === 'dm') return true
+  return identity.channelIds.includes(input.parentChannelId ?? input.channelId)
+}
+
+export function assertDiscordBotIdentity(expected: string, actual: string): void {
+  if (actual !== expected) {
+    throw new Error(
+      `Discord bot identity mismatch: logged in user ${JSON.stringify(actual)} does not match expected user ${JSON.stringify(expected)}`,
+    )
+  }
+}
+
+function containsSecret(value: unknown): boolean {
+  if (typeof value === 'string') return SECRET_VALUE.test(value)
+  if (Array.isArray(value)) return value.some(containsSecret)
+  if (!value || typeof value !== 'object') return false
+  return Object.entries(value).some(
+    ([key, child]) => SECRET_KEY.test(key) || containsSecret(child),
+  )
 }
 
 function dotenvValue(text: string, key: string): string | undefined {
@@ -137,20 +337,6 @@ function dotenvValue(text: string, key: string): string | undefined {
     }
   }
   return value
-}
-
-export function readMailboxDiscordFlag(
-  readEnvFile: () => string,
-): { enabled: boolean; readError?: string } {
-  try {
-    const prefix = `${MAILBOX_DISCORD_ENV}=`
-    const line = readEnvFile()
-      .split(/\r?\n/)
-      .find(candidate => candidate.startsWith(prefix))
-    return { enabled: line?.slice(prefix.length) === '1' }
-  } catch (error) {
-    return { enabled: false, readError: (error as Error).message }
-  }
 }
 
 function isSnowflake(value: unknown): value is string {
@@ -219,7 +405,7 @@ export function parseSpoolIntent(encoded: string): SpoolIntentV1 {
   try {
     decoded = JSON.parse(encoded)
   } catch (error) {
-    throw new Error(`chat receipt spool intent JSON is invalid: ${(error as Error).message}`)
+    throw new Error(`Discord ingest spool intent JSON is invalid: ${(error as Error).message}`)
   }
   return normalizeSpoolIntent(decoded)
 }
@@ -228,36 +414,26 @@ export function isIntentFilename(name: string): boolean {
   return INTENT_FILENAME.test(name)
 }
 
-export function sentMessageCarriesReference(
-  sent: { reference?: { messageId?: string } | null },
-  inboundMsgId: string,
-): boolean {
-  return sent.reference?.messageId === inboundMsgId
+export function deliveryInboundInstruction(): string {
+  return STOCK_INBOUND_INSTRUCTION
 }
 
-export function receiptInboundInstruction(mode: RecorderMode): string {
-  if (mode.kind !== 'enabled') return STOCK_INBOUND_INSTRUCTION
-  return 'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. A receipted message (meta has receipt_id) must be answered with explicit reply_to=<message_id>. When roundtable routing strips a cross-channel reference, close the receipt with handle-receipt ack instead; a message already inside a topic thread can carry a normal same-channel reply_to. Messages without receipt_id keep normal optional reply_to behavior.'
+export function deliveryReplyToolDescription(): string {
+  return STOCK_REPLY_TOOL_DESCRIPTION
 }
 
-export function receiptReplyToolDescription(mode: RecorderMode): string {
-  if (mode.kind !== 'enabled') return STOCK_REPLY_TOOL_DESCRIPTION
-  return 'Reply on Discord. Pass chat_id from the inbound message. For a message whose meta has receipt_id, explicitly pass reply_to=<message_id>; if roundtable routing strips that cross-channel reference, use handle-receipt ack instead. A message already inside a topic thread can use a normal same-channel reply_to. Files accepts absolute paths for attachments.'
-}
-
-export function receiptReplyToDescription(mode: RecorderMode): string {
-  if (mode.kind !== 'enabled') return STOCK_REPLY_TO_DESCRIPTION
-  return 'Message ID to thread under. Explicit reply_to is required when the inbound meta has receipt_id so a successful referenced payload can settle it. If roundtable routing strips a cross-channel reference, use handle-receipt ack instead; messages already inside a topic thread can use their same-channel message_id.'
+export function deliveryReplyToDescription(): string {
+  return STOCK_REPLY_TO_DESCRIPTION
 }
 
 function normalizeSpoolIntent(value: unknown): SpoolIntentV1 {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('chat receipt spool intent must be an object')
+    throw new Error('Discord ingest spool intent must be an object')
   }
   const candidate = value as Record<string, unknown>
-  if (candidate.v !== 1) throw new Error('chat receipt spool intent v1 is required')
+  if (candidate.v !== 1) throw new Error('Discord ingest spool intent v1 is required')
   if (!Number.isSafeInteger(candidate.attempts) || (candidate.attempts as number) < 0) {
-    throw new Error('chat receipt spool attempts must be a non-negative integer')
+    throw new Error('Discord ingest spool attempts must be a non-negative integer')
   }
   if (candidate.advisedAt !== null && candidate.advisedAt !== undefined) {
     utcTimestamp(candidate.advisedAt, 'advisedAt')
@@ -272,16 +448,16 @@ function normalizeSpoolIntent(value: unknown): SpoolIntentV1 {
 
 function normalizeBeginArgs(value: unknown): BeginArgs {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('chat receipt spool begin must be an object')
+    throw new Error('Discord ingest spool begin must be an object')
   }
   const begin = value as Record<string, unknown>
   const priority = begin.priority
   if (priority !== 0 && priority !== 1) {
-    throw new Error('chat receipt spool priority must be 0 or 1')
+    throw new Error('Discord ingest spool priority must be 0 or 1')
   }
   const msgKind = begin.msgKind
   if (msgKind !== 'dm' && msgKind !== 'guild' && msgKind !== 'roundtable') {
-    throw new Error('chat receipt spool msgKind must be dm, guild, or roundtable')
+    throw new Error('Discord ingest spool msgKind must be dm, guild, or roundtable')
   }
   const chatId = msgField(begin.chatId, 'chatId')
   return {
@@ -325,7 +501,7 @@ function normalizeReplyRoute(value: unknown): DiscordReplyRoute {
   }
 }
 
-function normalizeAttachments(value: unknown): ReceiptAttachment[] {
+function normalizeAttachments(value: unknown): DeliveryAttachment[] {
   if (!Array.isArray(value)) throw new Error('attachments must be an array')
   return value.map((entry, index) => {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {

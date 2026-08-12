@@ -35,22 +35,20 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir } from 'os'
 import { join, sep } from 'path'
 import { parseIntInRange, type SendWithRetryOpts } from './retry'
-import {
-  sendReplyChunks,
-  type SendPayload,
-  type SentMessage,
-} from './reply-send'
+import { sendReplyChunks } from './reply-send'
 import {
   buildBeginArgs,
-  receiptInboundInstruction,
-  receiptReplyToDescription,
-  receiptReplyToolDescription,
+  canIngestDiscordChat,
+  assertDiscordBotIdentity,
+  deliveryInboundInstruction,
+  deliveryReplyToDescription,
+  deliveryReplyToolDescription,
   resolveFounderIdForMode,
+  resolveDiscordIdentity,
   resolveRecorderMode,
-  sentMessageCarriesReference,
   type BeginArgs,
 } from './chat-receipt-recorder'
-import { ChatReceiptRuntime } from './chat-receipt-runtime'
+import { ChatIngestRuntime } from './chat-receipt-runtime'
 import { resolveGroupMentionPatterns } from './mention-patterns'
 import {
   loadRoundtableConfig,
@@ -71,7 +69,12 @@ import {
 import { loadSharedRoundtableRouting } from './roundtable-shared-routing'
 import { buildRoundtableThreadCreateBody } from './roundtable-archive-policy'
 
-const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
+const INHERITED_ENV = { ...process.env }
+const DISCORD_IDENTITY = resolveDiscordIdentity(INHERITED_ENV, {
+  homeDir: homedir(),
+  readFile: path => readFileSync(path, 'utf8'),
+})
+const STATE_DIR = DISCORD_IDENTITY.stateDir
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -87,21 +90,26 @@ try {
   }
 } catch {}
 
-const TOKEN = process.env.DISCORD_BOT_TOKEN
+const TOKEN = DISCORD_IDENTITY.kind === 'registry'
+  ? DISCORD_IDENTITY.token
+  : process.env.DISCORD_BOT_TOKEN
 const STATIC = process.env.DISCORD_ACCESS_MODE === 'static'
-const RECORDER_MODE = resolveRecorderMode(process.env)
+const RECORDER_MODE = resolveRecorderMode(
+  INHERITED_ENV,
+  DISCORD_IDENTITY.kind === 'registry' ? DISCORD_IDENTITY.leadId : undefined,
+)
 const FOUNDER_ID = resolveFounderIdForMode(RECORDER_MODE, {
   env: process.env,
   readEnvFile: () => readFileSync(join(homedir(), '.flywheel', '.env'), 'utf8'),
 })
 if (RECORDER_MODE.kind === 'broken') {
   process.stderr.write(
-    `CHAT RECEIPT WIRING BROKEN: missing ${RECORDER_MODE.missing.join(', ')}; inbound delivery remains fail-open\n`,
+    `DISCORD MAILBOX WIRING BROKEN: missing ${RECORDER_MODE.missing.join(', ')}; inbound delivery remains fail-open\n`,
   )
 }
 if (RECORDER_MODE.kind === 'enabled' && !FOUNDER_ID) {
   process.stderr.write(
-    'chat receipt: DISCORD_OWNER_USER_ID unavailable; all inbound receipts use P1\n',
+    'discord mailbox: DISCORD_OWNER_USER_ID unavailable; all inbound messages use P1\n',
   )
 }
 
@@ -991,7 +999,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Discord, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      receiptInboundInstruction(RECORDER_MODE),
+      deliveryInboundInstruction(),
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -1002,23 +1010,18 @@ const mcp = new Server(
   },
 )
 
-const chatReceiptRuntime = new ChatReceiptRuntime({
+const chatIngestRuntime = new ChatIngestRuntime({
   mode: RECORDER_MODE,
   stateDir: STATE_DIR,
   founderId: FOUNDER_ID,
-  notify: notification =>
-    mcp.notification({
-      method: 'notifications/claude/channel',
-      params: notification,
-    }),
   advise: async (chatId, text) => {
-    if (!chatId) throw new Error('no Discord chat is available for the receipt advisory')
+    if (!chatId) throw new Error('no Discord chat is available for the ingest advisory')
     const channel = await fetchAllowedChannel(chatId)
     if (!('send' in channel)) throw new Error(`channel ${chatId} is not sendable`)
     await channel.send({ content: `⚠️ ${text}` })
   },
 })
-void chatReceiptRuntime.diagnoseNode()
+void chatIngestRuntime.diagnoseNode()
 
 // Stores full permission details for "See more" expansion keyed by request_id.
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
@@ -1075,7 +1078,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: 'reply',
-      description: receiptReplyToolDescription(RECORDER_MODE),
+      description: deliveryReplyToolDescription(),
       inputSchema: {
         type: 'object',
         properties: {
@@ -1087,7 +1090,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           message: { type: 'string', description: 'Alias for `text` (prefer `text`).' },
           reply_to: {
             type: 'string',
-            description: receiptReplyToDescription(RECORDER_MODE),
+            description: deliveryReplyToDescription(),
           },
           files: {
             type: 'array',
@@ -1235,26 +1238,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
         const chunks = chunk(text, limit, mode)
-        let receiptSettled = false
-        const onSent =
-          RECORDER_MODE.kind === 'enabled'
-            ? async (
-                id: string,
-                _payload: SendPayload,
-                sent: SentMessage,
-              ) => {
-                noteSent(id)
-                if (
-                  !receiptSettled &&
-                  reply_to &&
-                  sentMessageCarriesReference(sent, reply_to)
-                ) {
-                  receiptSettled = true
-                  await chatReceiptRuntime.settle(reply_to, id, chat_id)
-                }
-              }
-            : noteSent
-
         // FLY-306: send each chunk with bounded retry on transient failures.
         // The loop advances only on a successful send, so chunks already
         // delivered are never re-sent. A single chunk's retry is still
@@ -1267,7 +1250,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           chunks,
           { files, reply_to, replyMode },
           replyRetryOpts,
-          onSent,
+          noteSent,
         )
 
         // FLY-676 initiator-seed: when THIS Lead posts a top-level topic to the roundtable
@@ -1454,7 +1437,7 @@ client.on('error', err => {
 // Button-click handler for permission requests. customId is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
-client.on('interactionCreate', async (interaction: Interaction) => {
+async function handleInteractionCreate(interaction: Interaction): Promise<void> {
   if (!interaction.isButton()) return
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(interaction.customId)
   if (!m) return
@@ -1510,9 +1493,9 @@ client.on('interactionCreate', async (interaction: Interaction) => {
   await interaction
     .update({ content: `${interaction.message.content}\n\n${label}`, components: [] })
     .catch(() => {})
-})
+}
 
-client.on('messageCreate', msg => {
+function handleMessageCreate(msg: Message): void {
   // Never process our own messages — prevents typing keepalive re-trigger on reply echo.
   if (msg.author.id === client.user?.id) return
   if (msg.author.bot) {
@@ -1520,7 +1503,7 @@ client.on('messageCreate', msg => {
     if (!access.allowBots?.includes(msg.author.id)) return
   }
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
-})
+}
 
 async function handleInbound(msg: Message): Promise<void> {
   const result = await gate(msg)
@@ -1619,27 +1602,34 @@ async function handleInbound(msg: Message): Promise<void> {
   // calls download_attachment when it wants them. Keeps the notification
   // fast and avoids filling inbox/ with images nobody looked at.
   const atts: string[] = []
-  const receiptAttachments: BeginArgs['attachments'] = []
+  const deliveryAttachments: BeginArgs['attachments'] = []
   for (const att of msg.attachments.values()) {
     const kb = (att.size / 1024).toFixed(0)
     const name = safeAttName(att)
     const type = att.contentType ?? 'unknown'
     atts.push(`${name} (${type}, ${kb}KB)`)
-    receiptAttachments.push({ name, type, sizeKb: Number(kb) })
+    deliveryAttachments.push({ name, type, sizeKb: Number(kb) })
   }
 
   // Attachment listing goes in meta only — an in-content annotation is
   // forgeable by any allowlisted sender typing that string.
   const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
   if (RECORDER_MODE.kind === 'broken') {
-    await chatReceiptRuntime.adviseBroken(chat_id).catch(err => {
-      process.stderr.write(`chat receipt: broken-wiring advisory failed: ${err}\n`)
+    await chatIngestRuntime.adviseBroken(chat_id).catch(err => {
+      process.stderr.write(`discord mailbox: broken-wiring advisory failed: ${err}\n`)
     })
   }
 
-  let receiptArgs: BeginArgs | undefined
-  if (RECORDER_MODE.kind === 'enabled') {
-    receiptArgs = buildBeginArgs(
+  let ingestArgs: BeginArgs | undefined
+  if (
+    RECORDER_MODE.kind === 'enabled' &&
+    canIngestDiscordChat(DISCORD_IDENTITY, {
+      channelKind: msg.channel.type === ChannelType.DM ? 'dm' : 'guild',
+      channelId: msg.channelId,
+      parentChannelId: msg.channel.isThread() ? msg.channel.parentId : undefined,
+    })
+  ) {
+    ingestArgs = buildBeginArgs(
       {
         messageId: msg.id,
         originChannelId: msg.channelId,
@@ -1647,7 +1637,7 @@ async function handleInbound(msg: Message): Promise<void> {
         authorName: msg.author.username,
         ts: msg.createdAt.toISOString(),
         text: content,
-        attachments: receiptAttachments,
+        attachments: deliveryAttachments,
       },
       {
         leadId: RECORDER_MODE.leadId,
@@ -1667,57 +1657,52 @@ async function handleInbound(msg: Message): Promise<void> {
       },
       FOUNDER_ID,
     )
-    chatReceiptRuntime.markAccepting(msg.id)
   }
 
-  try {
-    const delivery = receiptArgs
-      ? await chatReceiptRuntime.acceptInbound(receiptArgs)
-      : 'legacy'
+  const delivery = ingestArgs
+    ? await chatIngestRuntime.acceptInbound(ingestArgs)
+    : 'legacy'
 
-    // Typing keepalive — refreshes every 8s so "Bot is typing..." persists
-    // until the reply tool is called (or the 10-minute safety cap expires).
-    if ('sendTyping' in msg.channel) {
-      startTypingKeepalive(msg.channel as { sendTyping(): Promise<void> }, chat_id)
-    }
+  // Typing keepalive — refreshes every 8s so "Bot is typing..." persists
+  // until the reply tool is called (or the 10-minute safety cap expires).
+  if ('sendTyping' in msg.channel) {
+    startTypingKeepalive(msg.channel as { sendTyping(): Promise<void> }, chat_id)
+  }
 
-    // Ack reaction — lets the user know we're processing. Fire-and-forget.
-    const access = result.access
-    if (access.ackReaction) {
-      void msg.react(access.ackReaction).catch(() => {})
-    }
+  // Ack reaction — lets the user know we're processing. Fire-and-forget.
+  const access = result.access
+  if (access.ackReaction) {
+    void msg.react(access.ackReaction).catch(() => {})
+  }
 
-    if (receiptArgs && delivery === 'legacy') {
-      await chatReceiptRuntime.deliver(receiptArgs)
-    } else if (!receiptArgs) {
-      mcp.notification({
-        method: 'notifications/claude/channel',
-        params: {
-          content,
-          meta: {
-            chat_id,
-            message_id: msg.id,
-            user: msg.author.username,
-            user_id: msg.author.id,
-            ts: msg.createdAt.toISOString(),
-            ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
-          },
+  if (delivery === 'legacy') {
+    mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content,
+        meta: {
+          chat_id,
+          message_id: msg.id,
+          user: msg.author.username,
+          user_id: msg.author.id,
+          ts: msg.createdAt.toISOString(),
+          ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
         },
-      }).catch(err => {
-        process.stderr.write(`discord channel: failed to deliver inbound to Claude: ${err}\n`)
-      })
-    }
-  } finally {
-    if (receiptArgs) {
-      chatReceiptRuntime.finishAccepting(msg.id)
-      chatReceiptRuntime.kickWorker()
-    }
+      },
+    }).catch(err => {
+      process.stderr.write(`discord channel: failed to deliver inbound to Claude: ${err}\n`)
+    })
   }
 }
 
 client.once('ready', c => {
+  if (DISCORD_IDENTITY.kind === 'registry') {
+    assertDiscordBotIdentity(DISCORD_IDENTITY.expectedBotUserId, c.user.id)
+  }
+  client.on('interactionCreate', handleInteractionCreate)
+  client.on('messageCreate', handleMessageCreate)
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
-  chatReceiptRuntime.kickWorker()
+  chatIngestRuntime.kickWorker()
 })
 
 client.login(TOKEN).catch(err => {
