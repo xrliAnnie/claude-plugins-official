@@ -69,9 +69,11 @@ import {
   type RoundtableConfig,
 } from './roundtable-thread-policy'
 import { loadSharedRoundtableRouting } from './roundtable-shared-routing'
+import { authenticateDiscordIdentity, DiscordIdentityAssertionError } from './identity-assertion'
 import { buildRoundtableThreadCreateBody } from './roundtable-archive-policy'
 
-const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
+const configuredStateDir = process.env.DISCORD_STATE_DIR?.trim()
+const STATE_DIR = configuredStateDir || join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -89,6 +91,14 @@ try {
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN
 const STATIC = process.env.DISCORD_ACCESS_MODE === 'static'
+const IDENTITY_MODE = process.env.DISCORD_IDENTITY_MODE?.trim()
+if (IDENTITY_MODE && IDENTITY_MODE !== 'managed') {
+  process.stderr.write(
+    `discord channel: unsupported DISCORD_IDENTITY_MODE=${JSON.stringify(IDENTITY_MODE)}\n`,
+  )
+  process.exit(1)
+}
+const MANAGED_IDENTITY = IDENTITY_MODE === 'managed'
 const RECORDER_MODE = resolveRecorderMode(process.env)
 const FOUNDER_ID = resolveFounderIdForMode(RECORDER_MODE, {
   env: process.env,
@@ -900,8 +910,6 @@ function checkApprovals(): void {
   }
 }
 
-if (!STATIC) setInterval(checkApprovals, 5000).unref()
-
 // Discord caps messages at 2000 chars (hard limit — larger sends reject).
 // Split long replies, preferring paragraph boundaries when chunkMode is
 // 'newline'.
@@ -1038,6 +1046,12 @@ mcp.setNotificationHandler(
     }),
   }),
   async ({ params }) => {
+    if (!identityReady) {
+      process.stderr.write(
+        `discord channel: dropped permission_request ${params.request_id} before identity authentication\n`,
+      )
+      return
+    }
     const { request_id, tool_name, description, input_preview } = params
     pendingPermissions.set(request_id, { tool_name, description, input_preview })
     const access = loadAccess()
@@ -1180,7 +1194,14 @@ function resolveOutboundText(
   return { text: raw }
 }
 
+let identityReady = false
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
+  if (!identityReady) {
+    return {
+      content: [{ type: 'text', text: 'Discord identity authentication is not ready' }],
+      isError: true,
+    }
+  }
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   // FLY-29: Any tool call with chat_id resets the idle timer, keeping typing
   // alive while the Lead is actively using Discord tools.
@@ -1364,8 +1385,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   }
 })
 
-await mcp.connect(new StdioServerTransport())
-
 // When Claude Code closes the MCP connection, stdin gets EOF. Without this
 // the gateway stays connected as a zombie holding resources.
 let shuttingDown = false
@@ -1454,73 +1473,76 @@ client.on('error', err => {
 // Button-click handler for permission requests. customId is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
-client.on('interactionCreate', async (interaction: Interaction) => {
-  if (!interaction.isButton()) return
-  const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(interaction.customId)
-  if (!m) return
-  const access = loadAccess()
-  if (!access.allowFrom.includes(interaction.user.id)) {
-    await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
-    return
-  }
-  const [, behavior, request_id] = m
+function registerAuthenticatedInboundHandlers(): void {
+	if (!STATIC) setInterval(checkApprovals, 5000).unref()
+	client.on('interactionCreate', async (interaction: Interaction) => {
+		if (!interaction.isButton()) return
+		const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(interaction.customId)
+		if (!m) return
+		const access = loadAccess()
+		if (!access.allowFrom.includes(interaction.user.id)) {
+			await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
+			return
+		}
+		const [, behavior, request_id] = m
 
-  if (behavior === 'more') {
-    const details = pendingPermissions.get(request_id)
-    if (!details) {
-      await interaction.reply({ content: 'Details no longer available.', ephemeral: true }).catch(() => {})
-      return
-    }
-    const { tool_name, description, input_preview } = details
-    let prettyInput: string
-    try {
-      prettyInput = JSON.stringify(JSON.parse(input_preview), null, 2)
-    } catch {
-      prettyInput = input_preview
-    }
-    const expanded =
-      `🔐 Permission: ${tool_name}\n\n` +
-      `tool_name: ${tool_name}\n` +
-      `description: ${description}\n` +
-      `input_preview:\n${prettyInput}`
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`perm:allow:${request_id}`)
-        .setLabel('Allow')
-        .setEmoji('✅')
-        .setStyle(ButtonStyle.Success),
-      new ButtonBuilder()
-        .setCustomId(`perm:deny:${request_id}`)
-        .setLabel('Deny')
-        .setEmoji('❌')
-        .setStyle(ButtonStyle.Danger),
-    )
-    await interaction.update({ content: expanded, components: [row] }).catch(() => {})
-    return
-  }
+		if (behavior === 'more') {
+			const details = pendingPermissions.get(request_id)
+			if (!details) {
+				await interaction.reply({ content: 'Details no longer available.', ephemeral: true }).catch(() => {})
+				return
+			}
+			const { tool_name, description, input_preview } = details
+			let prettyInput: string
+			try {
+				prettyInput = JSON.stringify(JSON.parse(input_preview), null, 2)
+			} catch {
+				prettyInput = input_preview
+			}
+			const expanded =
+				`🔐 Permission: ${tool_name}\n\n` +
+				`tool_name: ${tool_name}\n` +
+				`description: ${description}\n` +
+				`input_preview:\n${prettyInput}`
+			const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+				new ButtonBuilder()
+					.setCustomId(`perm:allow:${request_id}`)
+					.setLabel('Allow')
+					.setEmoji('✅')
+					.setStyle(ButtonStyle.Success),
+				new ButtonBuilder()
+					.setCustomId(`perm:deny:${request_id}`)
+					.setLabel('Deny')
+					.setEmoji('❌')
+					.setStyle(ButtonStyle.Danger),
+			)
+			await interaction.update({ content: expanded, components: [row] }).catch(() => {})
+			return
+		}
 
-  void mcp.notification({
-    method: 'notifications/claude/channel/permission',
-    params: { request_id, behavior },
-  })
-  pendingPermissions.delete(request_id)
-  const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
-  // Replace buttons with the outcome so the same request can't be answered
-  // twice and the chat history shows what was chosen.
-  await interaction
-    .update({ content: `${interaction.message.content}\n\n${label}`, components: [] })
-    .catch(() => {})
-})
+		void mcp.notification({
+			method: 'notifications/claude/channel/permission',
+			params: { request_id, behavior },
+		})
+		pendingPermissions.delete(request_id)
+		const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
+		// Replace buttons with the outcome so the same request can't be answered
+		// twice and the chat history shows what was chosen.
+		await interaction
+			.update({ content: `${interaction.message.content}\n\n${label}`, components: [] })
+			.catch(() => {})
+	})
 
-client.on('messageCreate', msg => {
-  // Never process our own messages — prevents typing keepalive re-trigger on reply echo.
-  if (msg.author.id === client.user?.id) return
-  if (msg.author.bot) {
-    const access = loadAccess()
-    if (!access.allowBots?.includes(msg.author.id)) return
-  }
-  handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
-})
+	client.on('messageCreate', msg => {
+		// Never process our own messages — prevents typing keepalive re-trigger on reply echo.
+		if (msg.author.id === client.user?.id) return
+		if (msg.author.bot) {
+			const access = loadAccess()
+			if (!access.allowBots?.includes(msg.author.id)) return
+		}
+		handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
+	})
+}
 
 async function handleInbound(msg: Message): Promise<void> {
   const result = await gate(msg)
@@ -1715,12 +1737,59 @@ async function handleInbound(msg: Message): Promise<void> {
   }
 }
 
-client.once('ready', c => {
-  process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
-  chatReceiptRuntime.kickWorker()
-})
+function recordIdentityFailure(code: string, message: string): void {
+  const cli = process.env.FLYWHEEL_COMM_CLI
+  const projectsFile = process.env.FLYWHEEL_PROJECTS_FILE
+  const project = process.env.FLYWHEEL_PROJECT_NAME
+  const lead = process.env.FLYWHEEL_LEAD_ID
+  if (!cli || !projectsFile || !project || !lead) return
+  const nodeBin =
+    process.env.FLYWHEEL_NODE_BIN ??
+    ['/opt/homebrew/bin/node', '/usr/local/bin/node', '/usr/bin/node'].find(path => existsSync(path)) ??
+    'node'
+  try {
+    execFileSync(nodeBin, [
+      cli,
+      'lead-identity',
+      'record-failure',
+      '--projects-file', projectsFile,
+      '--project', project,
+      '--lead', lead,
+      '--code', code,
+      '--message', message,
+    ], { stdio: 'ignore', timeout: 5000 })
+  } catch {
+    // The identity failure remains fatal even when local diagnostics cannot persist.
+  }
+}
 
-client.login(TOKEN).catch(err => {
-  process.stderr.write(`discord channel: login failed: ${err}\n`)
+// Complete the MCP handshake promptly, but keep every Discord-touching tool and
+// notification/inbound/poller handler behind the authenticated identity boundary.
+try {
+  await mcp.connect(new StdioServerTransport())
+} catch (err) {
+  const message = err instanceof Error ? err.message : String(err)
+  process.stderr.write(`discord channel: MCP transport startup failed: ${message}\n`)
   process.exit(1)
-})
+}
+try {
+  await authenticateDiscordIdentity({
+    managed: MANAGED_IDENTITY,
+    expectedUserId: process.env.DISCORD_EXPECTED_BOT_USER_ID,
+    login: () => client.login(TOKEN),
+    actualUserId: () => client.user?.id,
+    registerInboundHandlers: () => {
+      identityReady = true
+      registerAuthenticatedInboundHandlers()
+    },
+  })
+  process.stderr.write(`discord channel: gateway connected as ${client.user?.tag ?? client.user?.id}\n`)
+  chatReceiptRuntime.kickWorker()
+} catch (err) {
+  const code = err instanceof DiscordIdentityAssertionError ? err.code : 'identity_discord_login_failed'
+  const message = err instanceof Error ? err.message : String(err)
+  recordIdentityFailure(code, message)
+  process.stderr.write(`discord channel: login identity assertion failed: ${message}\n`)
+  setTimeout(() => process.exit(1), 2000)
+  void Promise.resolve(client.destroy()).finally(() => process.exit(1))
+}
