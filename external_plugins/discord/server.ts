@@ -42,6 +42,7 @@ import {
 } from './reply-send'
 import {
   buildBeginArgs,
+  canMintChatReceipt,
   assertDiscordBotIdentity,
   receiptInboundInstruction,
   receiptReplyToDescription,
@@ -1650,7 +1651,14 @@ async function handleInbound(msg: Message): Promise<void> {
   }
 
   let receiptArgs: BeginArgs | undefined
-  if (RECORDER_MODE.kind === 'enabled') {
+  if (
+    RECORDER_MODE.kind === 'enabled' &&
+    canMintChatReceipt(DISCORD_IDENTITY, {
+      channelKind: msg.channel.type === ChannelType.DM ? 'dm' : 'guild',
+      channelId: msg.channelId,
+      parentChannelId: msg.channel.isThread() ? msg.channel.parentId : undefined,
+    })
+  ) {
     receiptArgs = buildBeginArgs(
       {
         messageId: msg.id,

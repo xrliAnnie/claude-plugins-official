@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import flagCases from './mailbox-discord-flag.fixture.json'
 import {
   buildBeginArgs,
+  canMintChatReceipt,
   encodeSpoolIntent,
   isIntentFilename,
   parseSpoolIntent,
@@ -27,9 +28,12 @@ const enabledEnv = {
 
 const projects = JSON.stringify([{
   projectName: 'flywheel',
+  generalChannel: '100000000000000011',
   leads: [{
     agentId: 'flywheel-eng-lead',
+    chatChannel: '100000000000000012',
     botTokenEnv: 'ENG_TOKEN',
+    crossDeptChannels: ['100000000000000013'],
   }],
 }])
 
@@ -341,24 +345,51 @@ describe('resolveFounderId', () => {
 })
 
 describe('buildBeginArgs', () => {
-  it('keeps one roundtable topic eligible for every true cross-project member', () => {
+  it('mints roundtable receipts only for members declared by registry ground truth', () => {
+    const parentId = '1512578695468941333'
     const threadId = '1536604232398938224'
     const members = [
       'tidal-echo-cos-lead',
       'sub-lead',
       'flywheel-cos-lead',
     ]
-    const receipts = members.map(leadId => buildBeginArgs(
+    const allLeads = [...members, 'claude-infra-bot-lead']
+    const registry = JSON.stringify(allLeads.map((agentId, index) => ({
+      projectName: `project-${index}`,
+      leads: [{
+        agentId,
+        chatChannel: `10000000000000002${index}`,
+        botTokenEnv: `TOKEN_${index}`,
+        ...(members.includes(agentId) ? { crossDeptChannels: [parentId] } : {}),
+      }],
+    })))
+    const identities = allLeads.map((leadId, index) => resolveDiscordIdentity({
+      FLYWHEEL_LEAD_ID: leadId,
+      FLYWHEEL_DISCORD_IDENTITY_MODE: 'registry',
+      FLYWHEEL_EXPECTED_DISCORD_BOT_USER_ID: `10000000000000003${index}`,
+      FLYWHEEL_PROJECTS: registry,
+      [`TOKEN_${index}`]: `token-${index}`,
+    }, { homeDir: '/Users/test', readFile: () => '' }))
+    expect(identities.map(identity => canMintChatReceipt(identity, {
+      channelKind: 'guild',
+      channelId: threadId,
+      parentChannelId: parentId,
+    }))).toEqual([true, true, true, false])
+
+    const receipts = identities.flatMap((identity, index) =>
+      canMintChatReceipt(identity, {
+        channelKind: 'guild', channelId: threadId, parentChannelId: parentId,
+      }) ? [buildBeginArgs(
       baseMessage,
       {
-        leadId,
+        leadId: allLeads[index]!,
         chatId: threadId,
         channelKind: 'guild',
         routedToRoundtable: false,
         inRoundtableThread: true,
       },
       baseMessage.authorId,
-    ))
+      )] : [])
     expect(receipts.map(receipt => receipt.leadId)).toEqual(members)
     expect(receipts.every(receipt =>
       receipt.chatId === threadId && receipt.msgKind === 'roundtable')).toBe(true)

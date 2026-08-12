@@ -27,6 +27,7 @@ export type DiscordIdentity = {
   stateDir: string
   token: string
   expectedBotUserId: string
+  channelIds: string[]
 }
 
 export interface DiscordIdentityDeps {
@@ -36,8 +37,15 @@ export interface DiscordIdentityDeps {
 
 interface RegistryLead {
   agentId: string
+  chatChannel?: string
   botTokenEnv?: string
   discordStateDir?: string
+  crossDeptChannels?: string[]
+}
+
+interface RegistryProject {
+  generalChannel?: string
+  leads: unknown[]
 }
 
 export interface ReceiptAttachment {
@@ -182,7 +190,7 @@ export function resolveDiscordIdentity(
   if (!Array.isArray(raw)) {
     throw new Error(`Discord identity registry ${registrySource} must be an array`)
   }
-  const matches: RegistryLead[] = []
+  const matches: { lead: RegistryLead; project: RegistryProject }[] = []
   for (const [projectIndex, project] of raw.entries()) {
     if (!project || typeof project !== 'object' ||
         !Array.isArray((project as { leads?: unknown }).leads)) {
@@ -199,7 +207,10 @@ export function resolveDiscordIdentity(
         )
       }
       if (agentId === leadId) {
-        matches.push(candidate as RegistryLead)
+        matches.push({
+          lead: candidate as RegistryLead,
+          project: project as RegistryProject,
+        })
       }
     }
   }
@@ -208,7 +219,7 @@ export function resolveDiscordIdentity(
       `Discord identity registry must contain exactly one lead with agentId ${JSON.stringify(leadId)}; found ${matches.length}`,
     )
   }
-  const lead = matches[0]!
+  const { lead, project } = matches[0]!
   if (lead.botTokenEnv !== undefined &&
       (typeof lead.botTokenEnv !== 'string' || !present(lead.botTokenEnv))) {
     throw new Error('Discord identity botTokenEnv is invalid')
@@ -244,6 +255,19 @@ export function resolveDiscordIdentity(
   if (!expectedBotUserId || !DISCORD_SNOWFLAKE.test(expectedBotUserId)) {
     throw new Error(`Discord identity expected bot user id in ${EXPECTED_BOT_USER_ID_ENV} is invalid`)
   }
+  const chatChannel = present(lead.chatChannel)
+  if (!chatChannel) throw new Error('Discord identity chatChannel is invalid')
+  const generalChannel = present(project.generalChannel)
+  if (lead.crossDeptChannels !== undefined &&
+      (!Array.isArray(lead.crossDeptChannels) ||
+       lead.crossDeptChannels.some(channel => !present(channel)))) {
+    throw new Error('Discord identity crossDeptChannels is invalid')
+  }
+  const channelIds = [...new Set([
+    chatChannel,
+    ...(generalChannel ? [generalChannel] : []),
+    ...(lead.crossDeptChannels ?? []),
+  ])]
 
   return {
     kind: 'registry',
@@ -252,7 +276,20 @@ export function resolveDiscordIdentity(
     stateDir,
     token,
     expectedBotUserId,
+    channelIds,
   }
+}
+
+export function canMintChatReceipt(
+  identity: DiscordIdentity,
+  input: {
+    channelKind: 'dm' | 'guild'
+    channelId: string
+    parentChannelId?: string | null
+  },
+): boolean {
+  if (identity.kind === 'legacy' || input.channelKind === 'dm') return true
+  return identity.channelIds.includes(input.parentChannelId ?? input.channelId)
 }
 
 export function assertDiscordBotIdentity(expected: string, actual: string): void {
