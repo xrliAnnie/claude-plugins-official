@@ -38,10 +38,13 @@ import { parseIntInRange, type SendWithRetryOpts } from './retry'
 import { sendReplyChunks } from './reply-send'
 import {
   buildBeginArgs,
+  canIngestDiscordChat,
+  assertDiscordBotIdentity,
   deliveryInboundInstruction,
   deliveryReplyToDescription,
   deliveryReplyToolDescription,
   resolveFounderIdForMode,
+  resolveDiscordIdentity,
   resolveRecorderMode,
   type BeginArgs,
 } from './chat-receipt-recorder'
@@ -66,7 +69,12 @@ import {
 import { loadSharedRoundtableRouting } from './roundtable-shared-routing'
 import { buildRoundtableThreadCreateBody } from './roundtable-archive-policy'
 
-const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
+const INHERITED_ENV = { ...process.env }
+const DISCORD_IDENTITY = resolveDiscordIdentity(INHERITED_ENV, {
+  homeDir: homedir(),
+  readFile: path => readFileSync(path, 'utf8'),
+})
+const STATE_DIR = DISCORD_IDENTITY.stateDir
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -82,9 +90,14 @@ try {
   }
 } catch {}
 
-const TOKEN = process.env.DISCORD_BOT_TOKEN
+const TOKEN = DISCORD_IDENTITY.kind === 'registry'
+  ? DISCORD_IDENTITY.token
+  : process.env.DISCORD_BOT_TOKEN
 const STATIC = process.env.DISCORD_ACCESS_MODE === 'static'
-const RECORDER_MODE = resolveRecorderMode(process.env)
+const RECORDER_MODE = resolveRecorderMode(
+  INHERITED_ENV,
+  DISCORD_IDENTITY.kind === 'registry' ? DISCORD_IDENTITY.leadId : undefined,
+)
 const FOUNDER_ID = resolveFounderIdForMode(RECORDER_MODE, {
   env: process.env,
   readEnvFile: () => readFileSync(join(homedir(), '.flywheel', '.env'), 'utf8'),
@@ -1418,7 +1431,7 @@ client.on('error', err => {
 // Button-click handler for permission requests. customId is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
-client.on('interactionCreate', async (interaction: Interaction) => {
+async function handleInteractionCreate(interaction: Interaction): Promise<void> {
   if (!interaction.isButton()) return
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(interaction.customId)
   if (!m) return
@@ -1474,9 +1487,9 @@ client.on('interactionCreate', async (interaction: Interaction) => {
   await interaction
     .update({ content: `${interaction.message.content}\n\n${label}`, components: [] })
     .catch(() => {})
-})
+}
 
-client.on('messageCreate', msg => {
+function handleMessageCreate(msg: Message): void {
   // Never process our own messages — prevents typing keepalive re-trigger on reply echo.
   if (msg.author.id === client.user?.id) return
   if (msg.author.bot) {
@@ -1484,7 +1497,7 @@ client.on('messageCreate', msg => {
     if (!access.allowBots?.includes(msg.author.id)) return
   }
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
-})
+}
 
 async function handleInbound(msg: Message): Promise<void> {
   const result = await gate(msg)
@@ -1596,7 +1609,14 @@ async function handleInbound(msg: Message): Promise<void> {
   // forgeable by any allowlisted sender typing that string.
   const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
   let ingestArgs: BeginArgs | undefined
-  if (RECORDER_MODE.kind === 'enabled') {
+  if (
+    RECORDER_MODE.kind === 'enabled' &&
+    canIngestDiscordChat(DISCORD_IDENTITY, {
+      channelKind: msg.channel.type === ChannelType.DM ? 'dm' : 'guild',
+      channelId: msg.channelId,
+      parentChannelId: msg.channel.isThread() ? msg.channel.parentId : undefined,
+    })
+  ) {
     ingestArgs = buildBeginArgs(
       {
         messageId: msg.id,
@@ -1665,6 +1685,11 @@ async function handleInbound(msg: Message): Promise<void> {
 }
 
 client.once('ready', c => {
+  if (DISCORD_IDENTITY.kind === 'registry') {
+    assertDiscordBotIdentity(DISCORD_IDENTITY.expectedBotUserId, c.user.id)
+  }
+  client.on('interactionCreate', handleInteractionCreate)
+  client.on('messageCreate', handleMessageCreate)
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
   chatIngestRuntime.kickWorker()
 })
