@@ -1,8 +1,6 @@
 const PINNED_DISCORD_JS_VERSION = '14.25.1'
-
-// @discordjs/ws@1.2.3 WebSocketShardDestroyRecovery.Reconnect. Keep local so
-// discord.js remains the only dependency that owns the transitive ws version.
-const WS_SHARD_RECOVER_RECONNECT = 0
+const PINNED_DISCORD_WS_VERSION = '1.2.3'
+const PINNED_RECONNECT_RECOVERY = 0
 
 interface RawShard {
   destroy(options: { reason: string; recover: number }): Promise<unknown> | unknown
@@ -26,6 +24,8 @@ export type RawShardReconnectInspection =
 export function inspectRawShardReconnect(
   clientWs: unknown,
   discordVersion: string,
+  discordWsVersion: string,
+  reconnectRecovery: number,
 ): RawShardReconnectInspection {
   if (discordVersion !== PINNED_DISCORD_JS_VERSION) {
     return {
@@ -33,6 +33,24 @@ export function inspectRawShardReconnect(
       reason:
         `unsupported discord.js version ${discordVersion}; ` +
         `expected ${PINNED_DISCORD_JS_VERSION}`,
+    }
+  }
+
+  if (discordWsVersion !== PINNED_DISCORD_WS_VERSION) {
+    return {
+      ok: false,
+      reason:
+        `unsupported @discordjs/ws version ${discordWsVersion}; ` +
+        `expected ${PINNED_DISCORD_WS_VERSION}`,
+    }
+  }
+
+  if (reconnectRecovery !== PINNED_RECONNECT_RECOVERY) {
+    return {
+      ok: false,
+      reason:
+        `unsupported @discordjs/ws reconnect recovery value ${reconnectRecovery}; ` +
+        `expected ${PINNED_RECONNECT_RECOVERY}`,
     }
   }
 
@@ -59,7 +77,7 @@ export function inspectRawShardReconnect(
           Promise.resolve().then(() =>
             shard.destroy({
               reason,
-              recover: WS_SHARD_RECOVER_RECONNECT,
+              recover: reconnectRecovery,
             }),
           ),
         ),

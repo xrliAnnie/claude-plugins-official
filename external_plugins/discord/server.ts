@@ -32,6 +32,10 @@ import {
   type Attachment,
   type Interaction,
 } from 'discord.js'
+import {
+  version as discordWsVersion,
+  WebSocketShardDestroyRecovery,
+} from '@discordjs/ws'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, existsSync } from 'fs'
 import { homedir } from 'os'
@@ -71,7 +75,10 @@ import {
   GatewayHealthMonitor,
   type GatewayHealthScheduler,
 } from './gateway-health'
-import { GatewayFailureAlerter } from './gateway-alert'
+import {
+  GatewayFailureAlerter,
+  gatewayAlertConfigurationError,
+} from './gateway-alert'
 import { GatewayHealthFiles } from './gateway-health-files'
 import { inspectRawShardReconnect } from './gateway-reconnect'
 import { attachGatewayLifecycleEvents } from './gateway-wiring'
@@ -509,6 +516,14 @@ const gatewayFailureAlerter = new GatewayFailureAlerter({
   appendDeadLetter: entry => { gatewayHealthFiles.appendDeadLetter(entry) },
   log: message => { gatewayHealthFiles.log(message) },
 })
+const gatewayAlertConfigurationWarning = gatewayAlertConfigurationError(
+  process.env.DISCORD_ALERT_CHANNEL,
+)
+if (gatewayAlertConfigurationWarning) {
+  gatewayHealthFiles.log(
+    `${gatewayAlertConfigurationWarning}; gateway failures will be dead-lettered locally`,
+  )
+}
 const gatewayHealthScheduler: GatewayHealthScheduler = {
   setTimeout(run, delayMs) {
     const timer = setTimeout(run, delayMs)
@@ -549,7 +564,12 @@ const gatewayHealth = new GatewayHealthMonitor({
 function initializeRawShardReconnect(): void {
   if (rawShardGuardChecked) return
   rawShardGuardChecked = true
-  const inspected = inspectRawShardReconnect(client.ws, discordJsVersion)
+  const inspected = inspectRawShardReconnect(
+    client.ws,
+    discordJsVersion,
+    discordWsVersion,
+    WebSocketShardDestroyRecovery.Reconnect,
+  )
   if (inspected.ok === false) {
     rawShardReconnectUnavailable = inspected.reason
     gatewayHealthFiles.log(
@@ -564,7 +584,8 @@ function initializeRawShardReconnect(): void {
   rawShardReconnect = inspected.forceReconnect
   rawShardReconnectUnavailable = ''
   gatewayHealthFiles.log(
-    `raw-shard reconnect startup guard passed for discord.js ${discordJsVersion}`,
+    `raw-shard reconnect startup guard passed for discord.js ${discordJsVersion} ` +
+    `and @discordjs/ws ${discordWsVersion}`,
   )
 }
 

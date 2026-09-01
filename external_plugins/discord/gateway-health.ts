@@ -55,6 +55,7 @@ export class GatewayHealthMonitor {
         forced: boolean
         alerted: boolean
         budgetLatched?: boolean
+        terminalDisconnect?: boolean
       }
     | undefined
   private episodeSequence = 0
@@ -95,12 +96,15 @@ export class GatewayHealthMonitor {
       `gateway shard ${shardId} disconnected permanently; ` +
       `code=${event.code} reason=${event.reason} wasClean=${event.wasClean}`,
     )
-    if (!this.episode) {
+    if (!this.episode || (this.episode.alerted && !this.episode.terminalDisconnect)) {
       this.episode = {
         key: `gateway-recovery-${++this.episodeSequence}`,
         forced: false,
         alerted: false,
+        terminalDisconnect: true,
       }
+    } else {
+      this.episode.terminalDisconnect = true
     }
     this.clearReconnectDeadline()
     this.clearPendingEchoes()

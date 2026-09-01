@@ -1,6 +1,15 @@
 import type { GatewayHealthFailure } from './gateway-health'
 
 const SNOWFLAKE_RE = /^\d{15,21}$/
+const INVALID_ALERT_CHANNEL = 'DISCORD_ALERT_CHANNEL is missing or invalid'
+
+export function gatewayAlertConfigurationError(
+  alertChannelId: string | undefined,
+): string | undefined {
+  return isGatewayAlertChannelId(alertChannelId)
+    ? undefined
+    : INVALID_ALERT_CHANNEL
+}
 
 export interface GatewayFailureAlerterOptions {
   alertChannelId: string | undefined
@@ -35,8 +44,9 @@ export class GatewayFailureAlerter {
 
   private async deliver(failure: GatewayHealthFailure): Promise<void> {
     const channelId = this.options.alertChannelId
-    if (!channelId || !SNOWFLAKE_RE.test(channelId)) {
-      this.deadLetter(failure, 'DISCORD_ALERT_CHANNEL is missing or invalid')
+    const configurationError = gatewayAlertConfigurationError(channelId)
+    if (configurationError || !isGatewayAlertChannelId(channelId)) {
+      this.deadLetter(failure, configurationError ?? INVALID_ALERT_CHANNEL)
       return
     }
     const content =
@@ -65,6 +75,12 @@ export class GatewayFailureAlerter {
       )
     }
   }
+}
+
+function isGatewayAlertChannelId(
+  alertChannelId: string | undefined,
+): alertChannelId is string {
+  return !!alertChannelId && SNOWFLAKE_RE.test(alertChannelId)
 }
 
 function formatError(error: unknown): string {

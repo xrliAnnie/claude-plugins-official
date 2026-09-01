@@ -1,9 +1,41 @@
 import { describe, expect, it } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import {
+  version as runtimeDiscordWsVersion,
+  WebSocketShardDestroyRecovery,
+} from '@discordjs/ws'
 import { inspectRawShardReconnect } from './gateway-reconnect'
 
 describe('discord.js 14.25.1 raw-shard reconnect adapter', () => {
+  it('rejects drift in the runtime @discordjs/ws package that owns recovery semantics', () => {
+    const inspected = inspectRawShardReconnect(
+      { _ws: { strategy: { shards: new Map([[0, { destroy: async () => {} }]]) } } },
+      '14.25.1',
+      '1.3.0',
+      0,
+    )
+
+    expect(inspected).toEqual({
+      ok: false,
+      reason: 'unsupported @discordjs/ws version 1.3.0; expected 1.2.3',
+    })
+  })
+
+  it('rejects drift in the runtime reconnect recovery enum', () => {
+    const inspected = inspectRawShardReconnect(
+      { _ws: { strategy: { shards: new Map([[0, { destroy: async () => {} }]]) } } },
+      '14.25.1',
+      '1.2.3',
+      1,
+    )
+
+    expect(inspected).toEqual({
+      ok: false,
+      reason: 'unsupported @discordjs/ws reconnect recovery value 1; expected 0',
+    })
+  })
+
   it('reconnects the same live strategy map twice without clearing it', async () => {
     const calls: Array<{ shardId: number; reason: string; recover: number }> = []
     const shards = new Map([
@@ -21,6 +53,8 @@ describe('discord.js 14.25.1 raw-shard reconnect adapter', () => {
     const inspected = inspectRawShardReconnect(
       { _ws: { strategy: { shards } } },
       '14.25.1',
+      '1.2.3',
+      0,
     )
 
     expect(inspected.ok).toBe(true)
@@ -46,6 +80,8 @@ describe('discord.js 14.25.1 raw-shard reconnect adapter', () => {
     const inspected = inspectRawShardReconnect(
       { _ws: { strategy: { shards } } },
       '14.25.1',
+      '1.2.3',
+      0,
     )
 
     expect(inspected.ok).toBe(true)
@@ -69,6 +105,8 @@ describe('discord.js 14.25.1 raw-shard reconnect adapter', () => {
     expect(packageJson.dependencies['discord.js']).toBe('14.25.1')
     expect(lock).toContain('discord.js@14.25.1')
     expect(lock).toContain('@discordjs/ws@1.2.3')
+    expect(runtimeDiscordWsVersion).toBe('1.2.3')
+    expect(WebSocketShardDestroyRecovery.Reconnect).toBe(0)
   })
 
   it('dispatches reconnect to every shard even when one destroy throws synchronously', async () => {
@@ -87,6 +125,8 @@ describe('discord.js 14.25.1 raw-shard reconnect adapter', () => {
     const inspected = inspectRawShardReconnect(
       { _ws: { strategy: { shards } } },
       '14.25.1',
+      '1.2.3',
+      0,
     )
 
     expect(inspected.ok).toBe(true)

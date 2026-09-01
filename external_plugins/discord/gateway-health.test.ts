@@ -486,6 +486,44 @@ describe('GatewayHealthMonitor self-echo probe', () => {
     expect(scheduler.pendingCount()).toBe(0)
   })
 
+  it('alerts a later unrecoverable disconnect after the recovery episode already alerted', async () => {
+    const scheduler = new TestScheduler()
+    const alerts: string[] = []
+    const monitor = new GatewayHealthMonitor({
+      gatewayWatchEnabled: false,
+      echoProbeEnabled: true,
+      echoTimeoutMs: 60_000,
+      recoveryDeadlineMs: 90_000,
+      pendingCap: 200,
+      earlyEchoCap: 1_000,
+      scheduler,
+      forceReconnect: async () => { throw new Error('raw shape changed') },
+      alertFailure: async failure => { alerts.push(failure.body) },
+      log: () => {},
+    })
+
+    await monitor.trackedSend('100000000000000001', async () => ({
+      id: '100000000000000002',
+    }))
+    await scheduler.advanceBy(60_000)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(alerts).toHaveLength(1)
+
+    monitor.onShardDisconnect(
+      { code: 4014, reason: 'Disallowed intents', wasClean: true },
+      0,
+    )
+    monitor.onShardDisconnect(
+      { code: 4014, reason: 'Disallowed intents', wasClean: true },
+      0,
+    )
+    await Promise.resolve()
+
+    expect(alerts).toHaveLength(2)
+    expect(alerts[1]).toContain('code=4014')
+  })
+
   it('never rejects a delivered send when early-echo probe bookkeeping logging fails', async () => {
     const scheduler = new TestScheduler()
     let resolveSend!: (message: { id: string }) => void

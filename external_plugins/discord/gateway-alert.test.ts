@@ -1,7 +1,20 @@
 import { describe, expect, it } from 'bun:test'
-import { GatewayFailureAlerter } from './gateway-alert'
+import {
+  GatewayFailureAlerter,
+  gatewayAlertConfigurationError,
+} from './gateway-alert'
 
 describe('GatewayFailureAlerter', () => {
+  it('reports invalid alert-channel configuration before the first failure', () => {
+    expect(gatewayAlertConfigurationError(undefined)).toBe(
+      'DISCORD_ALERT_CHANNEL is missing or invalid',
+    )
+    expect(gatewayAlertConfigurationError('not-a-snowflake')).toBe(
+      'DISCORD_ALERT_CHANNEL is missing or invalid',
+    )
+    expect(gatewayAlertConfigurationError('100000000000000001')).toBeUndefined()
+  })
+
   it('sends one immutable alert through the plugin REST path without dead-lettering', async () => {
     const sent: Array<{ channelId: string; content: string }> = []
     const deadLetters: unknown[] = []
