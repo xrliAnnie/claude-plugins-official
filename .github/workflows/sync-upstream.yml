@@ -4,6 +4,21 @@ on:
   schedule:
     - cron: '0 8 * * *'   # Daily at 08:00 UTC (00:00 PST)
   workflow_dispatch:
+    inputs:
+      test_alert:
+        description: Send the failure alert without rebasing, pushing, or opening an issue
+        required: false
+        type: boolean
+        default: false
+      test_discord_guard:
+        description: Inject a local Discord delta to prove the pre-push tree guard fails
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -13,75 +28,133 @@ jobs:
   rebase:
     runs-on: ubuntu-latest
     steps:
+      - name: Validate drill inputs
+        if: ${{ inputs.test_alert && inputs.test_discord_guard }}
+        run: |
+          echo "test_alert and test_discord_guard are mutually exclusive" >&2
+          exit 1
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.SYNC_PAT }}
 
       - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      - name: Record fork baseline
+        id: baseline
+        run: echo "old_fork_head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Fetch upstream
+        if: ${{ !inputs.test_alert && !inputs.test_discord_guard }}
         run: |
           git remote add upstream https://github.com/anthropics/claude-plugins-official.git
           git fetch upstream main
 
       - name: Check for new commits
+        if: ${{ !inputs.test_alert && !inputs.test_discord_guard }}
         id: check
         run: |
           BEHIND=$(git rev-list HEAD..upstream/main --count)
           echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
-          OLD_UPSTREAM=$(git merge-base HEAD upstream/main)
-          echo "old_upstream=$OLD_UPSTREAM" >> "$GITHUB_OUTPUT"
+
+      - name: Inject controlled Discord delta
+        if: ${{ inputs.test_discord_guard }}
+        run: |
+          printf '\n// FLY-1676 guard drill — never pushed\n' >> external_plugins/discord/server.ts
+          git add external_plugins/discord/server.ts
+          git commit -m "test: inject unpushable Discord guard delta"
 
       - name: Rebase
-        if: steps.check.outputs.behind != '0'
+        if: ${{ !inputs.test_alert && !inputs.test_discord_guard && steps.check.outputs.behind != '0' }}
         id: rebase
+        continue-on-error: true
         run: |
-          if git rebase upstream/main; then
-            echo "status=success" >> "$GITHUB_OUTPUT"
-          else
+          git rebase upstream/main || {
             git rebase --abort
-            echo "status=conflict" >> "$GITHUB_OUTPUT"
+            exit 1
+          }
+
+      - name: Guard Discord tree
+        if: ${{ always() && !inputs.test_alert && (inputs.test_discord_guard || steps.rebase.outcome == 'success') }}
+        id: guard
+        continue-on-error: true
+        run: |
+          .github/scripts/check-discord-sync-tree.sh \
+            "${{ steps.baseline.outputs.old_fork_head }}" HEAD
+          grep -q 'allowBots' external_plugins/discord/server.ts
+
+      - name: Open manual-review issue
+        if: ${{ always() && !inputs.test_alert && !inputs.test_discord_guard && (steps.rebase.outcome == 'failure' || steps.guard.outcome == 'failure') }}
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REBASE_OUTCOME: ${{ steps.rebase.outcome }}
+          GUARD_OUTCOME: ${{ steps.guard.outcome }}
+        run: |
+          TITLE="Manual review required — upstream sync"
+          EXISTING=$(gh issue list --state open --search "${TITLE} in:title" --json number --jq '.[0].number // empty')
+          if [[ -z "$EXISTING" ]]; then
+            gh issue create \
+              --title "$TITLE" \
+              --body "The upstream sync stopped before push. Rebase outcome: ${REBASE_OUTCOME}; Discord-tree guard outcome: ${GUARD_OUTCOME}. Run: ${RUN_URL}"
+          else
+            echo "manual-review issue already open: #${EXISTING}"
+          fi
+
+      - name: Fail on rebase conflict
+        if: ${{ always() && !inputs.test_alert && !inputs.test_discord_guard && steps.rebase.outcome == 'failure' }}
+        run: |
+          echo "upstream rebase failed; manual review is required" >&2
+          exit 1
+
+      - name: Fail on Discord tree drift
+        if: ${{ always() && steps.guard.outcome == 'failure' }}
+        run: |
+          echo "Discord tree changed during sync; refusing to push" >&2
+          exit 1
+
+      - name: Advance Discord sync version
+        if: ${{ !inputs.test_alert && !inputs.test_discord_guard && steps.check.outputs.behind != '0' && steps.rebase.outcome == 'success' && steps.guard.outcome == 'success' }}
+        run: |
+          .github/scripts/bump-discord-sync-version.sh
+          git add external_plugins/discord/.claude-plugin/plugin.json
+          if [[ "$(git log -1 --format=%s)" == "chore(discord): advance sync version"* ]]; then
+            git commit --amend --no-edit
+          else
+            git commit -m "chore(discord): advance sync version"
           fi
 
       - name: Force push
-        if: steps.rebase.outputs.status == 'success'
+        if: ${{ !inputs.test_alert && !inputs.test_discord_guard && steps.check.outputs.behind != '0' && steps.rebase.outcome == 'success' && steps.guard.outcome == 'success' }}
         run: git push origin main --force-with-lease
 
-      - name: Detect discord changes
-        if: steps.rebase.outputs.status == 'success'
-        id: changes
+      - name: Alert on any failure (or alert drill)
+        if: ${{ failure() || inputs.test_alert }}
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REBASE_OUTCOME: ${{ steps.rebase.outcome }}
+          GUARD_OUTCOME: ${{ steps.guard.outcome }}
         run: |
-          OLD_UP="${{ steps.check.outputs.old_upstream }}"
-          CHANGED=$(git diff --name-only "$OLD_UP" upstream/main -- external_plugins/discord/ || true)
-          if [ -n "$CHANGED" ]; then
-            echo "discord_changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "discord_changed=false" >> "$GITHUB_OUTPUT"
+          if [[ -z "$WEBHOOK_URL" ]]; then
+            echo "DISCORD_WEBHOOK_URL is missing; GitHub email notification is the out-of-band fallback" >&2
+            exit 1
           fi
-
-      - name: Discord webhook — plugin updated
-        if: steps.changes.outputs.discord_changed == 'true'
-        env:
-          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          curl -s -H "Content-Type: application/json" -d '{
-            "content": "[Flywheel Fork Sync] Discord Plugin Updated Upstream — fork rebase 后 external_plugins/discord/ 有变化，需要重新部署。请运行 update-discord-plugin。"
-          }' "$WEBHOOK_URL"
-
-      - name: Notify + issue on conflict
-        if: steps.rebase.outputs.status == 'conflict'
-        env:
-          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          curl -s -H "Content-Type: application/json" -d '{
-            "content": "[Flywheel Fork Sync] Upstream Rebase CONFLICT — daily rebase 失败，需要手动解决冲突。"
-          }' "$WEBHOOK_URL"
-          gh issue create \
-            --title "Upstream rebase conflict — $(date +%F)" \
-            --body "Our patch: allowBots commit on server.ts. Manual rebase needed." \
-            --label "upstream-conflict"
+          REASON="sync job failed"
+          if [[ "$REBASE_OUTCOME" == "failure" ]]; then
+            REASON="upstream rebase conflict"
+          elif [[ "$GUARD_OUTCOME" == "failure" ]]; then
+            REASON="Discord tree changed during sync; push was blocked"
+          elif [[ "${{ inputs.test_alert }}" == "true" ]]; then
+            REASON="alert delivery drill (no repository mutation)"
+          fi
+          CONTENT="[Flywheel Fork Sync] ${REASON}. Check ${RUN_URL}. Common causes: SYNC_PAT expired, Discord tree guard triggered, or push rejected. GitHub Actions email notifications and the weekly run-history check are the out-of-band fallback."
+          PAYLOAD=$(jq -n --arg content "$CONTENT" '{content: $content}')
+          curl --fail-with-body --show-error --retry 3 \
+            -H "Content-Type: application/json" \
+            --data "$PAYLOAD" \
+            "$WEBHOOK_URL"
