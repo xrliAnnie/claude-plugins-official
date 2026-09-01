@@ -485,4 +485,82 @@ describe('GatewayHealthMonitor self-echo probe', () => {
     ])
     expect(scheduler.pendingCount()).toBe(0)
   })
+
+  it('never rejects a delivered send when early-echo probe bookkeeping logging fails', async () => {
+    const scheduler = new TestScheduler()
+    let resolveSend!: (message: { id: string }) => void
+    const response = new Promise<{ id: string }>(resolve => { resolveSend = resolve })
+    const monitor = new GatewayHealthMonitor({
+      gatewayWatchEnabled: false,
+      echoProbeEnabled: true,
+      echoTimeoutMs: 60_000,
+      recoveryDeadlineMs: 90_000,
+      pendingCap: 200,
+      earlyEchoCap: 1_000,
+      scheduler,
+      forceReconnect: async () => {},
+      alertFailure: async () => {},
+      log: () => { throw new Error('stderr closed') },
+    })
+
+    const sending = monitor.trackedSend('100000000000000001', () => response)
+    monitor.onSelfEcho('100000000000000002', '100000000000000001')
+    resolveSend({ id: '100000000000000002' })
+
+    await expect(sending).resolves.toEqual({ id: '100000000000000002' })
+    expect(scheduler.pendingCount()).toBe(0)
+  })
+
+  it('alerts and latches on a fourth forced reconnect attempt inside a rolling hour', async () => {
+    const scheduler = new TestScheduler()
+    const reconnects: string[] = []
+    const alerts: string[] = []
+    const monitor = new GatewayHealthMonitor({
+      gatewayWatchEnabled: false,
+      echoProbeEnabled: true,
+      echoTimeoutMs: 60_000,
+      recoveryDeadlineMs: 90_000,
+      pendingCap: 200,
+      earlyEchoCap: 1_000,
+      scheduler,
+      forceReconnect: async reason => { reconnects.push(reason) },
+      alertFailure: async failure => { alerts.push(failure.body) },
+      log: () => {},
+    })
+
+    for (let index = 0; index < 3; index += 1) {
+      await monitor.trackedSend('100000000000000001', async () => ({
+        id: `10000000000000000${index + 2}`,
+      }))
+      await scheduler.advanceBy(60_000)
+      monitor.onShardReady(0)
+    }
+    expect(reconnects).toHaveLength(3)
+
+    await monitor.trackedSend('100000000000000001', async () => ({
+      id: '100000000000000010',
+    }))
+    await scheduler.advanceBy(60_000)
+
+    expect(reconnects).toHaveLength(3)
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]).toContain('3 attempts in a rolling 60 minutes')
+    expect(alerts[0]).toContain('restart the Discord plugin process')
+
+    monitor.onShardReady(0)
+    await monitor.trackedSend('100000000000000001', async () => ({
+      id: '100000000000000011',
+    }))
+    expect(scheduler.pendingCount()).toBe(1)
+
+    await scheduler.advanceBy(3_419_999)
+    expect(reconnects).toHaveLength(3)
+    await scheduler.advanceBy(1)
+    await monitor.trackedSend('100000000000000001', async () => ({
+      id: '100000000000000012',
+    }))
+    await scheduler.advanceBy(60_000)
+
+    expect(reconnects).toHaveLength(4)
+  })
 })

@@ -74,6 +74,20 @@ describe('GatewayHealthFiles', () => {
     expect(stderr.filter(line => line.includes('logging degraded'))).toHaveLength(1)
   })
 
+  it('continues durable logging when the stderr sink itself throws', () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'fly2226-gateway-log-'))
+    tempDirs.push(stateDir)
+    const files = new GatewayHealthFiles({
+      stateDir,
+      stderr: () => { throw new Error('stderr closed') },
+    })
+
+    expect(() => files.log('still durable')).not.toThrow()
+    expect(readFileSync(join(stateDir, 'gateway-health.log'), 'utf8')).toContain(
+      'still durable',
+    )
+  })
+
   it('writes alert delivery failures as private JSONL dead letters', () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'fly2226-gateway-log-'))
     tempDirs.push(stateDir)

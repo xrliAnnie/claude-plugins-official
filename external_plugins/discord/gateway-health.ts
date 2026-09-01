@@ -27,6 +27,9 @@ interface TrackedMessage {
   channelId?: string
 }
 
+const FORCED_RECONNECT_BUDGET = 3
+const FORCED_RECONNECT_WINDOW_MS = 60 * 60 * 1_000
+
 export interface GatewayShardClose {
   code: number
   reason: string
@@ -35,6 +38,8 @@ export interface GatewayShardClose {
 
 export class GatewayHealthMonitor {
   private reconnectDeadline: unknown
+  private budgetLatchDeadline: unknown
+  private readonly forcedReconnectAttempts: number[] = []
   private trackedRestInFlight = 0
   private readonly pendingEchoes = new Map<
     string,
@@ -45,14 +50,19 @@ export class GatewayHealthMonitor {
     { channelId: string; seenAt: number }
   >()
   private episode:
-    | { key: string; forced: boolean; alerted: boolean }
+    | {
+        key: string
+        forced: boolean
+        alerted: boolean
+        budgetLatched?: boolean
+      }
     | undefined
   private episodeSequence = 0
 
   constructor(private readonly options: GatewayHealthMonitorOptions) {}
 
   onShardReconnecting(shardId: number): void {
-    this.options.log(`gateway shard ${shardId} reconnecting`)
+    this.log(`gateway shard ${shardId} reconnecting`)
     // Echoes from the old socket can never arrive after this edge. Keeping
     // their timers would race the library's legitimate Resume path and trigger
     // a redundant forced reconnect before the lifecycle deadline.
@@ -65,23 +75,23 @@ export class GatewayHealthMonitor {
     }
     this.reconnectDeadline = this.options.scheduler.setTimeout(() => {
       this.reconnectDeadline = undefined
-      this.options.log(`gateway shard ${shardId} reconnect deadline elapsed`)
+      this.log(`gateway shard ${shardId} reconnect deadline elapsed`)
       this.beginForcedRecovery('Discord gateway did not resume before its recovery deadline')
     }, this.options.recoveryDeadlineMs)
   }
 
   onShardResume(shardId: number, replayedEvents: number): void {
-    this.options.log(`gateway shard ${shardId} resumed; replayed=${replayedEvents}`)
+    this.log(`gateway shard ${shardId} resumed; replayed=${replayedEvents}`)
     this.finishRecovery()
   }
 
   onShardReady(shardId: number): void {
-    this.options.log(`gateway shard ${shardId} ready`)
+    this.log(`gateway shard ${shardId} ready`)
     this.finishRecovery()
   }
 
   onShardDisconnect(event: GatewayShardClose, shardId: number): void {
-    this.options.log(
+    this.log(
       `gateway shard ${shardId} disconnected permanently; ` +
       `code=${event.code} reason=${event.reason} wasClean=${event.wasClean}`,
     )
@@ -101,11 +111,11 @@ export class GatewayHealthMonitor {
   }
 
   onShardError(error: Error, shardId: number): void {
-    this.options.log(`gateway shard ${shardId} error: ${formatError(error)}`)
+    this.log(`gateway shard ${shardId} error: ${formatError(error)}`)
   }
 
   onInvalidated(): void {
-    this.options.log(
+    this.log(
       'gateway invalidated event observed (future-compatible; not recovery evidence)',
     )
   }
@@ -120,7 +130,7 @@ export class GatewayHealthMonitor {
       if (this.options.echoProbeEnabled && !this.episode) {
         const resolvedChannelId = channelId ?? sent.channelId
         if (!resolvedChannelId) {
-          this.options.log(
+          this.log(
             `gateway self echo probe skipped message ${sent.id}: channel id unavailable`,
           )
           return sent
@@ -129,7 +139,7 @@ export class GatewayHealthMonitor {
         const early = this.earlySelfEchoes.get(sent.id)
         if (early?.channelId === resolvedChannelId) {
           this.earlySelfEchoes.delete(sent.id)
-          this.options.log(`gateway early self echo confirmed message ${sent.id}`)
+          this.log(`gateway early self echo confirmed message ${sent.id}`)
         } else {
           this.registerPendingEcho(sent.id, resolvedChannelId)
         }
@@ -145,7 +155,7 @@ export class GatewayHealthMonitor {
     if (pending?.channelId === channelId) {
       this.options.scheduler.clearTimeout(pending.timer)
       this.pendingEchoes.delete(messageId)
-      this.options.log(`gateway self echo confirmed message ${messageId}`)
+      this.log(`gateway self echo confirmed message ${messageId}`)
       return
     }
     if (
@@ -195,6 +205,18 @@ export class GatewayHealthMonitor {
     episode.forced = true
     this.clearReconnectDeadline()
 
+    if (!this.consumeForcedReconnectBudget()) {
+      episode.budgetLatched = true
+      this.clearPendingEchoes()
+      this.scheduleBudgetLatchRelease()
+      this.failEpisode(
+        'Discord gateway forced reconnect budget exhausted after ' +
+        '3 attempts in a rolling 60 minutes; restart the Discord plugin ' +
+        'process for immediate manual recovery',
+      )
+      return
+    }
+
     // Start the evidence deadline before dispatching the reconnect. The raw-shard
     // operation is intentionally fire-and-forget; only shardResume/shardReady can
     // prove recovery, never resolution of destroy().
@@ -215,13 +237,19 @@ export class GatewayHealthMonitor {
     episode.alerted = true
     this.clearReconnectDeadline()
     const failure = { episodeKey: episode.key, body }
-    this.options.log(body)
+    this.log(body)
     void this.options.alertFailure(failure).catch(error => {
-      this.options.log(`gateway failure alert delivery threw: ${formatError(error)}`)
+      this.log(`gateway failure alert delivery threw: ${formatError(error)}`)
     })
   }
 
   private finishRecovery(): void {
+    if (this.episode?.budgetLatched) {
+      this.log(
+        'gateway recovery evidence ignored while forced reconnect budget is latched',
+      )
+      return
+    }
     this.clearReconnectDeadline()
     this.clearPendingEchoes()
     this.episode = undefined
@@ -261,6 +289,51 @@ export class GatewayHealthMonitor {
     return typeof this.options.scheduler.nowMs === 'number'
       ? this.options.scheduler.nowMs
       : Date.now()
+  }
+
+  private consumeForcedReconnectBudget(): boolean {
+    this.pruneForcedReconnectAttempts()
+    if (this.forcedReconnectAttempts.length >= FORCED_RECONNECT_BUDGET) {
+      return false
+    }
+    this.forcedReconnectAttempts.push(this.now())
+    return true
+  }
+
+  private pruneForcedReconnectAttempts(): void {
+    const cutoff = this.now() - FORCED_RECONNECT_WINDOW_MS
+    while (
+      this.forcedReconnectAttempts.length > 0 &&
+      this.forcedReconnectAttempts[0] <= cutoff
+    ) {
+      this.forcedReconnectAttempts.shift()
+    }
+  }
+
+  private scheduleBudgetLatchRelease(): void {
+    if (this.budgetLatchDeadline !== undefined) return
+    this.pruneForcedReconnectAttempts()
+    const oldestAttempt = this.forcedReconnectAttempts[0]
+    const delayMs = oldestAttempt === undefined
+      ? 0
+      : Math.max(0, oldestAttempt + FORCED_RECONNECT_WINDOW_MS - this.now())
+    this.budgetLatchDeadline = this.options.scheduler.setTimeout(() => {
+      this.budgetLatchDeadline = undefined
+      this.pruneForcedReconnectAttempts()
+      if (!this.episode?.budgetLatched) return
+      this.clearPendingEchoes()
+      this.episode = undefined
+      this.log('gateway forced reconnect rolling budget window expired; probe re-enabled')
+    }, delayMs)
+  }
+
+  private log(message: string): void {
+    try {
+      this.options.log(message)
+    } catch {
+      // Health instrumentation is never allowed to turn an accepted Discord
+      // send into a retry (and therefore a duplicate visible message).
+    }
   }
 
   private clearReconnectDeadline(): void {

@@ -41,7 +41,7 @@ export class GatewayHealthFiles {
   }
 
   log(message: string): void {
-    this.stderr(`[gateway-health] ${message}\n`)
+    this.writeStderr(`[gateway-health] ${message}\n`)
     const line = boundUtf8Line(
       `${this.now().toISOString()} ${message}\n`,
       this.maxLogBytes,
@@ -58,10 +58,11 @@ export class GatewayHealthFiles {
       }
       appendFileSync(this.logPath, line, { encoding: 'utf8', mode: 0o600 })
       chmodSync(this.logPath, 0o600)
+      this.logWriteDegraded = false
     } catch (error) {
       if (this.logWriteDegraded) return
       this.logWriteDegraded = true
-      this.stderr(
+      this.writeStderr(
         `[gateway-health] lifecycle file logging degraded: ${formatError(error)}\n`,
       )
     }
@@ -78,6 +79,14 @@ export class GatewayHealthFiles {
       mode: 0o600,
     })
     chmodSync(this.deadLetterPath, 0o600)
+  }
+
+  private writeStderr(line: string): void {
+    try {
+      this.stderr(line)
+    } catch {
+      // The lifecycle evidence file is still useful when fd 2 is unavailable.
+    }
   }
 }
 
