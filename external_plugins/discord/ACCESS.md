@@ -89,6 +89,32 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
 
 **`chunkMode`** chooses the split strategy: `length` cuts exactly at the limit; `newline` prefers paragraph boundaries.
 
+### Gateway recovery and alerts
+
+Gateway self-healing is opt-in and uses messages the plugin already sends; it
+does not create polling or synthetic Discord traffic. Configure these values in
+the same `DISCORD_STATE_DIR/.env` as the bot token, then restart the plugin:
+
+| Variable | Behavior |
+| --- | --- |
+| `DISCORD_GATEWAY_WATCH=1` | Enables a one-shot forced reconnect when Discord's normal shard reconnect does not recover within 90 seconds. Missing, `0`, or any other value is off. |
+| `DISCORD_ECHO_PROBE=1` | Enables a one-shot forced reconnect when a successful plugin REST send is not echoed back through the gateway within 60 seconds. Missing, `0`, or any other value is off. |
+| `DISCORD_ALERT_CHANNEL=<channel snowflake>` | Destination for unrecoverable shard failures, failed recovery, and startup compatibility-guard failures. Use the lead's own allowlisted chat channel; this is not inferred from another setting. |
+
+Alerting and lifecycle logging are **always active**, even when both recovery
+flags are off. Alerts use the plugin's authenticated Discord REST client and
+intentionally bypass the echo probe. A missing or invalid
+`DISCORD_ALERT_CHANNEL` produces a loud startup warning; subsequent failures
+are written to `gateway-health-dead-letter.jsonl` instead of being sent to a
+guessed channel. Lifecycle evidence is retained in the bounded
+`gateway-health.log` plus one rotated backup inside `DISCORD_STATE_DIR`.
+
+Forced reconnect depends on the installed `discord.js` and transitive
+`@discordjs/ws` private shard contract. The plugin validates both runtime
+versions and the reconnect recovery enum at startup. If any part drifts, active
+recovery stays disabled and the compatibility failure follows the same alert or
+dead-letter path.
+
 ## Skill reference
 
 | Command | Effect |

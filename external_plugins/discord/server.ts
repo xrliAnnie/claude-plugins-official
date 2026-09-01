@@ -26,10 +26,16 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
+  Routes,
+  version as discordJsVersion,
   type Message,
   type Attachment,
   type Interaction,
 } from 'discord.js'
+import {
+  version as discordWsVersion,
+  WebSocketShardDestroyRecovery,
+} from '@discordjs/ws'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, existsSync } from 'fs'
 import { homedir } from 'os'
@@ -65,6 +71,17 @@ import {
 } from './roundtable-thread-policy'
 import { loadSharedRoundtableRouting } from './roundtable-shared-routing'
 import { buildRoundtableThreadCreateBody } from './roundtable-archive-policy'
+import {
+  GatewayHealthMonitor,
+  type GatewayHealthScheduler,
+} from './gateway-health'
+import {
+  GatewayFailureAlerter,
+  gatewayAlertConfigurationError,
+} from './gateway-alert'
+import { GatewayHealthFiles } from './gateway-health-files'
+import { inspectRawShardReconnect } from './gateway-reconnect'
+import { attachGatewayLifecycleEvents } from './gateway-wiring'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -472,6 +489,7 @@ process.on('uncaughtException', err => {
 // 5 lowercase letters a-z minus 'l'. Case-insensitive for phone autocorrect.
 // Strict: no bare yes/no (conversational), no prefix/suffix chatter.
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
+const RECENT_SENT_CAP = 200
 
 const client = new Client({
   intents: [
@@ -483,6 +501,93 @@ const client = new Client({
   // DMs arrive as partial channels — messageCreate never fires without this.
   partials: [Partials.Channel],
 })
+
+const gatewayHealthFiles = new GatewayHealthFiles({ stateDir: STATE_DIR })
+const gatewayFailureAlerter = new GatewayFailureAlerter({
+  alertChannelId: process.env.DISCORD_ALERT_CHANNEL,
+  // The client's REST manager already owns DISCORD_BOT_TOKEN after login. This
+  // path intentionally bypasses trackedSend: an alert about a dead gateway must
+  // not recursively open another echo probe.
+  sendDiscord: async (channelId, content) => {
+    await client.rest.post(Routes.channelMessages(channelId), {
+      body: { content },
+    })
+  },
+  appendDeadLetter: entry => { gatewayHealthFiles.appendDeadLetter(entry) },
+  log: message => { gatewayHealthFiles.log(message) },
+})
+const gatewayAlertConfigurationWarning = gatewayAlertConfigurationError(
+  process.env.DISCORD_ALERT_CHANNEL,
+)
+if (gatewayAlertConfigurationWarning) {
+  gatewayHealthFiles.log(
+    `${gatewayAlertConfigurationWarning}; gateway failures will be dead-lettered locally`,
+  )
+}
+const gatewayHealthScheduler: GatewayHealthScheduler = {
+  setTimeout(run, delayMs) {
+    const timer = setTimeout(run, delayMs)
+    timer.unref?.()
+    return timer
+  },
+  clearTimeout(timer) {
+    clearTimeout(timer as ReturnType<typeof setTimeout>)
+  },
+  get nowMs() {
+    return Date.now()
+  },
+}
+let rawShardReconnect: ((reason: string) => Promise<void>) | undefined
+let rawShardReconnectUnavailable = 'startup compatibility guard has not run'
+let rawShardGuardChecked = false
+const gatewayHealth = new GatewayHealthMonitor({
+  // First fleet release is opt-in. Missing is OFF; only exact =1 enables an
+  // active recovery path. Lifecycle logging and the startup shape guard remain
+  // active so a disabled lead is still diagnosable.
+  gatewayWatchEnabled: process.env.DISCORD_GATEWAY_WATCH === '1',
+  echoProbeEnabled: process.env.DISCORD_ECHO_PROBE === '1',
+  echoTimeoutMs: 60_000,
+  recoveryDeadlineMs: 90_000,
+  pendingCap: RECENT_SENT_CAP,
+  earlyEchoCap: 1_000,
+  scheduler: gatewayHealthScheduler,
+  forceReconnect: reason => {
+    if (!rawShardReconnect) {
+      return Promise.reject(new Error(rawShardReconnectUnavailable))
+    }
+    return rawShardReconnect(reason)
+  },
+  alertFailure: failure => gatewayFailureAlerter.alert(failure),
+  log: message => { gatewayHealthFiles.log(message) },
+})
+
+function initializeRawShardReconnect(): void {
+  if (rawShardGuardChecked) return
+  rawShardGuardChecked = true
+  const inspected = inspectRawShardReconnect(
+    client.ws,
+    discordJsVersion,
+    discordWsVersion,
+    WebSocketShardDestroyRecovery.Reconnect,
+  )
+  if (inspected.ok === false) {
+    rawShardReconnectUnavailable = inspected.reason
+    gatewayHealthFiles.log(
+      `raw-shard reconnect startup guard failed: ${inspected.reason}`,
+    )
+    void gatewayFailureAlerter.alert({
+      episodeKey: 'gateway-startup-compatibility-guard',
+      body: `Discord gateway recovery disabled at startup: ${inspected.reason}`,
+    })
+    return
+  }
+  rawShardReconnect = inspected.forceReconnect
+  rawShardReconnectUnavailable = ''
+  gatewayHealthFiles.log(
+    `raw-shard reconnect startup guard passed for discord.js ${discordJsVersion} ` +
+    `and @discordjs/ws ${discordWsVersion}`,
+  )
+}
 
 type PendingEntry = {
   senderId: string
@@ -691,7 +796,6 @@ function stopTypingKeepalive(chatId: string): void {
 // Track message IDs we recently sent, so reply-to-bot in guild channels
 // counts as a mention without needing fetchReference().
 const recentSentIds = new Set<string>()
-const RECENT_SENT_CAP = 200
 
 const dmChannelUsers = new Map<string, string>()
 
@@ -883,7 +987,10 @@ function checkApprovals(): void {
       try {
         const ch = await fetchTextChannel(dmChannelId)
         if ('send' in ch) {
-          await ch.send("Paired! Say hi to Claude.")
+          await gatewayHealth.trackedSend<Message>(
+            dmChannelId,
+            () => ch.send("Paired! Say hi to Claude."),
+          )
         }
         rmSync(file, { force: true })
       } catch (err) {
@@ -1046,7 +1153,10 @@ mcp.setNotificationHandler(
       void (async () => {
         try {
           const user = await client.users.fetch(userId)
-          await user.send({ content: text, components: [row] })
+          await gatewayHealth.trackedSend(
+            undefined,
+            () => user.send({ content: text, components: [row] }),
+          )
         } catch (e) {
           process.stderr.write(`permission_request send to ${userId} failed: ${e}\n`)
         }
@@ -1227,7 +1337,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // versus silently dropping the message. On exhaustion the thrown error
         // steers the model to send only the missing tail, not the whole message.
         const sentIds = await sendReplyChunks(
-          payload => ch.send(payload),
+          payload => gatewayHealth.trackedSend<Message>(
+            chat_id,
+            () => ch.send(payload),
+          ),
           chunks,
           { files, reply_to, replyMode },
           replyRetryOpts,
@@ -1414,6 +1527,7 @@ fly183ParentWatch.unref?.()
 client.on('error', err => {
   process.stderr.write(`discord channel: client error: ${err}\n`)
 })
+attachGatewayLifecycleEvents(client, gatewayHealth)
 
 // Button-click handler for permission requests. customId is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
@@ -1478,7 +1592,10 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 
 client.on('messageCreate', msg => {
   // Never process our own messages — prevents typing keepalive re-trigger on reply echo.
-  if (msg.author.id === client.user?.id) return
+  if (msg.author.id === client.user?.id) {
+    gatewayHealth.onSelfEcho(msg.id, msg.channelId)
+    return
+  }
   if (msg.author.bot) {
     const access = loadAccess()
     if (!access.allowBots?.includes(msg.author.id)) return
@@ -1494,8 +1611,11 @@ async function handleInbound(msg: Message): Promise<void> {
   if (result.action === 'pair') {
     const lead = result.isResend ? 'Still pending' : 'Pairing required'
     try {
-      await msg.reply(
-        `${lead} — run in Claude Code:\n\n/discord:access pair ${result.code}`,
+      await gatewayHealth.trackedSend(
+        msg.channelId,
+        () => msg.reply(
+          `${lead} — run in Claude Code:\n\n/discord:access pair ${result.code}`,
+        ),
       )
     } catch (err) {
       process.stderr.write(`discord channel: failed to send pairing code: ${err}\n`)
@@ -1666,6 +1786,7 @@ async function handleInbound(msg: Message): Promise<void> {
 
 client.once('ready', c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
+  initializeRawShardReconnect()
   chatIngestRuntime.kickWorker()
 })
 
