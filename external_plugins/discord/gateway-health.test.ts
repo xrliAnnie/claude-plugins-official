@@ -343,4 +343,146 @@ describe('GatewayHealthMonitor self-echo probe', () => {
     await scheduler.advanceBy(60_001)
     expect(reconnects).toEqual([])
   })
+
+  it('never starts a timer or recovery while the plugin has no outbound send', async () => {
+    const scheduler = new TestScheduler()
+    const reconnects: string[] = []
+    const alerts: string[] = []
+    const monitor = new GatewayHealthMonitor({
+      gatewayWatchEnabled: false,
+      echoProbeEnabled: true,
+      echoTimeoutMs: 60_000,
+      recoveryDeadlineMs: 90_000,
+      pendingCap: 200,
+      earlyEchoCap: 1_000,
+      scheduler,
+      forceReconnect: async reason => { reconnects.push(reason) },
+      alertFailure: async failure => { alerts.push(failure.body) },
+      log: () => {},
+    })
+
+    await scheduler.advanceBy(24 * 60 * 60 * 1_000)
+
+    expect(scheduler.pendingCount()).toBe(0)
+    expect(reconnects).toEqual([])
+    expect(alerts).toEqual([])
+  })
+
+  it('keeps a target early echo through unrelated traffic while pruning by TTL and cap', async () => {
+    const scheduler = new TestScheduler()
+    const reconnects: string[] = []
+    let resolveSend!: (message: { id: string }) => void
+    const response = new Promise<{ id: string }>(resolve => { resolveSend = resolve })
+    const monitor = new GatewayHealthMonitor({
+      gatewayWatchEnabled: false,
+      echoProbeEnabled: true,
+      echoTimeoutMs: 60_000,
+      recoveryDeadlineMs: 90_000,
+      pendingCap: 200,
+      earlyEchoCap: 2,
+      scheduler,
+      forceReconnect: async reason => { reconnects.push(reason) },
+      alertFailure: async () => {},
+      log: () => {},
+    })
+
+    const sending = monitor.trackedSend('100000000000000001', () => response)
+    monitor.onSelfEcho('100000000000000010', '100000000000000001')
+    await scheduler.advanceBy(119_999)
+    monitor.onSelfEcho('100000000000000002', '100000000000000001')
+    monitor.onSelfEcho('100000000000000011', '100000000000000001')
+    resolveSend({ id: '100000000000000002' })
+    await sending
+
+    expect(scheduler.pendingCount()).toBe(0)
+    await scheduler.advanceBy(60_001)
+    expect(reconnects).toEqual([])
+  })
+
+  it('expires an early echo after twice the timeout instead of accepting stale evidence', async () => {
+    const scheduler = new TestScheduler()
+    const reconnects: string[] = []
+    let resolveSend!: (message: { id: string }) => void
+    const response = new Promise<{ id: string }>(resolve => { resolveSend = resolve })
+    const monitor = new GatewayHealthMonitor({
+      gatewayWatchEnabled: false,
+      echoProbeEnabled: true,
+      echoTimeoutMs: 60_000,
+      recoveryDeadlineMs: 90_000,
+      pendingCap: 200,
+      earlyEchoCap: 1_000,
+      scheduler,
+      forceReconnect: async reason => { reconnects.push(reason) },
+      alertFailure: async () => {},
+      log: () => {},
+    })
+
+    const sending = monitor.trackedSend('100000000000000001', () => response)
+    monitor.onSelfEcho('100000000000000002', '100000000000000001')
+    await scheduler.advanceBy(120_001)
+    resolveSend({ id: '100000000000000002' })
+    await sending
+    expect(scheduler.pendingCount()).toBe(1)
+
+    await scheduler.advanceBy(60_000)
+    expect(reconnects).toHaveLength(1)
+  })
+
+  it('starts a new one-shot recovery after a real ready edge ends the prior episode', async () => {
+    const scheduler = new TestScheduler()
+    const reconnects: string[] = []
+    const monitor = new GatewayHealthMonitor({
+      gatewayWatchEnabled: false,
+      echoProbeEnabled: true,
+      echoTimeoutMs: 60_000,
+      recoveryDeadlineMs: 90_000,
+      pendingCap: 200,
+      earlyEchoCap: 1_000,
+      scheduler,
+      forceReconnect: async reason => { reconnects.push(reason) },
+      alertFailure: async () => {},
+      log: () => {},
+    })
+
+    await monitor.trackedSend('100000000000000001', async () => ({
+      id: '100000000000000002',
+    }))
+    await scheduler.advanceBy(60_000)
+    monitor.onShardReady(0)
+    await monitor.trackedSend('100000000000000001', async () => ({
+      id: '100000000000000003',
+    }))
+    await scheduler.advanceBy(60_000)
+
+    expect(reconnects).toHaveLength(2)
+  })
+
+  it('alerts immediately when the fire-and-forget reconnect rejects', async () => {
+    const scheduler = new TestScheduler()
+    const alerts: string[] = []
+    const monitor = new GatewayHealthMonitor({
+      gatewayWatchEnabled: false,
+      echoProbeEnabled: true,
+      echoTimeoutMs: 60_000,
+      recoveryDeadlineMs: 90_000,
+      pendingCap: 200,
+      earlyEchoCap: 1_000,
+      scheduler,
+      forceReconnect: async () => { throw new Error('raw shape changed') },
+      alertFailure: async failure => { alerts.push(failure.body) },
+      log: () => {},
+    })
+
+    await monitor.trackedSend('100000000000000001', async () => ({
+      id: '100000000000000002',
+    }))
+    await scheduler.advanceBy(60_000)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(alerts).toEqual([
+      'Discord gateway forced reconnect failed: raw shape changed',
+    ])
+    expect(scheduler.pendingCount()).toBe(0)
+  })
 })

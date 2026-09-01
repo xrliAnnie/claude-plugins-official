@@ -42,7 +42,10 @@ export class GatewayHealthFiles {
 
   log(message: string): void {
     this.stderr(`[gateway-health] ${message}\n`)
-    const line = `${this.now().toISOString()} ${message}\n`
+    const line = boundUtf8Line(
+      `${this.now().toISOString()} ${message}\n`,
+      this.maxLogBytes,
+    )
     try {
       mkdirSync(this.options.stateDir, { recursive: true, mode: 0o700 })
       const currentBytes = existsSync(this.logPath) ? statSync(this.logPath).size : 0
@@ -80,4 +83,17 @@ export class GatewayHealthFiles {
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function boundUtf8Line(line: string, maxBytes: number): string {
+  if (maxBytes <= 0) return ''
+  const encoded = Buffer.from(line, 'utf8')
+  if (encoded.byteLength <= maxBytes) return line
+  if (maxBytes === 1) return '\n'
+
+  const content = encoded
+    .subarray(0, maxBytes - 1)
+    .toString('utf8')
+    .replace(/\uFFFD$/u, '')
+  return `${content}\n`
 }
