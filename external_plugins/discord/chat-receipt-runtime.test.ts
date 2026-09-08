@@ -112,9 +112,23 @@ describe('durable Discord ingest runtime', () => {
     expect(serverSource).not.toContain('.adviseBroken(')
     expect(serverSource).not.toContain('content: `⚠️ ${text}`')
     expect(serverSource).not.toContain('chatIngestRuntime.settle')
+    expect(serverSource.match(/method: 'notifications\/claude\/channel',/g) ?? [])
+      .toHaveLength(1)
     expect(serverSource).toMatch(
       /await chatIngestRuntime\.acceptInbound\(ingestArgs\)[\s\S]{0,120}chatIngestRuntime\.kickWorker\(\)/,
     )
+    expect(serverSource).toContain(': await chatIngestRuntime.holdInbound(rejectedIntent)')
+    expect(serverSource).toContain('inbound delivery is FAIL-CLOSED')
+    const rejectedStart = serverSource.indexOf("if (delivery === 'rejected')")
+    const typingStart = serverSource.indexOf('// Typing keepalive', rejectedStart)
+    expect(rejectedStart).toBeGreaterThan(0)
+    expect(typingStart).toBeGreaterThan(rejectedStart)
+    const rejectedBlock = serverSource.slice(rejectedStart, typingStart)
+    expect(rejectedBlock).toContain('msg.react(REJECTED_REACTION)')
+    expect(rejectedBlock).not.toContain('mcp.notification')
+    expect(rejectedBlock).not.toContain('.send(')
+    expect(rejectedBlock).not.toContain('.reply(')
+    expect(rejectedBlock).not.toContain('startTypingKeepalive')
   })
 
   it('always invokes chat-ingest and never invokes a receipt command', async () => {

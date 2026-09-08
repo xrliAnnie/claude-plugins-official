@@ -43,13 +43,16 @@ import { join, sep } from 'path'
 import { parseIntInRange, type SendWithRetryOpts } from './retry'
 import { sendReplyChunks } from './reply-send'
 import {
+  REJECTED_REACTION,
   buildBeginArgs,
+  buildRejectedIntent,
   deliveryInboundInstruction,
   deliveryReplyToDescription,
   deliveryReplyToolDescription,
   resolveFounderIdForMode,
   resolveRecorderMode,
   type BeginArgs,
+  type RejectedRoutingMeta,
 } from './chat-receipt-recorder'
 import { ChatIngestRuntime } from './chat-receipt-runtime'
 import { resolveGroupMentionPatterns } from './mention-patterns'
@@ -108,7 +111,7 @@ const FOUNDER_ID = resolveFounderIdForMode(RECORDER_MODE, {
 })
 if (RECORDER_MODE.kind === 'broken') {
   process.stderr.write(
-    `DISCORD MAILBOX WIRING BROKEN: missing ${RECORDER_MODE.missing.join(', ')}; inbound delivery remains fail-open\n`,
+    `DISCORD MAILBOX WIRING BROKEN: missing ${RECORDER_MODE.missing.join(', ')}; inbound delivery is FAIL-CLOSED — messages get ${REJECTED_REACTION} and are held under ${STATE_DIR}/chat-receipt-spool/rejected until this Lead restarts with FLYWHEEL_COMM_CLI, FLYWHEEL_COMM_DB and FLYWHEEL_LEAD_ID all set\n`,
   )
 }
 if (RECORDER_MODE.kind === 'enabled' && !FOUNDER_ID) {
@@ -1715,42 +1718,56 @@ async function handleInbound(msg: Message): Promise<void> {
   // Attachment listing goes in meta only — an in-content annotation is
   // forgeable by any allowlisted sender typing that string.
   const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
+  const inboundMeta = {
+    messageId: msg.id,
+    originChannelId: msg.channelId,
+    authorId: msg.author.id,
+    authorName: msg.author.username,
+    ts: msg.createdAt.toISOString(),
+    text: content,
+    attachments: deliveryAttachments,
+  }
+  const routingMeta: RejectedRoutingMeta = {
+    chatId: chat_id,
+    channelKind: msg.channel.type === ChannelType.DM ? 'dm' : 'guild',
+    routedToRoundtable,
+    ...(replyRoute ? { replyRoute } : {}),
+    inRoundtableThread:
+      !!RT_CFG &&
+      isRoundtableTopicThread(
+        {
+          isThread: msg.channel.isThread(),
+          parentId: msg.channel.isThread() ? msg.channel.parentId ?? null : null,
+        },
+        RT_CFG,
+      ),
+  }
   let ingestArgs: BeginArgs | undefined
   if (RECORDER_MODE.kind === 'enabled') {
     ingestArgs = buildBeginArgs(
+      inboundMeta,
       {
-        messageId: msg.id,
-        originChannelId: msg.channelId,
-        authorId: msg.author.id,
-        authorName: msg.author.username,
-        ts: msg.createdAt.toISOString(),
-        text: content,
-        attachments: deliveryAttachments,
-      },
-      {
+        ...routingMeta,
         leadId: RECORDER_MODE.leadId,
-        chatId: chat_id,
-        channelKind: msg.channel.type === ChannelType.DM ? 'dm' : 'guild',
-        routedToRoundtable,
-        ...(replyRoute ? { replyRoute } : {}),
-        inRoundtableThread:
-          !!RT_CFG &&
-          isRoundtableTopicThread(
-            {
-              isThread: msg.channel.isThread(),
-              parentId: msg.channel.isThread() ? msg.channel.parentId ?? null : null,
-            },
-            RT_CFG,
-          ),
       },
       FOUNDER_ID,
     )
   }
+  const rejectedIntent = RECORDER_MODE.kind === 'broken'
+    ? buildRejectedIntent(inboundMeta, routingMeta, RECORDER_MODE.missing, new Date())
+    : undefined
 
   const delivery = ingestArgs
     ? await chatIngestRuntime.acceptInbound(ingestArgs)
-    : 'legacy'
+    : await chatIngestRuntime.holdInbound(rejectedIntent)
   if (ingestArgs) chatIngestRuntime.kickWorker()
+
+  if (delivery === 'rejected') {
+    void msg.react(REJECTED_REACTION).catch(err => {
+      process.stderr.write(`discord channel: rejected reaction failed: ${err}\n`)
+    })
+    return
+  }
 
   // Typing keepalive — refreshes every 8s so "Bot is typing..." persists
   // until the reply tool is called (or the 10-minute safety cap expires).
