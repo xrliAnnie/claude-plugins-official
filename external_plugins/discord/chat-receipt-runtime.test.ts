@@ -6,6 +6,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -339,15 +340,17 @@ describe('durable Discord ingest runtime', () => {
 
       expect(await runtime.holdInbound(intent)).toBe('rejected')
       expect(commands).toEqual([])
-      expect(parseRejectedIntent(readFileSync(join(
-        dir,
-        'chat-receipt-spool',
-        'rejected',
+      const rejectedDir = join(dir, 'chat-receipt-spool', 'rejected')
+      const rejectedPath = join(
+        rejectedDir,
         `${begin.messageId}.json`,
-      ), 'utf8'))).toMatchObject({
+      )
+      expect(parseRejectedIntent(readFileSync(rejectedPath, 'utf8'))).toMatchObject({
         missing: [missing],
         inbound: { text: begin.text },
       })
+      expect(statSync(rejectedDir).mode & 0o777).toBe(0o700)
+      expect(statSync(rejectedPath).mode & 0o777).toBe(0o600)
     })
   }
 
@@ -505,6 +508,49 @@ describe('durable Discord ingest runtime', () => {
     expect(logs.filter(line => line.includes('discord_mailbox_replay_awaiting_cli'))).toHaveLength(1)
 
     protocolVersion = 2
+    now = new Date('2026-08-11T05:00:06.000Z')
+    timers[0]!.fn()
+    await runtime.whenIdle()
+    expect(commands.filter(argv => argv.includes('--version-probe'))).toHaveLength(2)
+    expect(commands.filter(argv => !argv.includes('--version-probe'))).toHaveLength(1)
+    expect(existsSync(path)).toBe(false)
+  })
+
+  it('backs off a failed capability probe and self-heals without restart', async () => {
+    const dir = tempDir()
+    const path = writeRejected(dir, rejectedIntent(begin.messageId))
+    const commands: string[][] = []
+    const timers: Array<{ fn: () => void; ms: number }> = []
+    let now = new Date('2026-08-11T05:00:01.000Z')
+    let probeFails = true
+    const runtime = new ChatIngestRuntime({
+      mode: enabledMode(),
+      stateDir: dir,
+      now: () => now,
+      runCommand: async argv => {
+        commands.push(argv)
+        if (argv.includes('--version-probe')) {
+          return probeFails
+            ? result('', 1, 'probe failed')
+            : result(JSON.stringify({ protocolVersion: 2 }))
+        }
+        return result(JSON.stringify({ lane: 'inserted_inbox' }))
+      },
+      setTimer: (fn, ms) => {
+        timers.push({ fn, ms })
+        return timers.length as unknown as ReturnType<typeof setTimeout>
+      },
+      clearTimer: () => {},
+    })
+
+    runtime.kickWorker()
+    await runtime.whenIdle()
+    expect(commands.filter(argv => !argv.includes('--version-probe'))).toEqual([])
+    expect(existsSync(path)).toBe(true)
+    expect(timers).toHaveLength(1)
+    expect(timers[0]!.ms).toBeGreaterThanOrEqual(5_000)
+
+    probeFails = false
     now = new Date('2026-08-11T05:00:06.000Z')
     timers[0]!.fn()
     await runtime.whenIdle()
