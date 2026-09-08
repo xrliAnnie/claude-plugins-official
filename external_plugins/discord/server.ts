@@ -45,13 +45,14 @@ import { sendReplyChunks } from './reply-send'
 import {
   REJECTED_REACTION,
   buildBeginArgs,
-  buildRejectedIntent,
+  buildRejectedIntentFailClosed,
   deliveryInboundInstruction,
   deliveryReplyToDescription,
   deliveryReplyToolDescription,
   resolveFounderIdForMode,
   resolveRecorderMode,
   type BeginArgs,
+  type RejectedIntentV1,
   type RejectedRoutingMeta,
 } from './chat-receipt-recorder'
 import { ChatIngestRuntime } from './chat-receipt-runtime'
@@ -1753,9 +1754,23 @@ async function handleInbound(msg: Message): Promise<void> {
       FOUNDER_ID,
     )
   }
-  const rejectedIntent = RECORDER_MODE.kind === 'broken'
-    ? buildRejectedIntent(inboundMeta, routingMeta, RECORDER_MODE.missing, new Date())
-    : undefined
+  let rejectedIntent: RejectedIntentV1 | undefined
+  if (RECORDER_MODE.kind === 'broken') {
+    const rejected = buildRejectedIntentFailClosed(
+      inboundMeta,
+      routingMeta,
+      RECORDER_MODE.missing,
+      new Date(),
+    )
+    rejectedIntent = rejected.intent
+    if (rejected.repairError) {
+      process.stderr.write(`${JSON.stringify({
+        event: 'discord_mailbox_rejected_input_repaired',
+        message_id: msg.id,
+        error: rejected.repairError,
+      })}\n`)
+    }
+  }
 
   const delivery = ingestArgs
     ? await chatIngestRuntime.acceptInbound(ingestArgs)

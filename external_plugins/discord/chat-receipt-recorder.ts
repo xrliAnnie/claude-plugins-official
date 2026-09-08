@@ -235,6 +235,27 @@ export function buildRejectedIntent(
   })
 }
 
+export function buildRejectedIntentFailClosed(
+  inbound: InboundMeta,
+  routing: RejectedRoutingMeta,
+  missing: string[],
+  now: Date,
+): { intent: RejectedIntentV1; repairError?: string } {
+  try {
+    return { intent: buildRejectedIntent(inbound, routing, missing, now) }
+  } catch (error) {
+    return {
+      intent: buildRejectedIntent(
+        { ...inbound, attachments: [] },
+        routing,
+        missing,
+        now,
+      ),
+      repairError: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
+
 export function encodeRejectedIntent(intent: RejectedIntentV1): string {
   return JSON.stringify(normalizeRejectedIntent(intent))
 }

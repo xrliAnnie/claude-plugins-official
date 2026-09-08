@@ -3,6 +3,7 @@ import {
   REJECTED_REACTION,
   buildBeginArgs,
   buildRejectedIntent,
+  buildRejectedIntentFailClosed,
   deliveryInboundInstruction,
   deliveryReplyToDescription,
   deliveryReplyToolDescription,
@@ -188,6 +189,23 @@ describe('rejected inbound envelope', () => {
       ...intent,
       routing: { ...intent.routing, channelKind: 'other' },
     }))).toThrow('channelKind must be dm or guild')
+  })
+
+  it('preserves the message when malformed attachment metadata needs a fallback', () => {
+    const result = buildRejectedIntentFailClosed(
+      {
+        ...baseMessage,
+        attachments: [{ name: '', type: 'image/png', sizeKb: 12 }],
+      },
+      routing,
+      ['FLYWHEEL_COMM_DB'],
+      new Date('2026-07-23T05:01:00.000Z'),
+    )
+    expect(result.repairError).toContain('attachments[0].name is required')
+    expect(result.intent.inbound).toEqual({
+      ...baseMessage,
+      attachments: [],
+    })
   })
 })
 
