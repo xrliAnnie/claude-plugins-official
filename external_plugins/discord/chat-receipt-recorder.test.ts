@@ -1,11 +1,16 @@
 import { describe, expect, it } from 'bun:test'
 import {
+  REJECTED_REACTION,
   buildBeginArgs,
+  buildRejectedIntent,
+  buildRejectedIntentFailClosed,
   deliveryInboundInstruction,
   deliveryReplyToDescription,
   deliveryReplyToolDescription,
+  encodeRejectedIntent,
   encodeSpoolIntent,
   isIntentFilename,
+  parseRejectedIntent,
   parseSpoolIntent,
   resolveFounderId,
   resolveFounderIdForMode,
@@ -139,6 +144,71 @@ describe('durable ingest envelope', () => {
   })
 })
 
+describe('rejected inbound envelope', () => {
+  const routing = {
+    chatId: '100000000000000020',
+    channelKind: 'guild' as const,
+    routedToRoundtable: false,
+    inRoundtableThread: false,
+  }
+
+  it('round-trips the complete rejected message and routing metadata', () => {
+    const receivedAt = new Date('2026-07-23T05:01:00.000Z')
+    const intent = buildRejectedIntent(
+      baseMessage,
+      routing,
+      ['FLYWHEEL_COMM_DB'],
+      receivedAt,
+    )
+    expect(REJECTED_REACTION).toBe('⛔')
+    expect(parseRejectedIntent(encodeRejectedIntent(intent))).toEqual({
+      v: 1,
+      kind: 'rejected',
+      receivedAt: receivedAt.toISOString(),
+      missing: ['FLYWHEEL_COMM_DB'],
+      inbound: baseMessage,
+      routing,
+      attempts: 0,
+      nextAttemptAt: receivedAt.toISOString(),
+      advisedAt: null,
+    })
+  })
+
+  it('rejects malformed inbound and routing metadata', () => {
+    const intent = buildRejectedIntent(
+      baseMessage,
+      routing,
+      ['FLYWHEEL_COMM_CLI'],
+      new Date('2026-07-23T05:01:00.000Z'),
+    )
+    expect(() => parseRejectedIntent(JSON.stringify({
+      ...intent,
+      inbound: { ...intent.inbound, messageId: 'bad' },
+    }))).toThrow('messageId must be a Discord snowflake')
+    expect(() => parseRejectedIntent(JSON.stringify({
+      ...intent,
+      routing: { ...intent.routing, channelKind: 'other' },
+    }))).toThrow('channelKind must be dm or guild')
+  })
+
+  it('preserves the message when malformed attachment metadata needs a fallback', () => {
+    const result = buildRejectedIntentFailClosed(
+      {
+        ...baseMessage,
+        attachments: [{ name: '', type: 'image/png', sizeKb: 12 }],
+      },
+      routing,
+      ['FLYWHEEL_COMM_DB'],
+      new Date('2026-07-23T05:01:00.000Z'),
+    )
+    expect(result.repairError).toContain('attachments[0].name is required')
+    expect(result.intent.inbound).toEqual({
+      ...baseMessage,
+      attachments: [],
+    })
+  })
+})
+
 describe('MCP copy', () => {
   it('is stock in every runtime mode and carries no settlement obligations', () => {
     const copy = [
@@ -147,7 +217,7 @@ describe('MCP copy', () => {
       deliveryReplyToDescription(),
     ]
     expect(copy).toEqual([
-      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses. If a <channel> tag carries held_since, this Lead\'s mailbox wiring was broken when that message arrived and it was held until now; before acting on held messages, tell the sender in that chat_id how many held messages you just read and when they were sent.',
       'Reply on Discord. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or other files.',
       'Message ID to thread under. Use message_id from the inbound <channel> block, or an id from fetch_messages.',
     ])

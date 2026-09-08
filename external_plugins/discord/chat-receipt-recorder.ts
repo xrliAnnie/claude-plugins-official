@@ -70,10 +70,30 @@ export interface SpoolIntentV1 {
   advisedAt: string | null
 }
 
+export type RejectedRoutingMeta = Omit<RoutingMeta, 'leadId'>
+
+export interface RejectedIntentV1 {
+  v: 1
+  kind: 'rejected'
+  receivedAt: string
+  missing: string[]
+  inbound: InboundMeta
+  routing: RejectedRoutingMeta
+  attempts: number
+  nextAttemptAt: string
+  advisedAt: string | null
+}
+
 const DISCORD_SNOWFLAKE = /^\d{17,20}$/
 const INTENT_FILENAME = /^\d{17,20}\.json$/
+const CAPABILITY_NAMES = new Set([
+  'FLYWHEEL_COMM_CLI',
+  'FLYWHEEL_COMM_DB',
+  'FLYWHEEL_LEAD_ID',
+])
+export const REJECTED_REACTION = '⛔'
 const STOCK_INBOUND_INSTRUCTION =
-  'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.'
+  'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses. If a <channel> tag carries held_since, this Lead\'s mailbox wiring was broken when that message arrived and it was held until now; before acting on held messages, tell the sender in that chat_id how many held messages you just read and when they were sent.'
 const STOCK_REPLY_TOOL_DESCRIPTION =
   'Reply on Discord. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or other files.'
 const STOCK_REPLY_TO_DESCRIPTION =
@@ -195,6 +215,61 @@ export function encodeSpoolIntent(intent: SpoolIntentV1): string {
   return JSON.stringify(normalizeSpoolIntent(intent))
 }
 
+export function buildRejectedIntent(
+  inbound: InboundMeta,
+  routing: RejectedRoutingMeta,
+  missing: string[],
+  now: Date,
+): RejectedIntentV1 {
+  const receivedAt = now.toISOString()
+  return normalizeRejectedIntent({
+    v: 1,
+    kind: 'rejected',
+    receivedAt,
+    missing,
+    inbound,
+    routing,
+    attempts: 0,
+    nextAttemptAt: receivedAt,
+    advisedAt: null,
+  })
+}
+
+export function buildRejectedIntentFailClosed(
+  inbound: InboundMeta,
+  routing: RejectedRoutingMeta,
+  missing: string[],
+  now: Date,
+): { intent: RejectedIntentV1; repairError?: string } {
+  try {
+    return { intent: buildRejectedIntent(inbound, routing, missing, now) }
+  } catch (error) {
+    return {
+      intent: buildRejectedIntent(
+        { ...inbound, attachments: [] },
+        routing,
+        missing,
+        now,
+      ),
+      repairError: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
+
+export function encodeRejectedIntent(intent: RejectedIntentV1): string {
+  return JSON.stringify(normalizeRejectedIntent(intent))
+}
+
+export function parseRejectedIntent(encoded: string): RejectedIntentV1 {
+  let decoded: unknown
+  try {
+    decoded = JSON.parse(encoded)
+  } catch (error) {
+    throw new Error(`Discord rejected intent JSON is invalid: ${(error as Error).message}`)
+  }
+  return normalizeRejectedIntent(decoded)
+}
+
 export function parseSpoolIntent(encoded: string): SpoolIntentV1 {
   let decoded: unknown
   try {
@@ -238,6 +313,84 @@ function normalizeSpoolIntent(value: unknown): SpoolIntentV1 {
     begin: normalizeBeginArgs(candidate.begin),
     attempts: candidate.attempts as number,
     advisedAt: (candidate.advisedAt as string | null | undefined) ?? null,
+  }
+}
+
+function normalizeRejectedIntent(value: unknown): RejectedIntentV1 {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Discord rejected intent must be an object')
+  }
+  const candidate = value as Record<string, unknown>
+  if (candidate.v !== 1 || candidate.kind !== 'rejected') {
+    throw new Error('Discord rejected intent v1 is required')
+  }
+  if (!Array.isArray(candidate.missing) || candidate.missing.length === 0) {
+    throw new Error('Discord rejected intent missing must be a non-empty array')
+  }
+  const missing = candidate.missing.map((name, index) => {
+    const parsed = requiredString(name, `missing[${index}]`)
+    if (!CAPABILITY_NAMES.has(parsed)) {
+      throw new Error(`missing[${index}] is not a Flywheel capability`)
+    }
+    return parsed
+  })
+  if (!Number.isSafeInteger(candidate.attempts) || (candidate.attempts as number) < 0) {
+    throw new Error('Discord rejected intent attempts must be a non-negative integer')
+  }
+  if (candidate.advisedAt !== null && candidate.advisedAt !== undefined) {
+    utcTimestamp(candidate.advisedAt, 'advisedAt')
+  }
+  return {
+    v: 1,
+    kind: 'rejected',
+    receivedAt: utcTimestamp(candidate.receivedAt, 'receivedAt'),
+    missing,
+    inbound: normalizeInboundMeta(candidate.inbound),
+    routing: normalizeRoutingMeta(candidate.routing),
+    attempts: candidate.attempts as number,
+    nextAttemptAt: utcTimestamp(candidate.nextAttemptAt, 'nextAttemptAt'),
+    advisedAt: (candidate.advisedAt as string | null | undefined) ?? null,
+  }
+}
+
+function normalizeInboundMeta(value: unknown): InboundMeta {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('inbound must be an object')
+  }
+  const inbound = value as Record<string, unknown>
+  return {
+    messageId: msgField(inbound.messageId, 'messageId'),
+    originChannelId: msgField(inbound.originChannelId, 'originChannelId'),
+    authorId: msgField(inbound.authorId, 'authorId'),
+    authorName: requiredString(inbound.authorName, 'authorName'),
+    ts: utcTimestamp(inbound.ts, 'ts'),
+    text: stringValue(inbound.text, 'text'),
+    attachments: normalizeAttachments(inbound.attachments),
+  }
+}
+
+function normalizeRoutingMeta(value: unknown): RejectedRoutingMeta {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('routing must be an object')
+  }
+  const routing = value as Record<string, unknown>
+  if (routing.channelKind !== 'dm' && routing.channelKind !== 'guild') {
+    throw new Error('channelKind must be dm or guild')
+  }
+  if (typeof routing.routedToRoundtable !== 'boolean') {
+    throw new Error('routedToRoundtable must be a boolean')
+  }
+  if (typeof routing.inRoundtableThread !== 'boolean') {
+    throw new Error('inRoundtableThread must be a boolean')
+  }
+  return {
+    chatId: msgField(routing.chatId, 'chatId'),
+    channelKind: routing.channelKind,
+    routedToRoundtable: routing.routedToRoundtable,
+    inRoundtableThread: routing.inRoundtableThread,
+    ...(routing.replyRoute === undefined
+      ? {}
+      : { replyRoute: normalizeReplyRoute(routing.replyRoute) }),
   }
 }
 
