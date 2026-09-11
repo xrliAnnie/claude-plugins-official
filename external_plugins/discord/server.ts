@@ -335,6 +335,9 @@ async function callReplyGuard(
   opts?: { roundtableThread?: boolean },
 ): Promise<GuardOutcome | null> {
   const outcome = await replyGuard.evaluate(chatId, text, opts)
+  if (outcome.kind === 'unavailable' || outcome.kind === 'unauthorized') {
+    process.stderr.write(`[reply-guard] ${outcome.kind} (${outcome.probe.outcome}); local=${outcome.local?.classification} decision=${outcome.local?.decision}\n`)
+  }
   return outcome.deny ? outcome : null
 }
 
