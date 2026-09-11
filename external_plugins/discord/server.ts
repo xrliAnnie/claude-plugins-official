@@ -42,6 +42,7 @@ import { homedir } from 'os'
 import { join, sep } from 'path'
 import { parseIntInRange, type SendWithRetryOpts } from './retry'
 import { sendReplyChunks } from './reply-send'
+import { createReplyGuardClient, formatGuardDeny, type GuardOutcome } from './reply-guard-client'
 import {
   REJECTED_REACTION,
   buildBeginArgs,
@@ -322,149 +323,27 @@ async function isRoundtableThreadMember(
 // via POST /api/chat-threads/send. The Bridge owns the authoritative
 // classification (chatChannel vs registered thread vs other).
 //
-// Hybrid fail policy when the Bridge is unreachable / not wired:
-//   • text contains >= 1 configured issue token  -> fail CLOSED (deny)
-//   • otherwise (free-form, zero tokens)          -> fail OPEN (proceed)
-// This keeps ordinary chat working during Bridge outages while still
-// protecting the TC-02 class (issue content leaking to the top level).
+// FLY-1942: the shared client records the probe and limits outage refusals to
+// issue-bearing text in this Lead's own chat channel. Bridge decisions remain
+// authoritative when reachable; an absent own-channel env retains legacy policy.
 // ──────────────────────────────────────────────────────────────────────
-const GUARD_PREFIXES = (process.env.TEAMLEAD_ISSUE_PREFIXES ?? 'FLY,GEO')
-  .split(',')
-  .map(s => s.trim().toUpperCase())
-  .filter(Boolean)
-const GUARD_TOKEN_RE = /\b([A-Za-z]{2,})-(\d+)\b/g
-
-function localHasIssueToken(text: string): boolean {
-  if (!text) return false
-  const allowed = new Set(GUARD_PREFIXES)
-  for (const m of text.matchAll(GUARD_TOKEN_RE)) {
-    if (m[1] && allowed.has(m[1].toUpperCase())) return true
-  }
-  return false
-}
-
-// FLY-173: the project core channel (#geoforge3d-core) is exempt from the reply
-// guard — triage overviews / cross-issue coordination legitimately list issue
-// numbers there. DISCORD_CORE_CHANNEL is injected per-pane by claude-lead.sh,
-// derived strictly from the project's generalChannel (the SAME source the Bridge
-// uses). Empty/unset → no core configured → never matches (no exemption).
-// Pure, side-effect-free.
-function isCoreChannel(chatId: string): boolean {
-  const core = process.env.DISCORD_CORE_CHANNEL
-  return !!core && chatId === core
-}
-
-interface GuardDeny {
-  allow: false
-  reason?: string
-  issues?: string[]
-  guidance?: string
-}
+const replyGuard = createReplyGuardClient()
 
 async function callReplyGuard(
   chatId: string,
   text: string,
   opts?: { roundtableThread?: boolean },
-): Promise<GuardDeny | null> {
-  const bridgeUrl = process.env.BRIDGE_URL
-  const apiToken = process.env.TEAMLEAD_API_TOKEN
-  const leadId = process.env.LEAD_ID
-  const projectName = process.env.PROJECT_NAME
-  // Not wired (running outside a Flywheel Lead) -> guard disabled (fail open).
-  if (!bridgeUrl || !apiToken || !leadId || !projectName) return null
-
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 1500)
-  try {
-    const res = await fetch(`${bridgeUrl}/api/discord/reply-guard`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiToken}`,
-      },
-      body: JSON.stringify({ projectName, leadId, chatId, text }),
-      signal: controller.signal,
-    })
-    // A 404 means this Bridge has no reply-guard route at all — i.e. the
-    // guard is not deployed here (e.g. a Bridge running code from before the
-    // route existed). That is NOT a transient outage, so fail OPEN regardless
-    // of token content: this keeps the plugin safe to deploy globally even
-    // before/independently of the Bridge route, and avoids blocking replies
-    // against a Bridge that was never meant to enforce. (When the guard IS
-    // deployed but disabled, the route returns 200 {allow:true}, not 404.)
-    if (res.status === 404) return null
-    // Other non-OK responses (5xx, 429, etc.) mean the Bridge is present but
-    // erroring — fall through to the catch's fail-closed-on-issue-token path.
-    if (!res.ok) throw new Error(`guard HTTP ${res.status}`)
-    const decision = (await res.json()) as {
-      allow?: boolean
-      reason?: string
-      issues?: string[]
-      guidance?: string
-    }
-    if (decision && decision.allow === false) {
-      return {
-        allow: false,
-        reason: decision.reason,
-        issues: decision.issues,
-        guidance: decision.guidance,
-      }
-    }
-    return null // allow (includes allow=true soft-telemetry responses)
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    // FLY-173: core channel is always exempt — even when the Bridge is down it
-    // must not re-block Simba's core triage. Checked BEFORE the issue-token
-    // fail-closed branch. (Healthy path stays Bridge-authoritative: the Bridge
-    // route returns allow for core via its generalChannel classification, so we
-    // only need this in the Bridge-unavailable catch path — no normal-path
-    // short-circuit, no plugin/Bridge divergence.)
-    if (isCoreChannel(chatId)) {
-      process.stderr.write(
-        `[reply-guard] Bridge unavailable (${msg}); fail-open on core channel (FLY-173)\n`,
-      )
-      return null
-    }
-    // FLY-314 R1#3: a roundtable topic thread is also fail-open — its discussion
-    // legitimately carries FLY/GEO ids and a transient Bridge outage must not block
-    // it. Same shape as the core-channel exemption; healthy path stays
-    // Bridge-authoritative (the Bridge classifies an unregistered roundtable thread
-    // as "other" → allow), so this only matters in the Bridge-unavailable catch path.
-    if (opts?.roundtableThread) {
-      process.stderr.write(
-        `[reply-guard] Bridge unavailable (${msg}); fail-open on roundtable topic thread (FLY-314)\n`,
-      )
-      return null
-    }
-    if (localHasIssueToken(text)) {
-      process.stderr.write(
-        `[reply-guard] Bridge unavailable (${msg}); fail-closed on issue-bearing text\n`,
-      )
-      return {
-        allow: false,
-        reason: 'guard_unavailable',
-        guidance:
-          'Bridge routing guard unavailable; do not post issue content at the chat-channel top level — use POST /api/chat-threads/send when the Bridge is healthy.',
-      }
-    }
-    process.stderr.write(
-      `[reply-guard] Bridge unavailable (${msg}); fail-open on free-form text\n`,
-    )
-    return null
-  } finally {
-    clearTimeout(timer)
+): Promise<GuardOutcome | null> {
+  const outcome = await replyGuard.evaluate(chatId, text, opts)
+  if (outcome.kind === 'unavailable' || outcome.kind === 'unauthorized') {
+    process.stderr.write(`[reply-guard] ${outcome.kind} (${outcome.probe.outcome}); local=${outcome.local?.classification} decision=${outcome.local?.decision}\n`)
   }
+  return outcome.deny ? outcome : null
 }
 
-function guardDenyResult(deny: GuardDeny) {
-  const issues = (deny.issues ?? []).join(', ')
+function guardDenyResult(outcome: GuardOutcome) {
   return {
-    content: [
-      {
-        type: 'text' as const,
-        text: `BLOCKED by routing guard (${deny.reason ?? 'denied'}). Issues: ${issues}. ${deny.guidance ?? ''}`.trim(),
-      },
-    ],
+    content: [{ type: 'text' as const, text: formatGuardDeny(outcome) }],
     isError: true,
   }
 }
