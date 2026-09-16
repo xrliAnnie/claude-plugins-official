@@ -50,6 +50,7 @@ export function attachSelfAuthorFilter<T extends { author: { id: string } }>(
   client.on('ready', ready)
   client.on('clientReady', ready)
   client.on('shardResume', ready)
+  client.on('shardReady', ready)
   for (const event of ['shardDisconnect', 'shardReconnecting', 'invalidated']) client.on(event, () => filter.disconnected())
   client.on('messageCreate', (msg: T) => {
     filter.checkCurrent(client.user?.id, client.isReady())

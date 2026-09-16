@@ -23,6 +23,11 @@ it('rejects unknown/disconnected identity and a changed ID after ready', () => {
  f.client.user = { id: '100000000000000099' }; f.client.emit('ready', f.client); f.emit('founder')
  expect(f.filter.observe(true).ready).toBe(false); expect(f.received).toEqual(['founder'])
 })
+it('rearms intake when a fresh shard identify becomes ready', () => {
+ const f = fixture(); f.client.user = { id: bot }; f.client.emit('ready', f.client)
+ f.client.emit('shardReconnecting', 0); f.client.emit('shardReady', 0, new Set<string>()); f.emit('founder')
+ expect(f.received).toEqual(['founder'])
+})
 it('keeps voice unavailable in broken/legacy mode without bypassing self guard', () => {
  const f = fixture(); f.client.user = { id: bot }; f.client.emit('ready', f.client)
  expect(f.filter.observe(false).ready).toBe(false); f.emit(bot); expect(f.received).toEqual([])
