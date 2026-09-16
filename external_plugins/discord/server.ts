@@ -86,6 +86,8 @@ import {
 import { GatewayHealthFiles } from './gateway-health-files'
 import { inspectRawShardReconnect } from './gateway-reconnect'
 import { attachGatewayLifecycleEvents } from './gateway-wiring'
+import { SelfAuthorFilter, attachSelfAuthorFilter } from './self-author-filter'
+import { VoiceSelfFilterSocket } from './voice-self-filter-socket'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -505,6 +507,17 @@ const client = new Client({
   // DMs arrive as partial channels — messageCreate never fires without this.
   partials: [Partials.Channel],
 })
+
+const selfAuthorFilter = new SelfAuthorFilter()
+const voiceSelfFilterSocket = RECORDER_MODE.kind === 'enabled' ? new VoiceSelfFilterSocket({
+  socketPath: join(STATE_DIR, 'voice-self-filter.sock'),
+  leadId: RECORDER_MODE.leadId,
+  secret: TOKEN,
+  observe: () => {
+    selfAuthorFilter.checkCurrent(client.user?.id, client.isReady())
+    return selfAuthorFilter.observe(RECORDER_MODE.kind === 'enabled')
+  },
+}) : undefined
 
 const gatewayHealthFiles = new GatewayHealthFiles({ stateDir: STATE_DIR })
 const gatewayFailureAlerter = new GatewayFailureAlerter({
@@ -1455,7 +1468,8 @@ function shutdown(): void {
   shuttingDown = true
   process.stderr.write('discord channel: shutting down\n')
   setTimeout(() => process.exit(0), 2000)
-  void Promise.resolve(client.destroy()).finally(() => process.exit(0))
+  selfAuthorFilter.disconnected()
+  void Promise.allSettled([Promise.resolve(client.destroy()), voiceSelfFilterSocket?.close()]).finally(() => process.exit(0))
 }
 process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)
@@ -1594,17 +1608,15 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     .catch(() => {})
 })
 
-client.on('messageCreate', msg => {
-  // Never process our own messages — prevents typing keepalive re-trigger on reply echo.
-  if (msg.author.id === client.user?.id) {
-    gatewayHealth.onSelfEcho(msg.id, msg.channelId)
-    return
-  }
-  if (msg.author.bot) {
-    const access = loadAccess()
-    if (!access.allowBots?.includes(msg.author.id)) return
-  }
-  handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
+attachSelfAuthorFilter<Message>(client, selfAuthorFilter, {
+  onSelfEcho: msg => { gatewayHealth.onSelfEcho(msg.id, msg.channelId) },
+  onOther: msg => {
+    if (msg.author.bot) {
+      const access = loadAccess()
+      if (!access.allowBots?.includes(msg.author.id)) return
+    }
+    handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
+  },
 })
 
 async function handleInbound(msg: Message): Promise<void> {
@@ -1821,6 +1833,13 @@ client.once('ready', c => {
   initializeRawShardReconnect()
   chatIngestRuntime.kickWorker()
 })
+
+if (voiceSelfFilterSocket) {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+  await voiceSelfFilterSocket.listen().catch(() => {
+    process.stderr.write('discord voice self-filter probe unavailable; voice admission remains closed\n')
+  })
+}
 
 client.login(TOKEN).catch(err => {
   process.stderr.write(`discord channel: login failed: ${err}\n`)
