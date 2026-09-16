@@ -1,6 +1,7 @@
-import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
-import { chmodSync, lstatSync, unlinkSync } from 'node:fs'
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
+import { chmodSync, linkSync, lstatSync, unlinkSync } from 'node:fs'
 import { createServer, type Server, type Socket } from 'node:net'
+import { dirname, join } from 'node:path'
 import type { SelfFilterObservation } from './self-author-filter'
 const LIMIT = 4096
 const hex = /^[a-f0-9]{64}$/
@@ -9,6 +10,7 @@ const hex = /^[a-f0-9]{64}$/
 export class VoiceSelfFilterSocket {
   private server?: Server
   private bound?: { dev: number; ino: number }
+  private listenPath?: string
   private readonly peers = new Set<Socket>()
   private readonly runtimeId = randomUUID()
   constructor(private readonly opts: { socketPath: string; leadId: string; secret: string; observe(): SelfFilterObservation }) {
@@ -18,15 +20,23 @@ export class VoiceSelfFilterSocket {
     if (this.server) return
     try { lstatSync(this.opts.socketPath); throw new Error('voice_self_filter_path_exists') }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+    // Bun on Linux unlinks its listen pathname during close, before user cleanup.
+    // Bind a private unique name and publish an exclusive hard link. Runtime
+    // cleanup can then touch only the private name; public cleanup is inode-guarded.
+    const privatePath = join(dirname(this.opts.socketPath), `.v${randomBytes(6).toString('hex')}`)
     const server = createServer({ allowHalfOpen: true }, peer => this.accept(peer))
     await new Promise<void>((resolve, reject) => {
       server.once('error', reject)
-      server.listen(this.opts.socketPath, () => { server.removeListener('error', reject); resolve() })
+      server.listen(privatePath, () => { server.removeListener('error', reject); resolve() })
     })
     this.server = server
-    const stat = lstatSync(this.opts.socketPath)
+    this.listenPath = privatePath
+    const stat = lstatSync(privatePath)
     this.bound = { dev: stat.dev, ino: stat.ino }
-    try { chmodSync(this.opts.socketPath, 0o600) } catch (error) { await this.close(); throw error }
+    try {
+      chmodSync(privatePath, 0o600)
+      linkSync(privatePath, this.opts.socketPath)
+    } catch (error) { await this.close(); throw error }
   }
   async close(): Promise<void> {
     const server = this.server
@@ -34,10 +44,14 @@ export class VoiceSelfFilterSocket {
     this.server = undefined
     for (const peer of this.peers) peer.destroy()
     await new Promise<void>(resolve => server.close(() => resolve()))
-    try {
-      const stat = lstatSync(this.opts.socketPath)
-      if (stat.isSocket() && stat.dev === this.bound?.dev && stat.ino === this.bound?.ino) unlinkSync(this.opts.socketPath)
-    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+    for (const path of [this.opts.socketPath, this.listenPath]) {
+      if (!path) continue
+      try {
+        const stat = lstatSync(path)
+        if (stat.isSocket() && stat.dev === this.bound?.dev && stat.ino === this.bound?.ino) unlinkSync(path)
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+    }
+    this.listenPath = undefined
     this.bound = undefined
   }
   private accept(peer: Socket): void {

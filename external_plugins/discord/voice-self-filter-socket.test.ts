@@ -1,7 +1,7 @@
 import { afterEach, expect, it } from 'bun:test'
-import { mkdtempSync, rmSync, lstatSync, symlinkSync, writeFileSync, readFileSync, unlinkSync } from 'node:fs'
+import { mkdtempSync, rmSync, readdirSync, lstatSync, symlinkSync, writeFileSync, readFileSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
 import { createConnection } from 'node:net'
 import { createHmac } from 'node:crypto'
 import { VoiceSelfFilterSocket } from './voice-self-filter-socket'
@@ -65,4 +65,10 @@ it('serves a Node Bridge client over newline framing without requiring EOF', asy
  peer.on('error',()=>process.exit(3));`
  const raw = await new Promise<string>((resolve, reject) => execFile('node', ['--input-type=module', '-e', script, socketPath, JSON.stringify(request())], { timeout: 5000 }, (error, stdout) => error ? reject(error) : resolve(stdout)))
  expect(JSON.parse(raw)).toMatchObject({ ready: true, botUserId: bot, leadId })
+})
+
+it('closes both owned socket links without leaving a private bind path', async () => {
+ const { server, socketPath } = await start()
+ await server.close(); await server.close()
+ expect(readdirSync(dirname(socketPath))).toEqual([])
 })

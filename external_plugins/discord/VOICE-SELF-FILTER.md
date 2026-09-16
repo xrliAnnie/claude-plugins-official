@@ -17,7 +17,9 @@ file, capability flag or old receipt does not constitute a live proof.
 The socket is mode 0600. Existing paths (including symlinks and unproven stale
 sockets) are never taken over. Bind failure keeps ordinary messaging running but
 voice admission unavailable. Shutdown only removes the bound socket identity;
-it preserves replacement paths. No Discord REST requests or mailbox writes occur
+it preserves replacement paths. The runtime binds a private unique name and
+publishes an exclusive hard link, so Bun's Linux automatic unlink on close cannot
+remove a replacement at the public pathname. No Discord REST requests or mailbox writes occur
 inside the probe.
 
 This change does not install or reload any production plugin. Deployment must
