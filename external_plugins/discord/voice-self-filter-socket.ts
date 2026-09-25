@@ -18,6 +18,50 @@ const LIMIT = 4096
 const hex = /^[a-f0-9]{64}$/
 const privateSocketName = /^\.v[0-9a-f]{12}$/
 
+function mac(value: string, secret: string): string {
+  return createHmac('sha256', secret).update(value).digest('hex')
+}
+
+export function voiceSelfFilterRequestAuth(
+  input: { leadId: string; expectedBotUserId: string; nonce: string },
+  secret: string,
+): string {
+  return mac(JSON.stringify([
+    1,
+    'voice-self-filter-v1',
+    input.leadId,
+    input.expectedBotUserId,
+    input.nonce,
+  ]), secret)
+}
+
+export function voiceSelfFilterResponseAuth(
+  input: {
+    version: number
+    leadId: string
+    botUserId: string
+    runtimeId: string
+    nonce: string
+    ready: boolean
+    selfDropped: boolean
+    unknownDropped: boolean
+    otherPassed: boolean
+  },
+  secret: string,
+): string {
+  return mac(JSON.stringify([
+    input.version,
+    input.leadId,
+    input.botUserId,
+    input.runtimeId,
+    input.nonce,
+    input.ready,
+    input.selfDropped,
+    input.unknownDropped,
+    input.otherPassed,
+  ]), secret)
+}
+
 export interface OwnerLock {
   close(): void
 }
@@ -373,13 +417,7 @@ export class VoiceSelfFilterSocket {
             'auth',
           ].includes(k))
         ) throw new Error('invalid_request')
-        const signature = this.mac(JSON.stringify([
-          1,
-          'voice-self-filter-v1',
-          request.leadId,
-          request.expectedBotUserId,
-          request.nonce,
-        ]))
+        const signature = voiceSelfFilterRequestAuth(request, this.opts.secret)
         if (!timingSafeEqual(
           Buffer.from(signature, 'hex'),
           Buffer.from(request.auth, 'hex'),
@@ -391,17 +429,7 @@ export class VoiceSelfFilterSocket {
           nonce: request.nonce,
           ...this.opts.observe(),
         }
-        const auth = this.mac(JSON.stringify([
-          1,
-          result.leadId,
-          result.botUserId,
-          result.runtimeId,
-          result.nonce,
-          result.ready,
-          result.selfDropped,
-          result.unknownDropped,
-          result.otherPassed,
-        ]))
+        const auth = voiceSelfFilterResponseAuth(result, this.opts.secret)
         const reply = JSON.stringify({ ...result, auth }) + '\n'
         if (Buffer.byteLength(reply) > LIMIT) throw new Error('invalid_observation')
         peer.end(reply)
@@ -422,9 +450,5 @@ export class VoiceSelfFilterSocket {
       if (raw.includes('\n')) respond(raw)
     })
     peer.once('end', () => respond(Buffer.concat(chunks).toString('utf8')))
-  }
-
-  private mac(value: string): string {
-    return createHmac('sha256', this.opts.secret).update(value).digest('hex')
   }
 }
