@@ -1841,7 +1841,9 @@ client.once('ready', c => {
 
 if (voiceSelfFilterSocket) {
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-  await voiceSelfFilterSocket.listen().catch(() => {
+  void voiceSelfFilterSocket.maintain({
+    report: state => { gatewayHealthFiles.log(`voice self-filter probe ${state}`) },
+  }).catch(() => {
     process.stderr.write('discord voice self-filter probe unavailable; voice admission remains closed\n')
   })
 }
