@@ -508,18 +508,22 @@ const client = new Client({
   partials: [Partials.Channel],
 })
 
-const selfAuthorFilter = new SelfAuthorFilter()
+const gatewayHealthFiles = new GatewayHealthFiles({ stateDir: STATE_DIR })
+const selfAuthorFilter = new SelfAuthorFilter(undefined, seen => {
+  process.stderr.write(`discord self-filter identity changed to ${seen}; intake closed\n`)
+  gatewayHealthFiles.log('self-filter identity changed; intake closed')
+})
 const voiceSelfFilterSocket = RECORDER_MODE.kind === 'enabled' ? new VoiceSelfFilterSocket({
   socketPath: join(STATE_DIR, 'voice-self-filter.sock'),
   leadId: RECORDER_MODE.leadId,
   secret: TOKEN,
-  observe: () => {
-    selfAuthorFilter.checkCurrent(client.user?.id, client.isReady())
-    return selfAuthorFilter.observe(RECORDER_MODE.kind === 'enabled')
-  },
+  observe: () => selfAuthorFilter.observe({
+    recorderEnabled: RECORDER_MODE.kind === 'enabled',
+    currentUserId: client.user?.id,
+    clientReady: client.isReady(),
+  }),
 }) : undefined
 
-const gatewayHealthFiles = new GatewayHealthFiles({ stateDir: STATE_DIR })
 const gatewayFailureAlerter = new GatewayFailureAlerter({
   alertChannelId: process.env.DISCORD_ALERT_CHANNEL,
   // The client's REST manager already owns DISCORD_BOT_TOKEN after login. This
@@ -1610,6 +1614,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 
 attachSelfAuthorFilter<Message>(client, selfAuthorFilter, {
   onSelfEcho: msg => { gatewayHealth.onSelfEcho(msg.id, msg.channelId) },
+  log: message => { gatewayHealthFiles.log(message) },
   onOther: msg => {
     if (msg.author.bot) {
       const access = loadAccess()
