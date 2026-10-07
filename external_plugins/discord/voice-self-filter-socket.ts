@@ -129,100 +129,77 @@ export class VoiceSelfFilterSocket {
     if (acquired === 'busy') return { status: 'busy' }
     if (acquired === 'blocked') return { status: 'blocked', reason: 'lock_unsafe' }
     const ownerLock = acquired
+    let server: Server | undefined
+    let privatePath: string | undefined
+    let bound: { dev: number; ino: number } | undefined
+    let retained = false
     let reclaimedStale = false
-
-    const blocked = (reason: string): VoiceSelfFilterListenResult => {
-      ownerLock.close()
-      return { status: 'blocked', reason }
-    }
-    const uid = this.opts.getuid?.() ?? process.getuid?.()
-    if (uid === undefined) return blocked('lock_unsafe')
-
+    const blocked = (reason: string): VoiceSelfFilterListenResult => ({ status: 'blocked', reason })
     try {
-      const publicStat = lstatSync(this.opts.socketPath)
-      if (publicStat.isSymbolicLink()) return blocked('path_symlink')
-      if (!publicStat.isSocket()) return blocked('path_not_socket')
-      if (publicStat.uid !== uid) return blocked('path_foreign_owner')
-      unlinkSync(this.opts.socketPath)
-      reclaimedStale = true
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        return blocked('path_scan_failed')
+      const uid = this.opts.getuid?.() ?? process.getuid?.()
+      if (uid === undefined) return blocked('lock_unsafe')
+      try {
+        const publicStat = lstatSync(this.opts.socketPath)
+        if (publicStat.isSymbolicLink()) return blocked('path_symlink')
+        if (!publicStat.isSocket()) return blocked('path_not_socket')
+        if (publicStat.uid !== uid) return blocked('path_foreign_owner')
+        unlinkSync(this.opts.socketPath)
+        reclaimedStale = true
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return blocked('path_scan_failed')
       }
-    }
-
-    try {
-      const stateDir = dirname(this.opts.socketPath)
-      const stalePrivateNames = readdirSync(stateDir)
-        .filter(name => privateSocketName.test(name))
-        .slice(0, 64)
-      for (const name of stalePrivateNames) {
-        const stalePath = join(stateDir, name)
-        try {
-          const stat = lstatSync(stalePath)
-          if (stat.isSocket() && stat.uid === uid) {
-            unlinkSync(stalePath)
-            reclaimedStale = true
-          }
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-            return blocked('path_scan_failed')
+      try {
+        const stateDir = dirname(this.opts.socketPath)
+        const stalePrivateNames = readdirSync(stateDir).filter(name => privateSocketName.test(name)).slice(0, 64)
+        for (const name of stalePrivateNames) {
+          const stalePath = join(stateDir, name)
+          try {
+            const stat = lstatSync(stalePath)
+            if (stat.isSocket() && stat.uid === uid) { unlinkSync(stalePath); reclaimedStale = true }
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return blocked('path_scan_failed')
           }
         }
-      }
-    } catch {
-      return blocked('path_scan_failed')
-    }
-
-    const privatePath = join(
-      dirname(this.opts.socketPath),
-      '.v' + randomBytes(6).toString('hex'),
-    )
-    const server = createServer({ allowHalfOpen: true }, peer => this.accept(peer))
-    const listenError = await new Promise<unknown>(resolve => {
-      const onError = (error: unknown) => { resolve(error) }
-      server.once('error', onError)
-      server.listen(privatePath, () => {
-        server.removeListener('error', onError)
-        resolve(undefined)
+      } catch { return blocked('path_scan_failed') }
+      privatePath = join(dirname(this.opts.socketPath), '.v' + randomBytes(6).toString('hex'))
+      server = createServer({ allowHalfOpen: true }, peer => this.accept(peer))
+      const candidate = server
+      const listenError = await new Promise<unknown>(resolve => {
+        const onError = (error: unknown) => { resolve(error) }
+        candidate.once('error', onError)
+        candidate.listen(privatePath!, () => { candidate.removeListener('error', onError); resolve(undefined) })
       })
-    })
-    if (listenError) {
-      ownerLock.close()
-      return { status: 'blocked', reason: 'bind_failed' }
-    }
-
-    const stat = lstatSync(privatePath)
-    const bound = { dev: stat.dev, ino: stat.ino }
-    try {
-      chmodSync(privatePath, 0o600)
-      linkSync(privatePath, this.opts.socketPath)
-    } catch (error) {
+      if (listenError) return blocked('bind_failed')
+      const stat = lstatSync(privatePath)
+      bound = { dev: stat.dev, ino: stat.ino }
       try {
-        await this.closeUnpublished(server, privatePath, bound)
-      } finally {
-        ownerLock.close()
+        chmodSync(privatePath, 0o600)
+        linkSync(privatePath, this.opts.socketPath)
+      } catch (error) {
+        return blocked((error as NodeJS.ErrnoException).code === 'EEXIST' ? 'path_raced' : 'bind_failed')
       }
-      return {
-        status: 'blocked',
-        reason: (error as NodeJS.ErrnoException).code === 'EEXIST'
-          ? 'path_raced'
-          : 'bind_failed',
+      this.server = server
+      this.listenPath = privatePath
+      this.bound = bound
+      this.ownerLock = ownerLock
+      retained = true
+      return { status: 'bound', reclaimedStale }
+    } finally {
+      // Until ownership is transferred, every return/exception releases both
+      // resources. Cleanup errors must never skip listener close or lock release.
+      if (!retained) {
+        try {
+          if (server && privatePath) await this.closeUnpublished(server, privatePath, bound)
+        } finally { ownerLock.close() }
       }
     }
-
-    this.server = server
-    this.listenPath = privatePath
-    this.bound = bound
-    this.ownerLock = ownerLock
-    return { status: 'bound', reclaimedStale }
   }
 
   async maintain(options: MaintainOptions): Promise<void> {
     if (this.maintaining) return
     this.maintaining = true
     this.maintainOptions = options
-    await this.ensureMaintained()
+    await this.ensureMaintainedSafely()
   }
 
   async close(): Promise<void> {
@@ -303,14 +280,15 @@ export class VoiceSelfFilterSocket {
       const timer = setTimeout(() => { void run() }, delay)
       return timer
     })
-    schedule(async () => {
-      try {
-        await this.ensureMaintained()
-      } catch {
-        this.report('blocked:internal_error')
-        this.schedule(5000)
-      }
-    }, delayMs).unref()
+    schedule(() => this.ensureMaintainedSafely(), delayMs).unref()
+  }
+
+  private async ensureMaintainedSafely(): Promise<void> {
+    try { await this.ensureMaintained() }
+    catch {
+      this.report('blocked:internal_error')
+      this.schedule(5000)
+    }
   }
 
   private report(state: string): void {
@@ -364,10 +342,13 @@ export class VoiceSelfFilterSocket {
   private async closeUnpublished(
     server: Server,
     privatePath: string,
-    bound: { dev: number; ino: number },
+    bound: { dev: number; ino: number } | undefined,
   ): Promise<void> {
-    this.unlinkOwned(privatePath, bound)
-    await new Promise<void>(resolve => { server.close(() => resolve()) })
+    try { this.unlinkOwned(privatePath, bound) }
+    finally {
+      for (const peer of this.peers) peer.destroy()
+      await new Promise<void>(resolve => { server.close(() => resolve()) })
+    }
   }
 
   private unlinkOwned(
