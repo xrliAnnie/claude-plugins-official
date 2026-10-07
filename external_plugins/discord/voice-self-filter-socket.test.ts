@@ -1,4 +1,6 @@
-import { afterEach, expect, it } from 'bun:test'
+import { afterEach, expect, it, spyOn } from 'bun:test'
+import * as fs from 'node:fs'
+import * as net from 'node:net'
 import {
  lstatSync,
  mkdtempSync,
@@ -302,4 +304,85 @@ it('fails closed once on unsupported platforms without acquiring or observing', 
  expect(observed).toBe(0)
  expect(stderr).toEqual(['voice self-filter probe unsupported on linux; voice admission remains closed\n'])
  expect(readdirSync(dirname(socketPath))).toEqual([])
+})
+
+
+it('retries a first maintain exception and stops retrying after close', async () => {
+ const socketPath = path()
+ const scheduler = manualScheduler()
+ const states: string[] = []
+ let first = true
+ let released = 0
+ const server = new VoiceSelfFilterSocket({ socketPath, leadId, secret, observe: observation, platform: 'darwin',
+  acquireOwnerLock: () => { if (first) { first = false; throw new Error('initial failure') } return fakeOwnerLock(() => { released++ }) },
+ })
+ cleanup.push(() => server.close())
+ await expect(server.maintain({ report: state => { states.push(state) }, schedule: scheduler.schedule })).resolves.toBeUndefined()
+ expect(states).toEqual(['blocked:internal_error'])
+ expect(scheduler.queue).toHaveLength(1)
+ expect(scheduler.queue[0]?.delay).toBe(5000)
+ await server.maintain({ report: () => { throw new Error('duplicate maintain') }, schedule: scheduler.schedule })
+ expect(scheduler.queue).toHaveLength(1)
+ await scheduler.queue.shift()?.run()
+ expect(states).toEqual(['blocked:internal_error', 'bound'])
+ expect((await send(socketPath, request())).ready).toBe(true)
+ await server.close()
+ expect(released).toBe(1)
+ await scheduler.queue.shift()?.run()
+ expect(readdirSync(dirname(socketPath))).toEqual([])
+})
+
+it('releases an acquired owner lock when identity lookup throws before bind', async () => {
+ const socketPath = path()
+ let released = 0
+ let first = true
+ const server = new VoiceSelfFilterSocket({ socketPath, leadId, secret, observe: observation, ...fakeLockOptions(() => { released++ }),
+  getuid: () => { if (first) { first = false; throw new Error('uid failed') } return process.getuid?.() ?? 0 },
+ })
+ cleanup.push(() => server.close())
+ await expect(server.listen()).rejects.toThrow('uid failed')
+ expect(released).toBe(1)
+ expect(await server.listen()).toMatchObject({ status: 'bound' })
+ expect((await send(socketPath, request())).ready).toBe(true)
+})
+
+it.each(['post-bind-stat', 'unpublished-unlink'])('closes listener and releases lock after %s failure, then maintain retries', async (failure) => {
+ const socketPath = path()
+ const scheduler = manualScheduler()
+ const states: string[] = []
+ let released = 0
+ const servers: net.Server[] = []
+ const create = net.createServer
+ const stat = fs.lstatSync
+ const link = fs.linkSync
+ const unlink = fs.unlinkSync
+ const createSpy = spyOn(net, 'createServer').mockImplementation((...args: any[]) => { const server = (create as any)(...args); servers.push(server); return server })
+ cleanup.push(() => createSpy.mockRestore())
+ // Close even an original-code leaked listener so the red test itself exits.
+ cleanup.push(async () => { for (const server of servers) if (server.listening) await new Promise<void>(resolve => server.close(() => resolve())) })
+ let once = true
+ let unlinkFailed = false
+ const statSpy = spyOn(fs, 'lstatSync').mockImplementation((name: any, ...args: any[]) => {
+  if (failure === 'post-bind-stat' && once && /\.v[0-9a-f]{12}$/.test(String(name))) { once = false; throw Object.assign(new Error('stat failed'), { code: 'EIO' }) }
+  return (stat as any)(name, ...args)
+ })
+ const linkSpy = spyOn(fs, 'linkSync').mockImplementation((...args: any[]) => {
+  if (failure === 'unpublished-unlink' && once) { once = false; unlinkFailed = true; throw Object.assign(new Error('link failed'), { code: 'EACCES' }) }
+  return (link as any)(...args)
+ })
+ const unlinkSpy = spyOn(fs, 'unlinkSync').mockImplementation((name: any) => {
+  if (unlinkFailed && /\.v[0-9a-f]{12}$/.test(String(name))) { unlinkFailed = false; throw Object.assign(new Error('unlink failed'), { code: 'EACCES' }) }
+  return unlink(name)
+ })
+ cleanup.push(() => { statSpy.mockRestore(); linkSpy.mockRestore(); unlinkSpy.mockRestore() })
+ const server = new VoiceSelfFilterSocket({ socketPath, leadId, secret, observe: observation, ...fakeLockOptions(() => { released++ }) })
+ cleanup.push(() => server.close())
+ await expect(server.maintain({ report: state => { states.push(state) }, schedule: scheduler.schedule })).resolves.toBeUndefined()
+ expect(states).toEqual(['blocked:internal_error'])
+ expect(released).toBe(1)
+ expect(servers[0]?.listening).toBe(false)
+ expect(scheduler.queue[0]?.delay).toBe(5000)
+ await scheduler.queue.shift()?.run()
+ expect(states.at(-1)).toBe('bound')
+ expect((await send(socketPath, request())).ready).toBe(true)
 })
