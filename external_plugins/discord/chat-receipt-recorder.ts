@@ -1,3 +1,12 @@
+import {
+  chatDeliveryId,
+  normalizeChatDeliveryEnvelope,
+  normalizeChatDeliveryAttachments,
+  normalizeChatDeliveryReplyTo,
+  normalizeChatDeliveryReplyRoute,
+} from './shared-chat-delivery-envelope'
+import { assertUtcIsoTimestamp } from './shared-discord-utc-timestamp'
+
 export type RecorderMode =
   | {
       kind: 'enabled'
@@ -200,7 +209,9 @@ export function buildBeginArgs(
       : routing.routedToRoundtable || routing.inRoundtableThread
         ? 'roundtable'
         : 'guild'
-  return {
+  const envelope = normalizeChatDeliveryEnvelope({
+    v: 1,
+    deliveryId: chatDeliveryId(routing.leadId, msg.messageId),
     leadId: routing.leadId,
     chatId: msgField(routing.chatId, 'chatId'),
     replyChannelId: msgField(routing.chatId, 'replyChannelId'),
@@ -215,7 +226,9 @@ export function buildBeginArgs(
     attachments: normalizeAttachments(msg.attachments),
     ...(msg.replyTo === undefined ? {} : { replyTo: normalizeReplyTo(msg.replyTo) }),
     text: stringValue(msg.text, 'text'),
-  }
+  })
+  const { v: _version, deliveryId: _deliveryId, ...begin } = envelope
+  return begin
 }
 
 export function encodeSpoolIntent(intent: SpoolIntentV1): string {
@@ -440,61 +453,15 @@ function normalizeBeginArgs(value: unknown): BeginArgs {
 }
 
 function normalizeReplyTo(value: unknown): DiscordReplyReference {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('replyTo must be an object')
-  const reference = value as Record<string, unknown>
-  return {
-    messageId: msgField(reference.messageId, 'replyTo.messageId'),
-    channelId: msgField(reference.channelId, 'replyTo.channelId'),
-    ...(reference.authorId === undefined ? {} : { authorId: msgField(reference.authorId, 'replyTo.authorId') }),
-  }
+  return normalizeChatDeliveryReplyTo(value)
 }
 
 function normalizeReplyRoute(value: unknown): DiscordReplyRoute {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('replyRoute must be an object')
-  }
-  const route = value as Record<string, unknown>
-  if (route.kind !== 'roundtable_thread_from_message') {
-    throw new Error('replyRoute.kind is invalid')
-  }
-  return {
-    kind: route.kind,
-    parentChannelId: msgField(route.parentChannelId, 'replyRoute.parentChannelId'),
-    sourceMessageId: msgField(route.sourceMessageId, 'replyRoute.sourceMessageId'),
-    threadId: msgField(route.threadId, 'replyRoute.threadId'),
-    ...(route.threadName === undefined
-      ? {}
-      : { threadName: requiredString(route.threadName, 'replyRoute.threadName') }),
-  }
+  return normalizeChatDeliveryReplyRoute(value)
 }
 
 function normalizeAttachments(value: unknown): DeliveryAttachment[] {
-  if (!Array.isArray(value)) throw new Error('attachments must be an array')
-  return value.map((entry, index) => {
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
-      throw new Error(`attachments[${index}] must be an object`)
-    }
-    const attachment = entry as Record<string, unknown>
-    const validId = isSnowflake(attachment.attachmentId)
-    const invalid = (attachment.attachmentId !== undefined && !validId) ||
-      (validId && attachment.unavailableReason !== undefined) ||
-      (attachment.unavailableReason !== undefined && attachment.unavailableReason !== 'producer_identity_missing')
-    if (
-      typeof attachment.sizeKb !== 'number' ||
-      !Number.isFinite(attachment.sizeKb) ||
-      attachment.sizeKb < 0
-    ) {
-      throw new Error(`attachments[${index}].sizeKb must be non-negative`)
-    }
-    return {
-      name: requiredString(attachment.name, `attachments[${index}].name`),
-      type: requiredString(attachment.type, `attachments[${index}].type`),
-      sizeKb: attachment.sizeKb,
-      ...(!invalid && validId && attachment.unavailableReason === undefined ? { attachmentId: attachment.attachmentId as string } : {}),
-      ...(invalid ? { unavailableReason: 'invalid_metadata' as const } :
-        attachment.unavailableReason === 'producer_identity_missing' ? { unavailableReason: 'producer_identity_missing' as const } : {}),
-    }
-  })
+  return normalizeChatDeliveryAttachments(value)
 }
 
 function msgField(value: unknown, field: string): string {
@@ -514,8 +481,6 @@ function stringValue(value: unknown, field: string): string {
 
 function utcTimestamp(value: unknown, field: string): string {
   const parsed = requiredString(value, field)
-  if (!parsed.endsWith('Z') || Number.isNaN(Date.parse(parsed))) {
-    throw new Error(`${field} must be a UTC ISO timestamp`)
-  }
+  assertUtcIsoTimestamp(parsed, field)
   return parsed
 }

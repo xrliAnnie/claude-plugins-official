@@ -31,7 +31,7 @@ const baseMessage = {
   authorName: 'Annie',
   ts: '2026-07-23T05:00:00.000Z',
   text: 'Please inspect the delivery path.',
-  attachments: [{ name: 'trace.png', type: 'image/png', sizeKb: 12 }],
+  attachments: [{ name: 'trace.png', type: 'image/png', sizeKb: 12, unavailableReason: 'producer_identity_missing' as const }],
 }
 
 describe('resolveRecorderMode', () => {
@@ -207,7 +207,7 @@ describe('rejected inbound envelope', () => {
     }))).toThrow('channelKind must be dm or guild')
   })
 
-  it('preserves the message when malformed attachment metadata needs a fallback', () => {
+  it('preserves malformed attachment entries as unavailable metadata without deleting the original message', () => {
     const result = buildRejectedIntentFailClosed(
       {
         ...baseMessage,
@@ -217,10 +217,10 @@ describe('rejected inbound envelope', () => {
       ['FLYWHEEL_COMM_DB'],
       new Date('2026-07-23T05:01:00.000Z'),
     )
-    expect(result.repairError).toContain('attachments[0].name is required')
+    expect(result.repairError).toBeUndefined()
     expect(result.intent.inbound).toEqual({
       ...baseMessage,
-      attachments: [],
+      attachments: [{ name: 'attachment', type: 'image/png', sizeKb: 12, unavailableReason: 'invalid_metadata' }],
     })
   })
 })

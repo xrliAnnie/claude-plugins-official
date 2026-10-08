@@ -46,7 +46,7 @@ const begin: BeginArgs = {
   priority: 0,
   ts: '2026-08-11T05:00:00.000Z',
   msgKind: 'guild',
-  attachments: [{ name: 'trace.png', type: 'image/png', sizeKb: 5 }],
+  attachments: [{ name: 'trace.png', type: 'image/png', sizeKb: 5, unavailableReason: 'producer_identity_missing' }],
   text: 'Please handle this.',
 }
 
