@@ -31,7 +31,7 @@ const baseMessage = {
   authorName: 'Annie',
   ts: '2026-07-23T05:00:00.000Z',
   text: 'Please inspect the delivery path.',
-  attachments: [{ name: 'trace.png', type: 'image/png', sizeKb: 12, unavailableReason: 'producer_identity_missing' as const }],
+  attachments: [{ name: 'trace.png', type: 'image/png', sizeKb: 12 }],
 }
 
 describe('resolveRecorderMode', () => {
@@ -105,22 +105,6 @@ describe('founder identity', () => {
 })
 
 describe('durable ingest envelope', () => {
-  it('keeps attachment identity, fractional byte size and source reply metadata through replay', () => {
-    const message = {
-      ...baseMessage,
-      attachments: [{ attachmentId: '100000000000000030', name: 'trace.png', type: 'image/png', sizeKb: 1.234375 }],
-      replyTo: { messageId: '100000000000000040', channelId: baseMessage.originChannelId, authorId: '100000000000000041' },
-    }
-    const begin = buildBeginArgs(message, { leadId: 'lead-a', chatId: baseMessage.originChannelId,
-      channelKind: 'guild', routedToRoundtable: false, inRoundtableThread: false }, baseMessage.authorId)
-    expect(begin).toMatchObject({ text: message.text, attachments: message.attachments, replyTo: message.replyTo })
-    expect(parseSpoolIntent(encodeSpoolIntent({ v: 1, begin, attempts: 0, advisedAt: null })).begin).toEqual(begin)
-    const rejected = buildRejectedIntent(message, { chatId: baseMessage.originChannelId,
-      channelKind: 'guild', routedToRoundtable: false, inRoundtableThread: false }, ['FLYWHEEL_COMM_DB'], new Date('2026-10-08T07:00:00.000Z'))
-    expect(parseRejectedIntent(encodeRejectedIntent(rejected)).inbound.replyTo).toEqual(message.replyTo)
-    expect(() => buildBeginArgs({ ...message, replyTo: { ...message.replyTo, authorId: 'bad' } },
-      { leadId: 'lead-a', chatId: baseMessage.originChannelId, channelKind: 'guild', routedToRoundtable: false, inRoundtableThread: false })).toThrow('replyTo.authorId')
-  })
   const begin: BeginArgs = buildBeginArgs(
     baseMessage,
     {
@@ -207,7 +191,7 @@ describe('rejected inbound envelope', () => {
     }))).toThrow('channelKind must be dm or guild')
   })
 
-  it('preserves malformed attachment entries as unavailable metadata without deleting the original message', () => {
+  it('preserves the message when malformed attachment metadata needs a fallback', () => {
     const result = buildRejectedIntentFailClosed(
       {
         ...baseMessage,
@@ -217,10 +201,10 @@ describe('rejected inbound envelope', () => {
       ['FLYWHEEL_COMM_DB'],
       new Date('2026-07-23T05:01:00.000Z'),
     )
-    expect(result.repairError).toBeUndefined()
+    expect(result.repairError).toContain('attachments[0].name is required')
     expect(result.intent.inbound).toEqual({
       ...baseMessage,
-      attachments: [{ name: 'attachment', type: 'image/png', sizeKb: 12, unavailableReason: 'invalid_metadata' }],
+      attachments: [],
     })
   })
 })

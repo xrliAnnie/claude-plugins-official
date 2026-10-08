@@ -626,7 +626,6 @@ function ingestFlags(begin: BeginArgs, founderId?: string): string[] {
     ...(founderId ? ['--founder-id', founderId] : []),
     '--reply-channel-id',
     begin.replyChannelId ?? begin.chatId,
-    ...(begin.replyTo ? ['--reply-to-json', JSON.stringify(begin.replyTo)] : []),
     ...(begin.replyRoute
       ? ['--reply-route-json', JSON.stringify(begin.replyRoute)]
       : []),

@@ -1,12 +1,3 @@
-import {
-  chatDeliveryId,
-  normalizeChatDeliveryEnvelope,
-  normalizeChatDeliveryAttachments,
-  normalizeChatDeliveryReplyTo,
-  normalizeChatDeliveryReplyRoute,
-} from './shared-chat-delivery-envelope'
-import { assertUtcIsoTimestamp } from './shared-discord-utc-timestamp'
-
 export type RecorderMode =
   | {
       kind: 'enabled'
@@ -24,14 +15,10 @@ export type RecorderMode =
     }
 
 export interface DeliveryAttachment {
-  attachmentId?: string
   name: string
   type: string
   sizeKb: number
-  unavailableReason?: 'invalid_metadata' | 'producer_identity_missing'
 }
-
-export interface DiscordReplyReference { messageId: string; channelId: string; authorId?: string }
 
 export interface DiscordReplyRoute {
   kind: 'roundtable_thread_from_message'
@@ -49,7 +36,6 @@ export interface InboundMeta {
   ts: string
   text: string
   attachments: DeliveryAttachment[]
-  replyTo?: DiscordReplyReference
 }
 
 export interface RoutingMeta {
@@ -75,7 +61,6 @@ export interface BeginArgs {
   text: string
   replyChannelId?: string
   replyRoute?: DiscordReplyRoute
-  replyTo?: DiscordReplyReference
 }
 
 export interface SpoolIntentV1 {
@@ -209,9 +194,7 @@ export function buildBeginArgs(
       : routing.routedToRoundtable || routing.inRoundtableThread
         ? 'roundtable'
         : 'guild'
-  const envelope = normalizeChatDeliveryEnvelope({
-    v: 1,
-    deliveryId: chatDeliveryId(routing.leadId, msg.messageId),
+  return {
     leadId: routing.leadId,
     chatId: msgField(routing.chatId, 'chatId'),
     replyChannelId: msgField(routing.chatId, 'replyChannelId'),
@@ -224,11 +207,8 @@ export function buildBeginArgs(
     ts: utcTimestamp(msg.ts, 'ts'),
     msgKind,
     attachments: normalizeAttachments(msg.attachments),
-    ...(msg.replyTo === undefined ? {} : { replyTo: normalizeReplyTo(msg.replyTo) }),
     text: stringValue(msg.text, 'text'),
-  })
-  const { v: _version, deliveryId: _deliveryId, ...begin } = envelope
-  return begin
+  }
 }
 
 export function encodeSpoolIntent(intent: SpoolIntentV1): string {
@@ -386,7 +366,6 @@ function normalizeInboundMeta(value: unknown): InboundMeta {
     ts: utcTimestamp(inbound.ts, 'ts'),
     text: stringValue(inbound.text, 'text'),
     attachments: normalizeAttachments(inbound.attachments),
-    ...(inbound.replyTo === undefined ? {} : { replyTo: normalizeReplyTo(inbound.replyTo) }),
   }
 }
 
@@ -447,21 +426,49 @@ function normalizeBeginArgs(value: unknown): BeginArgs {
     ts: utcTimestamp(begin.ts, 'ts'),
     msgKind,
     attachments: normalizeAttachments(begin.attachments),
-    ...(begin.replyTo === undefined ? {} : { replyTo: normalizeReplyTo(begin.replyTo) }),
     text: stringValue(begin.text, 'text'),
   }
 }
 
-function normalizeReplyTo(value: unknown): DiscordReplyReference {
-  return normalizeChatDeliveryReplyTo(value)
-}
-
 function normalizeReplyRoute(value: unknown): DiscordReplyRoute {
-  return normalizeChatDeliveryReplyRoute(value)
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('replyRoute must be an object')
+  }
+  const route = value as Record<string, unknown>
+  if (route.kind !== 'roundtable_thread_from_message') {
+    throw new Error('replyRoute.kind is invalid')
+  }
+  return {
+    kind: route.kind,
+    parentChannelId: msgField(route.parentChannelId, 'replyRoute.parentChannelId'),
+    sourceMessageId: msgField(route.sourceMessageId, 'replyRoute.sourceMessageId'),
+    threadId: msgField(route.threadId, 'replyRoute.threadId'),
+    ...(route.threadName === undefined
+      ? {}
+      : { threadName: requiredString(route.threadName, 'replyRoute.threadName') }),
+  }
 }
 
 function normalizeAttachments(value: unknown): DeliveryAttachment[] {
-  return normalizeChatDeliveryAttachments(value)
+  if (!Array.isArray(value)) throw new Error('attachments must be an array')
+  return value.map((entry, index) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error(`attachments[${index}] must be an object`)
+    }
+    const attachment = entry as Record<string, unknown>
+    if (
+      typeof attachment.sizeKb !== 'number' ||
+      !Number.isFinite(attachment.sizeKb) ||
+      attachment.sizeKb < 0
+    ) {
+      throw new Error(`attachments[${index}].sizeKb must be non-negative`)
+    }
+    return {
+      name: requiredString(attachment.name, `attachments[${index}].name`),
+      type: requiredString(attachment.type, `attachments[${index}].type`),
+      sizeKb: attachment.sizeKb,
+    }
+  })
 }
 
 function msgField(value: unknown, field: string): string {
@@ -481,6 +488,8 @@ function stringValue(value: unknown, field: string): string {
 
 function utcTimestamp(value: unknown, field: string): string {
   const parsed = requiredString(value, field)
-  assertUtcIsoTimestamp(parsed, field)
+  if (!parsed.endsWith('Z') || Number.isNaN(Date.parse(parsed))) {
+    throw new Error(`${field} must be a UTC ISO timestamp`)
+  }
   return parsed
 }

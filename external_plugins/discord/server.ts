@@ -56,12 +56,6 @@ import {
   type RejectedRoutingMeta,
 } from './chat-receipt-recorder'
 import { ChatIngestRuntime } from './chat-receipt-runtime'
-import { probeChatProducerContract, type ChatProducerContractMarker } from './chat-producer-contract'
-import {
-  classifyDiscordInbound,
-  classifyDiscordPermissionReply,
-  type DiscordInboundClassification,
-} from './shared-discord-inbound-classifier'
 import { resolveGroupMentionPatterns } from './mention-patterns'
 import {
   loadRoundtableConfig,
@@ -499,6 +493,7 @@ process.on('uncaughtException', err => {
 // src/services/mcp/channelPermissions.ts — inlined (no CC repo dep).
 // 5 lowercase letters a-z minus 'l'. Case-insensitive for phone autocorrect.
 // Strict: no bare yes/no (conversational), no prefix/suffix chatter.
+const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 const RECENT_SENT_CAP = 200
 
 const client = new Client({
@@ -515,8 +510,6 @@ const client = new Client({
 const gatewayHealthFiles = new GatewayHealthFiles({ stateDir: STATE_DIR })
 let gatewayStatus: GatewayStatusTelemetry | null = null
 let gatewayStatusWarning = ''
-let chatProducerContract: ChatProducerContractMarker | null = null
-let chatProducerContractChecked = false
 function getGatewayStatus(): GatewayStatusTelemetry | null {
   if (!client.user) return null
   try {
@@ -639,12 +632,7 @@ function publishGatewayStatus(): void {
   const status = getGatewayStatus()
   if (!status) return
   try {
-    if (!chatProducerContractChecked) {
-      chatProducerContractChecked = true
-      try { chatProducerContract = probeChatProducerContract() }
-      catch { gatewayHealthFiles.log('chat producer contract fixture unavailable; backup compatibility remains unproven') }
-    }
-    gatewayHealthFiles.writeStatus({ ...status.snapshot(), ...(chatProducerContract ? { chatProducer: chatProducerContract } : {}) }, {
+    gatewayHealthFiles.writeStatus(status.snapshot(), {
       ...gatewayHealth.recoverySnapshot(), guard: rawShardReconnect ? 'available' : 'unavailable',
     })
     gatewayStatusWarning = ''
@@ -881,36 +869,14 @@ async function gate(msg: Message): Promise<GateResult> {
   const pruned = pruneExpired(access)
   if (pruned) saveAccess(access)
 
+  if (access.dmPolicy === 'disabled') return { action: 'drop' }
+
   const senderId = msg.author.id
   const isDM = msg.channel.type === ChannelType.DM
-  const channelId = msg.channel.isThread()
-    ? msg.channel.parentId ?? msg.channelId
-    : msg.channelId
-  // FLY-3433: exact copy of the canonical dependency-free policy. Pairing
-  // persistence, reference resolution and topic-budget mutation remain owned
-  // by their existing adapters; the classifier only returns a decision.
-  const classify = (mentionMatched: boolean, topicDecision?: 'deliver' | 'drop') =>
-    classifyDiscordInbound({
-      channelKind: isDM ? 'dm' : 'guild', policyChannelId: channelId,
-      senderId, isSelf: msg.author.id === client.user?.id,
-      authorIsBot: msg.author.bot, content: msg.content,
-      mentionMatched, topicThread: topicDecision !== undefined,
-      ...(topicDecision ? { topicDecision } : {}),
-      // Stock primary access belongs to this bot. Independent Bridge sources
-      // additionally supply their verified frozen owner binding.
-      requireOwner: false, access,
-    })
-  const outcome = (decision: DiscordInboundClassification): GateResult => {
-    if (decision.action === 'deliver') return { action: 'deliver', access }
-    if (decision.action === 'quarantine') {
-      process.stderr.write(`[inbound-policy] unavailable reason=${decision.reason} message_id=${msg.id}\n`)
-    }
-    return { action: 'drop' }
-  }
 
   if (isDM) {
-    const decision = classify(false)
-    if (decision.action !== 'pair') return outcome(decision)
+    if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
+    if (access.dmPolicy === 'allowlist') return { action: 'drop' }
 
     // pairing mode — check for existing non-expired code for this sender
     for (const [code, p] of Object.entries(access.pending)) {
@@ -942,12 +908,16 @@ async function gate(msg: Message): Promise<GateResult> {
   // opt in per-channel rather than per-server. Threads inherit their
   // parent channel's opt-in; the reply still goes to msg.channelId
   // (the thread), this is only the gate lookup.
-  // Access-only check before any membership lookup or budget consumption.
-  // The final branch below still resolves the actual mention/topic evidence.
-  const accessOnly = classify(true)
-  if (accessOnly.action !== 'deliver') return outcome(accessOnly)
+  const channelId = msg.channel.isThread()
+    ? msg.channel.parentId ?? msg.channelId
+    : msg.channelId
   const policy = access.groups[channelId]
   if (!policy) return { action: 'drop' }
+  const groupAllowFrom = policy.allowFrom ?? []
+  const requireMention = policy.requireMention ?? true
+  if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
+    return { action: 'drop' }
+  }
   // FLY-314 Part(b): inside a roundtable TOPIC THREAD, members may continue the
   // discussion WITHOUT being @-mentioned, bounded by the anti-loop budget. ALL
   // decision logic (incl "bot @ consumes budget, never bypasses") is in the pure
@@ -991,7 +961,7 @@ async function gate(msg: Message): Promise<GateResult> {
       rtBudget,
       RT_CFG,
     )
-    return outcome(classify(mentioned, decision.handle ? 'deliver' : 'drop'))
+    return decision.handle ? { action: 'deliver', access } : { action: 'drop' }
   }
 
   // FLY-898: a group MAY override the global name-mention patterns. An empty
@@ -1005,11 +975,13 @@ async function gate(msg: Message): Promise<GateResult> {
   // `resolveGroupMentionPatterns` at BOTH isMentioned call sites (above + here) — a
   // deliberate, controlled marker can't false-positive on a helper definition or a
   // half-finished impl the way a code-shape grep can (Codex FLY-898 R2 MEDIUM).
-  return outcome(classify(
-    (policy.requireMention ?? true)
-      ? await isMentioned(msg, resolveGroupMentionPatterns(policy, access))
-      : false,
-  ))
+  if (
+    requireMention &&
+    !(await isMentioned(msg, resolveGroupMentionPatterns(policy, access)))
+  ) {
+    return { action: 'drop' }
+  }
+  return { action: 'deliver', access }
 }
 
 async function isMentioned(msg: Message, extraPatterns?: string[]): Promise<boolean> {
@@ -1769,16 +1741,16 @@ async function handleInbound(msg: Message): Promise<void> {
   // pending permission request, emit the structured event instead of
   // relaying as chat. The sender is already gate()-approved at this point
   // (non-allowlisted senders were dropped above), so we trust the reply.
-  const permissionReply = classifyDiscordPermissionReply(msg.content)
-  if (permissionReply) {
+  const permMatch = PERMISSION_REPLY_RE.exec(msg.content)
+  if (permMatch) {
     void mcp.notification({
       method: 'notifications/claude/channel/permission',
       params: {
-        request_id: permissionReply.requestId,
-        behavior: permissionReply.behavior,
+        request_id: permMatch[2]!.toLowerCase(),
+        behavior: permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny',
       },
     })
-    const emoji = permissionReply.behavior === 'allow' ? '✅' : '❌'
+    const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '✅' : '❌'
     void msg.react(emoji).catch(() => {})
     return
   }
@@ -1793,17 +1765,7 @@ async function handleInbound(msg: Message): Promise<void> {
     const name = safeAttName(att)
     const type = att.contentType ?? 'unknown'
     atts.push(`${name} (${type}, ${kb}KB)`)
-    const validName = typeof att.name === 'string' && att.name.trim().length > 0
-    const validType = typeof att.contentType === 'string' && att.contentType.trim().length > 0
-    const validSize = Number.isFinite(att.size) && att.size >= 0
-    const validId = /^\d{17,20}$/.test(att.id)
-    const invalid = !validName || !validType || !validSize || !validId
-    deliveryAttachments.push({
-      name: validName ? att.name!.trim() : 'attachment',
-      type: validType ? att.contentType!.trim() : 'application/octet-stream',
-      sizeKb: validSize ? att.size / 1024 : 0,
-      ...(invalid ? { unavailableReason: 'invalid_metadata' } : { attachmentId: att.id }),
-    })
+    deliveryAttachments.push({ name, type, sizeKb: Number(kb) })
   }
 
   // Attachment listing goes in meta only — an in-content annotation is
@@ -1815,14 +1777,8 @@ async function handleInbound(msg: Message): Promise<void> {
     authorId: msg.author.id,
     authorName: msg.author.username,
     ts: msg.createdAt.toISOString(),
-    text: msg.content,
+    text: content,
     attachments: deliveryAttachments,
-    ...(msg.reference?.messageId && (msg.reference.type === undefined || msg.reference.type === 0) ? {
-      replyTo: {
-        messageId: msg.reference.messageId, channelId: msg.reference.channelId ?? msg.channelId,
-        ...(msg.mentions.repliedUser?.id ? { authorId: msg.mentions.repliedUser.id } : {}),
-      },
-    } : {}),
   }
   const routingMeta: RejectedRoutingMeta = {
     chatId: chat_id,
