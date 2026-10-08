@@ -102,6 +102,18 @@ function result(stdout = '', exitCode = 0, stderr = ''): CommandResult {
 }
 
 describe('durable Discord ingest runtime', () => {
+  it('passes the immutable source reply reference to the canonical ingest command', async () => {
+    const commands: string[][] = []
+    const replyTo = { messageId: '100000000000000040', channelId: begin.originChannelId, authorId: '100000000000000041' }
+    const runtime = new ChatIngestRuntime({ mode: enabledMode(), stateDir: tempDir(), runCommand: async argv => {
+      commands.push(argv)
+      return result(JSON.stringify({ lane: 'inserted_inbox' }))
+    } })
+    expect(await runtime.acceptInbound({ ...begin, replyTo })).toBe('mailbox')
+    const index = commands[0].indexOf('--reply-to-json')
+    expect(index).toBeGreaterThan(0)
+    expect(JSON.parse(commands[0][index + 1])).toEqual(replyTo)
+  })
   it('has no receipt or Discord advisory injection surface', () => {
     const runtimeSource = readFileSync(join(import.meta.dir, 'chat-receipt-runtime.ts'), 'utf8')
     const serverSource = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')

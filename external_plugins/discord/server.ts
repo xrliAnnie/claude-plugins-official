@@ -1765,7 +1765,17 @@ async function handleInbound(msg: Message): Promise<void> {
     const name = safeAttName(att)
     const type = att.contentType ?? 'unknown'
     atts.push(`${name} (${type}, ${kb}KB)`)
-    deliveryAttachments.push({ name, type, sizeKb: Number(kb) })
+    const validName = typeof att.name === 'string' && att.name.trim().length > 0
+    const validType = typeof att.contentType === 'string' && att.contentType.trim().length > 0
+    const validSize = Number.isFinite(att.size) && att.size >= 0
+    const validId = /^\d{17,20}$/.test(att.id)
+    const invalid = !validName || !validType || !validSize || !validId
+    deliveryAttachments.push({
+      name: validName ? att.name!.trim() : 'attachment',
+      type: validType ? att.contentType!.trim() : 'application/octet-stream',
+      sizeKb: validSize ? att.size / 1024 : 0,
+      ...(invalid ? { unavailableReason: 'invalid_metadata' } : { attachmentId: att.id }),
+    })
   }
 
   // Attachment listing goes in meta only — an in-content annotation is
@@ -1777,8 +1787,14 @@ async function handleInbound(msg: Message): Promise<void> {
     authorId: msg.author.id,
     authorName: msg.author.username,
     ts: msg.createdAt.toISOString(),
-    text: content,
+    text: msg.content,
     attachments: deliveryAttachments,
+    ...(msg.reference?.messageId && (msg.reference.type === undefined || msg.reference.type === 0) ? {
+      replyTo: {
+        messageId: msg.reference.messageId, channelId: msg.reference.channelId ?? msg.channelId,
+        ...(msg.mentions.repliedUser?.id ? { authorId: msg.mentions.repliedUser.id } : {}),
+      },
+    } : {}),
   }
   const routingMeta: RejectedRoutingMeta = {
     chatId: chat_id,

@@ -15,10 +15,14 @@ export type RecorderMode =
     }
 
 export interface DeliveryAttachment {
+  attachmentId?: string
   name: string
   type: string
   sizeKb: number
+  unavailableReason?: 'invalid_metadata' | 'producer_identity_missing'
 }
+
+export interface DiscordReplyReference { messageId: string; channelId: string; authorId?: string }
 
 export interface DiscordReplyRoute {
   kind: 'roundtable_thread_from_message'
@@ -36,6 +40,7 @@ export interface InboundMeta {
   ts: string
   text: string
   attachments: DeliveryAttachment[]
+  replyTo?: DiscordReplyReference
 }
 
 export interface RoutingMeta {
@@ -61,6 +66,7 @@ export interface BeginArgs {
   text: string
   replyChannelId?: string
   replyRoute?: DiscordReplyRoute
+  replyTo?: DiscordReplyReference
 }
 
 export interface SpoolIntentV1 {
@@ -207,6 +213,7 @@ export function buildBeginArgs(
     ts: utcTimestamp(msg.ts, 'ts'),
     msgKind,
     attachments: normalizeAttachments(msg.attachments),
+    ...(msg.replyTo === undefined ? {} : { replyTo: normalizeReplyTo(msg.replyTo) }),
     text: stringValue(msg.text, 'text'),
   }
 }
@@ -366,6 +373,7 @@ function normalizeInboundMeta(value: unknown): InboundMeta {
     ts: utcTimestamp(inbound.ts, 'ts'),
     text: stringValue(inbound.text, 'text'),
     attachments: normalizeAttachments(inbound.attachments),
+    ...(inbound.replyTo === undefined ? {} : { replyTo: normalizeReplyTo(inbound.replyTo) }),
   }
 }
 
@@ -426,7 +434,18 @@ function normalizeBeginArgs(value: unknown): BeginArgs {
     ts: utcTimestamp(begin.ts, 'ts'),
     msgKind,
     attachments: normalizeAttachments(begin.attachments),
+    ...(begin.replyTo === undefined ? {} : { replyTo: normalizeReplyTo(begin.replyTo) }),
     text: stringValue(begin.text, 'text'),
+  }
+}
+
+function normalizeReplyTo(value: unknown): DiscordReplyReference {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('replyTo must be an object')
+  const reference = value as Record<string, unknown>
+  return {
+    messageId: msgField(reference.messageId, 'replyTo.messageId'),
+    channelId: msgField(reference.channelId, 'replyTo.channelId'),
+    ...(reference.authorId === undefined ? {} : { authorId: msgField(reference.authorId, 'replyTo.authorId') }),
   }
 }
 
@@ -456,6 +475,10 @@ function normalizeAttachments(value: unknown): DeliveryAttachment[] {
       throw new Error(`attachments[${index}] must be an object`)
     }
     const attachment = entry as Record<string, unknown>
+    const validId = isSnowflake(attachment.attachmentId)
+    const invalid = (attachment.attachmentId !== undefined && !validId) ||
+      (validId && attachment.unavailableReason !== undefined) ||
+      (attachment.unavailableReason !== undefined && attachment.unavailableReason !== 'producer_identity_missing')
     if (
       typeof attachment.sizeKb !== 'number' ||
       !Number.isFinite(attachment.sizeKb) ||
@@ -467,6 +490,9 @@ function normalizeAttachments(value: unknown): DeliveryAttachment[] {
       name: requiredString(attachment.name, `attachments[${index}].name`),
       type: requiredString(attachment.type, `attachments[${index}].type`),
       sizeKb: attachment.sizeKb,
+      ...(!invalid && validId && attachment.unavailableReason === undefined ? { attachmentId: attachment.attachmentId as string } : {}),
+      ...(invalid ? { unavailableReason: 'invalid_metadata' as const } :
+        attachment.unavailableReason === 'producer_identity_missing' ? { unavailableReason: 'producer_identity_missing' as const } : {}),
     }
   })
 }

@@ -105,6 +105,22 @@ describe('founder identity', () => {
 })
 
 describe('durable ingest envelope', () => {
+  it('keeps attachment identity, fractional byte size and source reply metadata through replay', () => {
+    const message = {
+      ...baseMessage,
+      attachments: [{ attachmentId: '100000000000000030', name: 'trace.png', type: 'image/png', sizeKb: 1.234375 }],
+      replyTo: { messageId: '100000000000000040', channelId: baseMessage.originChannelId, authorId: '100000000000000041' },
+    }
+    const begin = buildBeginArgs(message, { leadId: 'lead-a', chatId: baseMessage.originChannelId,
+      channelKind: 'guild', routedToRoundtable: false, inRoundtableThread: false }, baseMessage.authorId)
+    expect(begin).toMatchObject({ text: message.text, attachments: message.attachments, replyTo: message.replyTo })
+    expect(parseSpoolIntent(encodeSpoolIntent({ v: 1, begin, attempts: 0, advisedAt: null })).begin).toEqual(begin)
+    const rejected = buildRejectedIntent(message, { chatId: baseMessage.originChannelId,
+      channelKind: 'guild', routedToRoundtable: false, inRoundtableThread: false }, ['FLYWHEEL_COMM_DB'], new Date('2026-10-08T07:00:00.000Z'))
+    expect(parseRejectedIntent(encodeRejectedIntent(rejected)).inbound.replyTo).toEqual(message.replyTo)
+    expect(() => buildBeginArgs({ ...message, replyTo: { ...message.replyTo, authorId: 'bad' } },
+      { leadId: 'lead-a', chatId: baseMessage.originChannelId, channelKind: 'guild', routedToRoundtable: false, inRoundtableThread: false })).toThrow('replyTo.authorId')
+  })
   const begin: BeginArgs = buildBeginArgs(
     baseMessage,
     {
