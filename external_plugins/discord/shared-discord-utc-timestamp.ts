@@ -5,4 +5,3 @@ export function assertUtcIsoTimestamp(value: string, field: string): void {
 		throw new Error(`${field} must be a valid UTC ISO timestamp ending in Z`);
 	}
 }
-

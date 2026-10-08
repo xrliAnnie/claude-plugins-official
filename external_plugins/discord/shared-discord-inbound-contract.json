@@ -10,7 +10,7 @@
     "sourceSha256": "15630eb1df0492fa878d407f9d23c7dc9dede8065b2bac57496b7fd31707e9a3",
     "moduleSha256": "b5ef63024e97c0f4a08cf07ccd1f642c6318f8dea1872c168426bd661009fddc",
     "timestampSource": "packages/flywheel-comm/src/mailbox-queue.ts:assertUtcIsoTimestamp",
-    "timestampSha256": "dd500408c5426e1dd6fb318afb7bc847b2b425d1028b3412138a7c578fbe14ed",
+    "timestampSha256": "fa878c3d6d0902afab477877d930166faefc9a2ab440ce9c9c6cdc1270c08a86",
     "goldenFrom": "packages/flywheel-comm/src/__tests__/fixtures/discord-chat-envelope-v1.json",
     "goldenSha256": "4a3a0906042a409e4d104e7adbfaea6a681b02d58665e352105e684c83d293e9"
   }
