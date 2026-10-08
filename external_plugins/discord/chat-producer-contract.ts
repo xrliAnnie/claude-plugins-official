@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { closeSync, constants, fstatSync, openSync, readFileSync } from 'node:fs'
+import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs'
 import { isDeepStrictEqual } from 'node:util'
 import { buildBeginArgs, type BeginArgs, type InboundMeta, type RoutingMeta } from './chat-receipt-recorder'
 import {
@@ -31,7 +31,15 @@ function fixture(name: string): { value: any; sha256: string } {
     const before = fstatSync(fd)
     if (!before.isFile() || before.nlink !== 1 || before.uid !== process.getuid?.() ||
       before.mode & 0o022 || before.size > 64 * 1024) throw new Error('producer_fixture_unsafe')
-    const bytes = readFileSync(fd)
+    const buffer = Buffer.alloc(64 * 1024 + 1)
+    let length = 0
+    while (length < buffer.length) {
+      const count = readSync(fd, buffer, length, buffer.length - length, length)
+      if (!count) break
+      length += count
+    }
+    if (length > 64 * 1024) throw new Error('producer_fixture_size')
+    const bytes = buffer.subarray(0, length)
     const after = fstatSync(fd)
     if (bytes.length !== before.size || after.size !== before.size || after.mtimeMs !== before.mtimeMs ||
       after.ctimeMs !== before.ctimeMs) throw new Error('producer_fixture_changed')
