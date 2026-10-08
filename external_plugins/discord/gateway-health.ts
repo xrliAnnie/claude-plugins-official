@@ -62,6 +62,16 @@ export class GatewayHealthMonitor {
 
   constructor(private readonly options: GatewayHealthMonitorOptions) {}
 
+  recoverySnapshot(): { episodeKey: string | null; forced: boolean; budgetLatched: boolean; attemptsInWindow: number } {
+    const cutoff = this.now() - FORCED_RECONNECT_WINDOW_MS
+    return {
+      episodeKey: this.episode?.key ?? null,
+      forced: this.episode?.forced ?? false,
+      budgetLatched: this.episode?.budgetLatched ?? false,
+      attemptsInWindow: this.forcedReconnectAttempts.filter(at => at > cutoff).length,
+    }
+  }
+
   onShardReconnecting(shardId: number): void {
     this.log(`gateway shard ${shardId} reconnecting`)
     // Echoes from the old socket can never arrive after this edge. Keeping

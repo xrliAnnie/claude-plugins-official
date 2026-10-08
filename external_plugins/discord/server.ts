@@ -85,7 +85,8 @@ import {
 } from './gateway-alert'
 import { GatewayHealthFiles } from './gateway-health-files'
 import { inspectRawShardReconnect } from './gateway-reconnect'
-import { attachGatewayLifecycleEvents } from './gateway-wiring'
+import { attachGatewayLifecycleEvents, attachGatewayStatusEvents } from './gateway-wiring'
+import { GatewayStatusTelemetry, inspectHeartbeatInterval } from './gateway-status'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -507,6 +508,39 @@ const client = new Client({
 })
 
 const gatewayHealthFiles = new GatewayHealthFiles({ stateDir: STATE_DIR })
+let gatewayStatus: GatewayStatusTelemetry | null = null
+let gatewayStatusWarning = ''
+function getGatewayStatus(): GatewayStatusTelemetry | null {
+  if (!client.user) return null
+  try {
+    if (client.user.id !== process.env.DISCORD_EXPECTED_BOT_USER_ID) throw new Error('gateway_bot_binding_mismatch')
+    if (gatewayStatus) return gatewayStatus
+    const start = (pid: number) => execFileSync('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8', timeout: 1000, killSignal: 'SIGKILL', maxBuffer: 256,
+      stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, LC_ALL: 'C' },
+    }).trim()
+    gatewayStatus = new GatewayStatusTelemetry({
+      project: process.env.FLYWHEEL_PROJECT_NAME ?? '', lead: process.env.FLYWHEEL_LEAD_ID ?? '',
+      identityDigest: process.env.FLYWHEEL_LEAD_IDENTITY_DIGEST ?? '',
+      launchGeneration: process.env.FLYWHEEL_LEAD_LAUNCH_GEN ?? '',
+      leaseGeneration: Number(process.env.FLYWHEEL_LEAD_GENERATION),
+      serverPid: process.pid, serverStart: start(process.pid),
+      parentPid: process.ppid, parentStart: start(process.ppid), botUserId: client.user.id,
+    })
+    return gatewayStatus
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'gateway_status_binding_unavailable'
+    if (reason !== gatewayStatusWarning) gatewayHealthFiles.log(`current-instance telemetry unavailable: ${reason}`)
+    gatewayStatusWarning = reason
+    return null
+  }
+}
+const refreshGatewayStatusEvents = attachGatewayStatusEvents(client, {
+  telemetry: getGatewayStatus,
+  manager: () => (client.ws as unknown as { _ws?: unknown })._ws,
+  supported: () => discordJsVersion === '14.25.1' && discordWsVersion === '1.2.3',
+  interval: id => inspectHeartbeatInterval(client.ws, id, discordJsVersion, discordWsVersion),
+})
 const gatewayFailureAlerter = new GatewayFailureAlerter({
   alertChannelId: process.env.DISCORD_ALERT_CHANNEL,
   // The client's REST manager already owns DISCORD_BOT_TOKEN after login. This
@@ -592,6 +626,24 @@ function initializeRawShardReconnect(): void {
     `and @discordjs/ws ${discordWsVersion}`,
   )
 }
+
+function publishGatewayStatus(): void {
+  refreshGatewayStatusEvents()
+  const status = getGatewayStatus()
+  if (!status) return
+  try {
+    gatewayHealthFiles.writeStatus(status.snapshot(), {
+      ...gatewayHealth.recoverySnapshot(), guard: rawShardReconnect ? 'available' : 'unavailable',
+    })
+    gatewayStatusWarning = ''
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'gateway_status_write_failed'
+    if (reason !== gatewayStatusWarning) gatewayHealthFiles.log(`current-instance telemetry unavailable: ${reason}`)
+    gatewayStatusWarning = reason
+  }
+}
+const gatewayStatusTimer = setInterval(publishGatewayStatus, 15_000)
+gatewayStatusTimer.unref?.()
 
 type PendingEntry = {
   senderId: string
@@ -1819,6 +1871,7 @@ async function handleInbound(msg: Message): Promise<void> {
 client.once('ready', c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
   initializeRawShardReconnect()
+  publishGatewayStatus()
   chatIngestRuntime.kickWorker()
 })
 
