@@ -1,0 +1,7 @@
+{
+  "contract": "discord-inbound-classifier/v1",
+  "generatedFrom": "packages/flywheel-comm/src/discord-inbound-classifier.ts",
+  "sourceSha256": "502677f0257940fb6b23993c405040a516f92f638c84ae0b7df049f560f38422",
+  "goldenFrom": "packages/flywheel-comm/src/__tests__/fixtures/discord-inbound-classifier-v1.json",
+  "goldenSha256": "a4866a3a145f4abeb5321e4ed03b43fce9063e439e59c9af9d1cc6ad0dfdbbe3"
+}
