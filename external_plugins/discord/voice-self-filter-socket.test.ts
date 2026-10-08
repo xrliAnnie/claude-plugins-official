@@ -20,6 +20,7 @@ const leadId = 'lead', bot = '100000000000000005', secret = 'fixture-secret'
 const cleanup: Array<() => unknown | Promise<unknown>> = []
 afterEach(async () => { for (const fn of cleanup.splice(0).reverse()) await fn() })
 function path() { const root = mkdtempSync(join(tmpdir(), 'cfprobe-')); cleanup.push(() => rmSync(root, { recursive: true, force: true })); return join(root, 'v.sock') }
+const invalidFrame = { ok: false, error: 'self_filter_invalid_request' }
 const observation = () => ({ botUserId: bot, ready: true, selfDropped: true, unknownDropped: true, otherPassed: true })
 function fakeOwnerLock(onClose: () => void = () => {}): OwnerLock {
  return { close: onClose }
@@ -31,11 +32,11 @@ function request(over: Record<string, unknown> = {}) {
  const r: any = { version: 1, method: 'probeVoiceSelfFilter', leadId, expectedBotUserId: bot, nonce: 'a'.repeat(64), ...over }
  r.auth = createHmac('sha256', secret).update(JSON.stringify([1, 'voice-self-filter-v1', r.leadId, r.expectedBotUserId, r.nonce])).digest('hex'); return r
 }
-async function send(socketPath: string, body: unknown): Promise<any> {
+async function send(socketPath: string, body: unknown, opts: { writeDelayMs?: number, deadlineMs?: number } = {}): Promise<any> {
  return new Promise((resolve, reject) => {
  const peer = createConnection(socketPath); let raw = ''
- const timer = setTimeout(() => { peer.destroy(); reject(new Error('deadline')) }, 2500)
- peer.once('connect', () => peer.write(typeof body === 'string' ? body : JSON.stringify(body) + '\n'))
+ const timer = setTimeout(() => { peer.destroy(); reject(new Error('deadline')) }, opts.deadlineMs ?? 2500)
+ peer.once('connect', () => setTimeout(() => peer.write(typeof body === 'string' ? body : JSON.stringify(body) + '\n'), opts.writeDelayMs ?? 0))
  peer.on('data', b => { raw += b }); peer.on('error', () => {})
  peer.once('close', () => { clearTimeout(timer); resolve(raw ? JSON.parse(raw) : null) })
  })
@@ -51,14 +52,14 @@ it('signs nonce-bound live proof on an owner-only socket', async () => {
  expect(r).toMatchObject({ version: 1, leadId, botUserId: bot, nonce: 'a'.repeat(64), ready: true, selfDropped: true, unknownDropped: true, otherPassed: true })
  expect(r.auth).toBe(createHmac('sha256', secret).update(JSON.stringify([1, r.leadId, r.botUserId, r.runtimeId, r.nonce, r.ready, r.selfDropped, r.unknownDropped, r.otherPassed])).digest('hex'))
 })
-it.each([{ leadId: 'other' }, { version: 2 }, { nonce: 'short' }, { method: 'submitBatch' }, { extra: 1 }])('rejects malformed/cross-Lead request %j', async (over) => {
- const { socketPath } = await start(); expect(await send(socketPath, request(over))).toBeNull()
+it.each([{ leadId: 'other' }, { version: 2 }, { nonce: 'short' }, { method: 'submitBatch' }, { extra: 1 }])('rejects malformed/cross-Lead request %j with a fixed error frame', async (over) => {
+ const { socketPath } = await start(); expect(await send(socketPath, request(over))).toEqual(invalidFrame)
 })
 it('rejects wrong MAC and oversized input without observing', async () => {
  let calls = 0; const socketPath = path()
  const server = new VoiceSelfFilterSocket({ socketPath, leadId, secret, observe: () => { calls++; return observation() }, ...fakeLockOptions() })
  await server.listen(); cleanup.push(() => server.close())
- expect(await send(socketPath, { ...request(), auth: 'b'.repeat(64) })).toBeNull(); expect(await send(socketPath, 'x'.repeat(4097))).toBeNull(); expect(calls).toBe(0)
+ expect(await send(socketPath, { ...request(), auth: 'b'.repeat(64) })).toEqual(invalidFrame); expect(await send(socketPath, 'x'.repeat(4097))).toBeNull(); expect(calls).toBe(0)
 })
 it('never steals active sockets or unlinks symlinks/unproven stale paths', async () => {
  const { socketPath } = await start()
@@ -385,4 +386,29 @@ it.each(['post-bind-stat', 'unpublished-unlink'])('closes listener and releases 
  await scheduler.queue.shift()?.run()
  expect(states.at(-1)).toBe('bound')
  expect((await send(socketPath, request())).ready).toBe(true)
+})
+
+// FLY-3436: the Lead must not hang up on a probe before the Bridge's own budget.
+it('answers a request that only completes 2.5s after accept (former 2s ceiling)', async () => {
+ const { socketPath } = await start()
+ const r = await send(socketPath, request(), { writeDelayMs: 2500, deadlineMs: 6000 })
+ expect(r).toMatchObject({ version: 1, leadId, ready: true })
+}, 10000)
+it('arms the accept deadline at the largest legal Bridge budget, not 2s', async () => {
+ const delays: number[] = []
+ const realSetTimeout = globalThis.setTimeout
+ const spy = spyOn(globalThis, 'setTimeout').mockImplementation(((fn: any, ms?: number, ...a: any[]) => { if (typeof ms === 'number') delays.push(ms); return realSetTimeout(fn, ms, ...a) }) as any)
+ try {
+  const { socketPath } = await start()
+  const before = delays.length
+  await send(socketPath, request())
+  expect(delays.slice(before)).toContain(30000)
+  expect(delays.slice(before)).not.toContain(2000)
+ } finally { spy.mockRestore() }
+})
+it('replies the same fixed frame to an unparseable request, never echoing input', async () => {
+ const { socketPath } = await start()
+ const r = await send(socketPath, 'not-json-' + 'secret-material\n')
+ expect(r).toEqual(invalidFrame)
+ expect(JSON.stringify(r)).not.toContain('secret-material')
 })

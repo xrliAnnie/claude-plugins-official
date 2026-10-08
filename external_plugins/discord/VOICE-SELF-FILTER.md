@@ -40,3 +40,13 @@ Tests exercise the registered callback, resume replay, a mutated guard, live
 authenticated sockets, kernel-lock crash recovery and handoff, limits, ownership,
 and a Node client talking to the Bun server. Real room audio and managed loading
 remain separate checks.
+
+## Probe deadline and rejection frame (FLY-3436)
+
+The socket keeps a probe connection open for up to 30 seconds from accept, the
+largest legal Bridge probe budget, so the Lead never hangs up before the
+Bridge's own timeout (this constant mirrors the flywheel contract and must stay
+equal to it). Requests that fail validation or authentication get one fixed
+`{"ok":false,"error":"self_filter_invalid_request"}` frame instead of a silent
+close: the Bridge reads that as a terminal rejection, while a zero-byte close is
+treated as a recoverable drop. Oversized input is still destroyed immediately.

@@ -15,6 +15,12 @@ import { dirname, join } from 'node:path'
 import type { SelfFilterObservation } from './self-author-filter'
 
 const LIMIT = 4096
+// Mirrors VOICE_SELF_FILTER_MAX_TIMEOUT_MS in the flywheel repo (the largest
+// legal Bridge probe budget). Cross-repo, so it cannot be imported: keep equal.
+// The nominal deadline must never be shorter than the Bridge's own timeout.
+const PROBE_MAX_TIMEOUT_MS = 30_000
+// Fixed frame for any rejected request: never echoes input or the cause.
+const INVALID_REQUEST_FRAME = '{"ok":false,"error":"self_filter_invalid_request"}\n'
 const hex = /^[a-f0-9]{64}$/
 const privateSocketName = /^\.v[0-9a-f]{12}$/
 
@@ -367,7 +373,7 @@ export class VoiceSelfFilterSocket {
 
   private accept(peer: Socket): void {
     this.peers.add(peer)
-    const timer = setTimeout(() => peer.destroy(), 2000)
+    const timer = setTimeout(() => peer.destroy(), PROBE_MAX_TIMEOUT_MS)
     peer.once('close', () => { clearTimeout(timer); this.peers.delete(peer) })
     peer.on('error', () => {})
     let size = 0
@@ -415,7 +421,9 @@ export class VoiceSelfFilterSocket {
         if (Buffer.byteLength(reply) > LIMIT) throw new Error('invalid_observation')
         peer.end(reply)
       } catch {
-        peer.destroy()
+        // A zero-byte close reads as a transient drop to the Bridge; an explicit
+        // rejection stays terminal there. Oversize input is still destroyed.
+        peer.end(INVALID_REQUEST_FRAME)
       }
     }
     peer.on('data', (chunk: Buffer) => {
