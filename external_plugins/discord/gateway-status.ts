@@ -27,6 +27,7 @@ export interface GatewayStatusSnapshot extends GatewayInstanceBinding {
   updatedAt: number
   telemetry: 'available' | 'unavailable'
   shards: GatewayShardStatus[]
+  chatProducer?: import('./chat-producer-contract').ChatProducerContractMarker
 }
 
 const record = (value: unknown): Record<string, unknown> | null =>

@@ -56,6 +56,7 @@ import {
   type RejectedRoutingMeta,
 } from './chat-receipt-recorder'
 import { ChatIngestRuntime } from './chat-receipt-runtime'
+import { probeChatProducerContract, type ChatProducerContractMarker } from './chat-producer-contract'
 import {
   classifyDiscordInbound,
   classifyDiscordPermissionReply,
@@ -514,6 +515,8 @@ const client = new Client({
 const gatewayHealthFiles = new GatewayHealthFiles({ stateDir: STATE_DIR })
 let gatewayStatus: GatewayStatusTelemetry | null = null
 let gatewayStatusWarning = ''
+let chatProducerContract: ChatProducerContractMarker | null = null
+let chatProducerContractChecked = false
 function getGatewayStatus(): GatewayStatusTelemetry | null {
   if (!client.user) return null
   try {
@@ -636,7 +639,12 @@ function publishGatewayStatus(): void {
   const status = getGatewayStatus()
   if (!status) return
   try {
-    gatewayHealthFiles.writeStatus(status.snapshot(), {
+    if (!chatProducerContractChecked) {
+      chatProducerContractChecked = true
+      try { chatProducerContract = probeChatProducerContract() }
+      catch { gatewayHealthFiles.log('chat producer contract fixture unavailable; backup compatibility remains unproven') }
+    }
+    gatewayHealthFiles.writeStatus({ ...status.snapshot(), ...(chatProducerContract ? { chatProducer: chatProducerContract } : {}) }, {
       ...gatewayHealth.recoverySnapshot(), guard: rawShardReconnect ? 'available' : 'unavailable',
     })
     gatewayStatusWarning = ''
