@@ -2,13 +2,16 @@ import { afterEach, describe, expect, it } from 'bun:test'
 import {
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { GatewayHealthFiles } from './gateway-health-files'
+import { GatewayStatusTelemetry } from './gateway-status'
 
 const tempDirs: string[] = []
 
@@ -17,6 +20,28 @@ afterEach(() => {
 })
 
 describe('GatewayHealthFiles', () => {
+  it('atomically publishes bounded private current-instance status without following a leaf symlink', () => {
+    const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'fly3433-gateway-status-')))
+    tempDirs.push(stateDir)
+    const files = new GatewayHealthFiles({ stateDir, stderr: () => {} })
+    const status = new GatewayStatusTelemetry({
+      project: 'fixture', lead: 'eng-lead', identityDigest: 'a'.repeat(64),
+      launchGeneration: 'launch-one', leaseGeneration: 7,
+      serverPid: 200, serverStart: 'server-start', parentPid: 100, parentStart: 'parent-start',
+      botUserId: '22345678901234567',
+    }, () => 100_000)
+    files.writeStatus(status.snapshot())
+    const path = join(stateDir, 'gateway-status.json')
+    expect(JSON.parse(readFileSync(path, 'utf8')).serverPid).toBe(200)
+    expect(statSync(path).mode & 0o777).toBe(0o600)
+    expect(() => files.writeStatus({ ...status.snapshot(), project: 'x'.repeat(65_536) })).toThrow('gateway_status_size')
+    rmSync(path)
+    const target = join(stateDir, 'source')
+    writeFileSync(target, 'unchanged')
+    symlinkSync(target, path)
+    expect(() => files.writeStatus(status.snapshot())).toThrow('gateway_status_unsafe')
+    expect(readFileSync(target, 'utf8')).toBe('unchanged')
+  })
   it('writes lifecycle evidence to stderr and keeps one bounded rotated backup', () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'fly2226-gateway-log-'))
     tempDirs.push(stateDir)

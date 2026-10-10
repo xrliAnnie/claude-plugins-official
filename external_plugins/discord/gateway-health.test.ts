@@ -41,6 +41,21 @@ class TestScheduler implements GatewayHealthScheduler {
 }
 
 describe('GatewayHealthMonitor lifecycle recovery', () => {
+  it('projects its existing recovery episode without consuming another attempt', () => {
+    const scheduler = new TestScheduler()
+    const monitor = new GatewayHealthMonitor({
+      gatewayWatchEnabled: true, echoProbeEnabled: false, echoTimeoutMs: 60_000,
+      recoveryDeadlineMs: 90_000, pendingCap: 200, earlyEchoCap: 1000, scheduler,
+      forceReconnect: async () => {}, alertFailure: async () => {}, log: () => {},
+    })
+    expect(monitor.recoverySnapshot()).toEqual({ episodeKey: null, forced: false, budgetLatched: false, attemptsInWindow: 0 })
+    monitor.onShardReconnecting(0)
+    const row = monitor.recoverySnapshot()
+    expect(row.episodeKey).toBe('gateway-recovery-1')
+    expect(monitor.recoverySnapshot()).toEqual(row)
+    monitor.onShardResume(0, 1)
+    expect(monitor.recoverySnapshot().episodeKey).toBeNull()
+  })
   it('does not force reconnect or alert when a reconnect resumes before its deadline', async () => {
     const scheduler = new TestScheduler()
     const reconnects: string[] = []

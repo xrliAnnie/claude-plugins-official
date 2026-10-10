@@ -1,14 +1,25 @@
 import {
   appendFileSync,
   chmodSync,
+  closeSync,
+  constants,
   existsSync,
+  fsyncSync,
+  fstatSync,
+  lstatSync,
   mkdirSync,
+  openSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
+  unlinkSync,
+  writeFileSync,
 } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import type { GatewayAlertDeadLetter } from './gateway-alert'
+import type { GatewayStatusSnapshot } from './gateway-status'
 
 const DEFAULT_MAX_LOG_BYTES = 256 * 1024
 
@@ -38,6 +49,61 @@ export class GatewayHealthFiles {
     this.maxLogBytes = options.maxLogBytes ?? DEFAULT_MAX_LOG_BYTES
     this.now = options.now ?? (() => new Date())
     this.stderr = options.stderr ?? (line => { process.stderr.write(line) })
+  }
+
+  writeStatus(status: GatewayStatusSnapshot, recovery?: {
+    episodeKey: string | null
+    forced: boolean
+    budgetLatched: boolean
+    attemptsInWindow: number
+    guard: 'available' | 'unavailable'
+  }): void {
+    const bytes = Buffer.from(JSON.stringify({ ...status, ...(recovery ? { recovery } : {}) }) + '\n')
+    if (bytes.length > 64 * 1024) throw new Error('gateway_status_size')
+    const dir = this.options.stateDir
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const root = lstatSync(dir)
+    if (!root.isDirectory() || root.uid !== process.getuid?.() || root.mode & 0o022 ||
+      realpathSync(dir) !== dir) throw new Error('gateway_status_unsafe')
+    const path = join(dir, 'gateway-status.json')
+    const existing = () => {
+      try {
+        const row = lstatSync(path)
+        if (!row.isFile() || row.uid !== process.getuid?.() || row.nlink !== 1 ||
+          row.mode & 0o077 || row.size > 64 * 1024) throw new Error('gateway_status_unsafe')
+        return row
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+        throw error
+      }
+    }
+    const before = existing()
+    const temp = join(dir, `.gateway-status-${randomUUID()}.tmp`)
+    const fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
+    const temporary = fstatSync(fd)
+    let renamed = false
+    try {
+      writeFileSync(fd, bytes)
+      fsyncSync(fd)
+      const latestRoot = lstatSync(dir), latest = existing()
+      if (!latestRoot.isDirectory() || latestRoot.uid !== root.uid || latestRoot.mode & 0o022 ||
+        latestRoot.dev !== root.dev || latestRoot.ino !== root.ino || realpathSync(dir) !== dir ||
+        latest?.dev !== before?.dev || latest?.ino !== before?.ino) throw new Error('gateway_status_changed')
+      renameSync(temp, path)
+      renamed = true
+      const parent = openSync(dir, constants.O_RDONLY | constants.O_NOFOLLOW)
+      try { fsyncSync(parent) } finally { closeSync(parent) }
+    } finally {
+      closeSync(fd)
+      if (!renamed) {
+        try {
+          const owned = lstatSync(temp)
+          if (owned.dev === temporary.dev && owned.ino === temporary.ino) unlinkSync(temp)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        }
+      }
+    }
   }
 
   log(message: string): void {
