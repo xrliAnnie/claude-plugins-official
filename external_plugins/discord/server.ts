@@ -173,20 +173,21 @@ const RT_DISCORD_API = 'https://discord.com/api/v10'
 // FLY-314 auto-thread manager / host bot creates the topic thread and a member bot
 // only needs to send into it. So a failed create is not necessarily fatal — confirm
 // the thread (id == message id) exists with a short bounded retry for the race.
-const RT_GET_CONFIRM_RETRIES = 3
-const RT_GET_CONFIRM_DELAY_MS = 400
+const RT_GET_CONFIRM_RETRIES = 12
+const RT_GET_CONFIRM_DELAY_MS = 500
 
 // GET /channels/{threadId}: 200 confirms the thread exists. Anything else (or a
 // network error) → not confirmed.
 async function roundtableThreadExists(
   threadId: string,
   parentChannelId: string,
+  timeoutMs = 5000,
 ): Promise<boolean> {
   if (!TOKEN) return false
   try {
     const res = await fetch(`${RT_DISCORD_API}/channels/${threadId}`, {
       headers: { Authorization: `Bot ${TOKEN}` },
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(timeoutMs),
     })
     if (!threadGetConfirmsExistence(res.status)) return false
     // FLY-314 fix (Codex R4 note 3): a 200 alone doesn't prove this is a topic thread
@@ -222,15 +223,17 @@ async function ensureRoundtableThread(
   // confirm-only, NEVER create. Creating a thread from the referenced id would just
   // move the over-spawn (a second thread on the referenced message). If it can't be
   // confirmed as a thread under the roundtable parent, the caller keeps the parent.
-  if (opts.confirmOnly) {
-    for (let i = 0; i < RT_GET_CONFIRM_RETRIES; i++) {
-      if (await roundtableThreadExists(targetMessageId, parentChannelId)) return true
-      if (i < RT_GET_CONFIRM_RETRIES - 1) {
-        await new Promise((r) => setTimeout(r, RT_GET_CONFIRM_DELAY_MS))
-      }
+  const deadline = performance.now() + RT_GET_CONFIRM_RETRIES * RT_GET_CONFIRM_DELAY_MS
+  for (let i = 0; i < RT_GET_CONFIRM_RETRIES; i++) {
+    const remaining = deadline - performance.now()
+    if (remaining <= 0) break
+    if (await roundtableThreadExists(targetMessageId, parentChannelId, Math.max(1, Math.ceil(Math.min(5000, remaining))))) return true
+    if (i < RT_GET_CONFIRM_RETRIES - 1) {
+      await new Promise((r) => setTimeout(r, Math.max(0, Math.min(RT_GET_CONFIRM_DELAY_MS, deadline - performance.now()))))
     }
-    return false
   }
+  if (opts.confirmOnly) return false
+  process.stderr.write(`[roundtable] host timed out for ${targetMessageId}; Lead falling back to create\n`)
 
   const createBody = await buildRoundtableThreadCreateBody(
     parentChannelId,
@@ -1647,6 +1650,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 })
 
 client.on('messageCreate', msg => {
+  if (msg.system) return
   // Never process our own messages — prevents typing keepalive re-trigger on reply echo.
   if (msg.author.id === client.user?.id) {
     gatewayHealth.onSelfEcho(msg.id, msg.channelId)

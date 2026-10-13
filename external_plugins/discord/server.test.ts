@@ -19,7 +19,8 @@ function ensureFixture(foundAt: number, confirmOnly = false, slow = false) {
     probes++;
     if (slow) elapsed += timeout ?? 5000;
     return probes === foundAt;
-  }, 12, 500, async () => ({ name: "topic", auto_archive_duration: 60 }),
+  }, Number(source.match(/const RT_GET_CONFIRM_RETRIES = (\d+)/)![1]),
+  Number(source.match(/const RT_GET_CONFIRM_DELAY_MS = (\d+)/)![1]), async () => ({ name: "topic", auto_archive_duration: 60 }),
   async (_url: string, init: RequestInit) => {
     creates++;
     signals.push(init.signal!);
