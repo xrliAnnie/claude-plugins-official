@@ -60,6 +60,7 @@ import { resolveGroupMentionPatterns } from './mention-patterns'
 import {
   loadRoundtableConfig,
   resolveRoundtableInboundChatId,
+  roundtableParentReplyHint,
   isRoundtableTopicThread,
   createThreadBudgetStore,
   decideTopicThreadHandling,
@@ -217,7 +218,7 @@ async function ensureRoundtableThread(
       await new Promise((r) => setTimeout(r, pause))
     }
   }
-  process.stderr.write(`[roundtable] host thread ${targetMessageId} unavailable; recipient creation refused, keeping parent route\n`)
+  process.stderr.write(`[roundtable] initiating Lead thread ${targetMessageId} unavailable; recipient creation refused, keeping parent route\n`)
   return false
 }
 
@@ -1315,7 +1316,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const access = loadAccess()
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
-        const replyMode = access.replyToMode ?? 'first'
+        const strictParentReply = !!RT_CFG && chat_id === RT_CFG.channelId && !!reply_to
+        const replyMode = strictParentReply ? 'all' : access.replyToMode ?? 'first'
         const chunks = chunk(text, limit, mode)
         // FLY-306: send each chunk with bounded retry on transient failures.
         // The loop advances only on a successful send, so chunks already
@@ -1330,7 +1332,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             () => ch.send(payload),
           ),
           chunks,
-          { files, reply_to, replyMode },
+          { files, reply_to, replyMode, ...(strictParentReply ? { failIfNotExists: true } : {}) },
           replyRetryOpts,
           noteSent,
         )
@@ -1627,6 +1629,7 @@ async function handleInbound(msg: Message): Promise<void> {
         messageId: msg.id,
         isThread: msg.channel.isThread(),
         parentId: msg.channel.isThread() ? msg.channel.parentId ?? null : null,
+        authorBot: msg.author.bot,
         // FLY-314 fix: reply target → follow-up routing; content → naming + noise gate.
         referencedMessageId: msg.reference?.messageId ?? null,
         content: msg.content,
@@ -1699,7 +1702,9 @@ async function handleInbound(msg: Message): Promise<void> {
 
   // Attachment listing goes in meta only — an in-content annotation is
   // forgeable by any allowlisted sender typing that string.
-  const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
+  const originalContent = msg.content || (atts.length > 0 ? '(attachment)' : '')
+  const replyHint = RT_CFG ? roundtableParentReplyHint({ channelId: msg.channelId, messageId: msg.id, isThread: msg.channel.isThread(), parentId: msg.channel.isThread() ? msg.channel.parentId ?? null : null, authorBot: msg.author.bot, referencedMessageId: msg.reference?.messageId, content: msg.content }, RT_CFG) : undefined
+  const content = replyHint ? `${originalContent}\n\n${replyHint}` : originalContent
   const inboundMeta = {
     messageId: msg.id,
     originChannelId: msg.channelId,

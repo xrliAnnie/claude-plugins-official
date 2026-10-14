@@ -13,19 +13,19 @@ function ensureFixture(foundAt: number, confirmOnly = false, slow = false, token
   let creates = 0;
   const signals: AbortSignal[] = [];
   const build = new Function("TOKEN", "roundtableThreadExists", "RT_GET_CONFIRM_RETRIES",
-    "RT_GET_CONFIRM_DELAY_MS", "buildRoundtableThreadCreateBody", "fetch", "RT_DISCORD_API",
-    "classifyThreadCreate", "process", "setTimeout", "performance", `${compiled}; return ensureRoundtableThread`);
+    "RT_GET_CONFIRM_DELAY_MS", "fetch", "RT_DISCORD_API",
+    "process", "setTimeout", "performance", `${compiled}; return ensureRoundtableThread`);
   const ensure = build(token, async (_id: string, _parent: string, timeout?: number) => {
     probes++;
     if (slow) elapsed += timeout ?? 5000;
     return probes === foundAt;
   }, Number(source.match(/const RT_GET_CONFIRM_RETRIES = (\d+)/)![1]),
-  Number(source.match(/const RT_GET_CONFIRM_DELAY_MS = (\d+)/)![1]), async () => ({ name: "topic", auto_archive_duration: 60 }),
+  Number(source.match(/const RT_GET_CONFIRM_DELAY_MS = (\d+)/)![1]),
   async (_url: string, init: RequestInit) => {
     creates++;
     signals.push(init.signal!);
     return { status: 201 };
-  }, "https://discord.com/api/v10", () => "created", { stderr: { write() {} } },
+  }, "https://discord.com/api/v10", { stderr: { write() {} } },
   (callback: () => void, delay: number) => { elapsed += delay; callback(); }, { now: () => elapsed });
   return { run: () => ensure("parent", "message", { confirmOnly }),
     counts: () => ({ probes, elapsed, creates, signals }) };

@@ -18,7 +18,6 @@ import {
 	seedThreadBudget,
 	shouldProbeTopicThreadMembership,
 	shouldSeedInitiatorBudget,
-	classifyThreadCreate,
 	threadGetConfirmsExistence,
 	confirmThreadUnderParent,
 	deriveRoundtableThreadName,
@@ -119,26 +118,7 @@ describe("loadRoundtableConfig", () => {
 	});
 });
 
-describe("classifyThreadCreate / threadGetConfirmsExistence (FLY-569 R1#2)", () => {
-	test("2xx create → created", () => {
-		expect(classifyThreadCreate(201)).toBe("created");
-		expect(classifyThreadCreate(200)).toBe("created");
-	});
-	test("400/409 with code 160004 (already has thread) → exists", () => {
-		expect(classifyThreadCreate(400, 160004)).toBe("exists");
-		expect(classifyThreadCreate(409, 160004)).toBe("exists");
-	});
-	test("403/404/429/5xx → confirm-via-get (maybe host/Bridge already created it)", () => {
-		expect(classifyThreadCreate(403)).toBe("confirm-via-get");
-		expect(classifyThreadCreate(404)).toBe("confirm-via-get");
-		expect(classifyThreadCreate(429)).toBe("confirm-via-get");
-		expect(classifyThreadCreate(500)).toBe("confirm-via-get");
-		expect(classifyThreadCreate(503)).toBe("confirm-via-get");
-	});
-	test("other 4xx (e.g. 400 without 160004) → failed", () => {
-		expect(classifyThreadCreate(400)).toBe("failed");
-		expect(classifyThreadCreate(401)).toBe("failed");
-	});
+describe("threadGetConfirmsExistence", () => {
 	test("threadGetConfirmsExistence: only 200 confirms", () => {
 		expect(threadGetConfirmsExistence(200)).toBe(true);
 		expect(threadGetConfirmsExistence(404)).toBe(false);
