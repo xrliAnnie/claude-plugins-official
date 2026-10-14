@@ -7,7 +7,7 @@ const start = source.indexOf("async function ensureRoundtableThread(");
 const body = source.slice(start, source.indexOf("\n}", start) + 2);
 const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(body);
 
-function ensureFixture(foundAt: number, confirmOnly = false, slow = false) {
+function ensureFixture(foundAt: number, confirmOnly = false, slow = false, token = "token") {
   let probes = 0;
   let elapsed = 0;
   let creates = 0;
@@ -15,7 +15,7 @@ function ensureFixture(foundAt: number, confirmOnly = false, slow = false) {
   const build = new Function("TOKEN", "roundtableThreadExists", "RT_GET_CONFIRM_RETRIES",
     "RT_GET_CONFIRM_DELAY_MS", "buildRoundtableThreadCreateBody", "fetch", "RT_DISCORD_API",
     "classifyThreadCreate", "process", "setTimeout", "performance", `${compiled}; return ensureRoundtableThread`);
-  const ensure = build("token", async (_id: string, _parent: string, timeout?: number) => {
+  const ensure = build(token, async (_id: string, _parent: string, timeout?: number) => {
     probes++;
     if (slow) elapsed += timeout ?? 5000;
     return probes === foundAt;
@@ -38,11 +38,11 @@ describe("FLY-3698 host-first server routing", () => {
     expect(fixture.counts().creates).toBe(0);
     expect(fixture.counts().probes).toBe(2);
   });
-  test("host absent: Lead falls back only after the confirmation window", async () => {
+  test("host absent: recipient never creates after the confirmation window", async () => {
     const fixture = ensureFixture(-1);
-    expect(await fixture.run()).toBe(true);
+    expect(await fixture.run()).toBe(false);
     expect(fixture.counts().probes).toBe(12);
-    expect(fixture.counts().creates).toBe(1);
+    expect(fixture.counts().creates).toBe(0);
     expect(fixture.counts().elapsed).toBe(5500);
   });
   test("follow-up uses the same window but never creates", async () => {
@@ -51,11 +51,35 @@ describe("FLY-3698 host-first server routing", () => {
     expect(fixture.counts().probes).toBe(12);
     expect(fixture.counts().creates).toBe(0);
   });
-  test("slow confirmation is bounded by 6000ms before a fresh fallback signal", async () => {
+  test("slow confirmation is bounded by 6000ms without creating", async () => {
     const fixture = ensureFixture(-1, false, true);
-    expect(await fixture.run()).toBe(true);
+    expect(await fixture.run()).toBe(false);
     expect(fixture.counts().elapsed).toBeLessThanOrEqual(6000);
-    expect(fixture.counts().signals[0].aborted).toBe(false);
+    expect(fixture.counts().creates).toBe(0);
+  });
+  test("host starting after timeout can be confirmed on a later retry", async () => {
+    const fixture = ensureFixture(14);
+    expect(await fixture.run()).toBe(false);
+    expect(await fixture.run()).toBe(true);
+    expect(fixture.counts().creates).toBe(0);
+  });
+  test("concurrent recipients only confirm an already-started host", async () => {
+    const a = ensureFixture(1);
+    const b = ensureFixture(1);
+    expect(await Promise.all([a.run(), b.run()])).toEqual([true, true]);
+    expect(a.counts().creates + b.counts().creates).toBe(0);
+  });
+  test("a host starting at the final probe is used without creating", async () => {
+    const fixture = ensureFixture(12);
+    expect(await fixture.run()).toBe(true);
+    expect(fixture.counts().probes).toBe(12);
+    expect(fixture.counts().creates).toBe(0);
+  });
+  test("missing credentials cannot create or probe", async () => {
+    const fixture = ensureFixture(-1, false, false, "");
+    expect(await fixture.run()).toBe(false);
+    expect(fixture.counts().probes).toBe(0);
+    expect(fixture.counts().creates).toBe(0);
   });
   test("system messages never reach inbound, including allowed Lead bots", () => {
     const callbackStart = source.indexOf("client.on('messageCreate', msg => {");
