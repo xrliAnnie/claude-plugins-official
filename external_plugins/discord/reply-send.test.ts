@@ -13,6 +13,11 @@ const fastRetry: SendWithRetryOpts = {
 }
 
 describe('buildChunkPayload', () => {
+
+  it('keeps every founder-topic reply strict even when replyToMode would be off', () => {
+    const opts = { files: [], reply_to: 'founder-topic', replyMode: 'all' as const, failIfNotExists: true }
+    expect(buildChunkPayload(2, ['a', 'b', 'c'], opts).reply).toEqual({ messageReference: 'founder-topic', failIfNotExists: true })
+  })
   const chunks = ['a', 'b', 'c']
 
   it('attaches files only to the first chunk', () => {
@@ -42,6 +47,16 @@ describe('buildChunkPayload', () => {
 })
 
 describe('sendReplyChunks', () => {
+  it.each([0, 1])('stops without unreferenced fallback when the founder topic disappears after %s chunks', async delivered => {
+    const seen: SendPayload[] = []
+    await expect(sendReplyChunks(async payload => {
+      seen.push(payload)
+      if (seen.length > delivered) throw new Error('Unknown message reference')
+      return { id: String(seen.length) }
+    }, ['a', 'b', 'c'], { files: [], reply_to: 'founder-topic', replyMode: 'all', failIfNotExists: true }, fastRetry)).rejects.toThrow(`delivering ${delivered} of 3`)
+    expect(seen.length).toBe(delivered + 1)
+    expect(seen.every(payload => payload.reply?.messageReference === 'founder-topic' && payload.reply.failIfNotExists)).toBe(true)
+  })
   const opts = { files: [], reply_to: undefined, replyMode: 'first' as const }
 
   it('sends every chunk once on success and returns ids', async () => {

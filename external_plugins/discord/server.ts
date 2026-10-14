@@ -60,13 +60,13 @@ import { resolveGroupMentionPatterns } from './mention-patterns'
 import {
   loadRoundtableConfig,
   resolveRoundtableInboundChatId,
+  roundtableParentReplyHint,
   isRoundtableTopicThread,
   createThreadBudgetStore,
   decideTopicThreadHandling,
   seedThreadBudget,
   shouldProbeTopicThreadMembership,
   shouldSeedInitiatorBudget,
-  classifyThreadCreate,
   threadGetConfirmsExistence,
   confirmThreadUnderParent,
   rememberRoundtableRedirect,
@@ -74,7 +74,6 @@ import {
   type RoundtableConfig,
 } from './roundtable-thread-policy'
 import { loadSharedRoundtableRouting } from './roundtable-shared-routing'
-import { buildRoundtableThreadCreateBody } from './roundtable-archive-policy'
 import {
   GatewayHealthMonitor,
   type GatewayHealthScheduler,
@@ -173,20 +172,21 @@ const RT_DISCORD_API = 'https://discord.com/api/v10'
 // FLY-314 auto-thread manager / host bot creates the topic thread and a member bot
 // only needs to send into it. So a failed create is not necessarily fatal — confirm
 // the thread (id == message id) exists with a short bounded retry for the race.
-const RT_GET_CONFIRM_RETRIES = 3
-const RT_GET_CONFIRM_DELAY_MS = 400
+const RT_GET_CONFIRM_RETRIES = 12
+const RT_GET_CONFIRM_DELAY_MS = 500
 
 // GET /channels/{threadId}: 200 confirms the thread exists. Anything else (or a
 // network error) → not confirmed.
 async function roundtableThreadExists(
   threadId: string,
   parentChannelId: string,
+  timeoutMs = 5000,
 ): Promise<boolean> {
   if (!TOKEN) return false
   try {
     const res = await fetch(`${RT_DISCORD_API}/channels/${threadId}`, {
       headers: { Authorization: `Bot ${TOKEN}` },
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(timeoutMs),
     })
     if (!threadGetConfirmsExistence(res.status)) return false
     // FLY-314 fix (Codex R4 note 3): a 200 alone doesn't prove this is a topic thread
@@ -201,91 +201,24 @@ async function roundtableThreadExists(
   }
 }
 
-// Ensure the topic thread for a roundtable message exists, or CONFIRM an already-
-// created one (idempotent). Thread id == source message id (Discord "thread from
-// message" invariant). Returns TRUE only when the thread is CONFIRMED to exist —
-// Codex code review (FLY-314 R1#2): the caller must NOT present an unconfirmed
-// thread id to the agent. Confirmation paths:
-//   - this bot created it (2xx), or it already had one (code 160004);
-//   - FLY-569 R1#2: create was denied/raced (403/404/429/5xx/network) BUT a host
-//     bot / the Bridge manager created it and GET /channels/{messageId} confirms it
-//     (bounded retry). Otherwise FALSE → caller keeps the parent channel (prior
-//     safe fallback).
+// Recipients may only confirm a host/initiator-created thread. A timeout never
+// grants another Lead authority to create; FALSE keeps the existing parent route.
 async function ensureRoundtableThread(
   parentChannelId: string,
   targetMessageId: string,
-  opts: { confirmOnly?: boolean; desiredName?: string } = {},
 ): Promise<boolean> {
   if (!TOKEN) return false
-
-  // FLY-314 fix: a FOLLOW-UP (Discord reply) routes into an EXISTING topic thread —
-  // confirm-only, NEVER create. Creating a thread from the referenced id would just
-  // move the over-spawn (a second thread on the referenced message). If it can't be
-  // confirmed as a thread under the roundtable parent, the caller keeps the parent.
-  if (opts.confirmOnly) {
-    for (let i = 0; i < RT_GET_CONFIRM_RETRIES; i++) {
-      if (await roundtableThreadExists(targetMessageId, parentChannelId)) return true
-      if (i < RT_GET_CONFIRM_RETRIES - 1) {
-        await new Promise((r) => setTimeout(r, RT_GET_CONFIRM_DELAY_MS))
-      }
-    }
-    return false
-  }
-
-  const createBody = await buildRoundtableThreadCreateBody(
-    parentChannelId,
-    opts.desiredName || 'Roundtable topic',
-    TOKEN,
-  )
-  if (!createBody) {
-    process.stderr.write(
-      `[roundtable] ensureThread ${targetMessageId}: parent archive policy unresolved; create held\n`,
-    )
-    return false
-  }
-  let createStatus = 0 // 0 = network/timeout on create → treat as "maybe exists"
-  let createCode: number | undefined
-  try {
-    const res = await fetch(
-      `${RT_DISCORD_API}/channels/${parentChannelId}/messages/${targetMessageId}/threads`,
-      {
-        method: 'POST',
-        headers: { Authorization: `Bot ${TOKEN}`, 'Content-Type': 'application/json' },
-        // FLY-314 fix: correct-from-start descriptive name (no more hard-coded
-        // 'Roundtable topic' placeholder). Falls back only when no name was derived.
-        body: JSON.stringify(createBody),
-        signal: AbortSignal.timeout(5000),
-      },
-    )
-    createStatus = res.status
-    if (res.status === 400 || res.status === 409) {
-      try {
-        const body = (await res.json()) as { code?: number }
-        createCode = body?.code
-      } catch {}
-    }
-  } catch (e) {
-    process.stderr.write(`[roundtable] ensureThread ${targetMessageId} create error: ${e}\n`)
-    createStatus = 0
-  }
-
-  const outcome =
-    createStatus === 0 ? 'confirm-via-get' : classifyThreadCreate(createStatus, createCode)
-  if (outcome === 'created' || outcome === 'exists') return true
-  if (outcome === 'failed') {
-    process.stderr.write(`[roundtable] ensureThread ${targetMessageId}: HTTP ${createStatus} (unconfirmed)\n`)
-    return false
-  }
-  // confirm-via-get: poll for a host/Bridge-created thread with a bounded retry.
+  const deadline = performance.now() + RT_GET_CONFIRM_RETRIES * RT_GET_CONFIRM_DELAY_MS
   for (let i = 0; i < RT_GET_CONFIRM_RETRIES; i++) {
-    if (await roundtableThreadExists(targetMessageId, parentChannelId)) return true
-    if (i < RT_GET_CONFIRM_RETRIES - 1) {
-      await new Promise((r) => setTimeout(r, RT_GET_CONFIRM_DELAY_MS))
+    const remaining = deadline - performance.now()
+    if (remaining <= 0) break
+    if (await roundtableThreadExists(targetMessageId, parentChannelId, Math.max(1, Math.ceil(Math.min(5000, remaining))))) return true
+    const pause = Math.min(RT_GET_CONFIRM_DELAY_MS, deadline - performance.now())
+    if (i < RT_GET_CONFIRM_RETRIES - 1 && pause > 0) {
+      await new Promise((r) => setTimeout(r, pause))
     }
   }
-  process.stderr.write(
-    `[roundtable] ensureThread ${targetMessageId}: create HTTP ${createStatus}, GET-confirm exhausted (unconfirmed)\n`,
-  )
+  process.stderr.write(`[roundtable] initiating Lead thread ${targetMessageId} unavailable; recipient creation refused, keeping parent route\n`)
   return false
 }
 
@@ -1383,7 +1316,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const access = loadAccess()
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
-        const replyMode = access.replyToMode ?? 'first'
+        const strictParentReply = !!RT_CFG && chat_id === RT_CFG.channelId && !!reply_to
+        const replyMode = strictParentReply ? 'all' : access.replyToMode ?? 'first'
         const chunks = chunk(text, limit, mode)
         // FLY-306: send each chunk with bounded retry on transient failures.
         // The loop advances only on a successful send, so chunks already
@@ -1398,7 +1332,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             () => ch.send(payload),
           ),
           chunks,
-          { files, reply_to, replyMode },
+          { files, reply_to, replyMode, ...(strictParentReply ? { failIfNotExists: true } : {}) },
           replyRetryOpts,
           noteSent,
         )
@@ -1647,6 +1581,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 })
 
 client.on('messageCreate', msg => {
+  if (msg.system) return
   // Never process our own messages — prevents typing keepalive re-trigger on reply echo.
   if (msg.author.id === client.user?.id) {
     gatewayHealth.onSelfEcho(msg.id, msg.channelId)
@@ -1694,6 +1629,7 @@ async function handleInbound(msg: Message): Promise<void> {
         messageId: msg.id,
         isThread: msg.channel.isThread(),
         parentId: msg.channel.isThread() ? msg.channel.parentId ?? null : null,
+        authorBot: msg.author.bot,
         // FLY-314 fix: reply target → follow-up routing; content → naming + noise gate.
         referencedMessageId: msg.reference?.messageId ?? null,
         content: msg.content,
@@ -1704,12 +1640,8 @@ async function handleInbound(msg: Message): Promise<void> {
       // Only present the topic thread id to the agent once the thread is CONFIRMED to
       // exist (R1 finding 2) — otherwise the redirected reply could 404. On failure we
       // leave chat_id at the parent (the message is still answerable there).
-      // FLY-314 fix: a follow-up is confirm-only (never creates); a fresh topic gets a
-      // correct-from-start descriptive name.
-      const confirmed = await ensureRoundtableThread(msg.channelId, routed.sourceMessageId, {
-        confirmOnly: routed.confirmOnly,
-        desiredName: routed.threadName,
-      })
+      // Both new topics and follow-ups are confirm-only for a recipient Lead.
+      const confirmed = await ensureRoundtableThread(msg.channelId, routed.sourceMessageId)
       if (confirmed) {
         chat_id = routed.chatId
         routedToRoundtable = true
@@ -1770,7 +1702,9 @@ async function handleInbound(msg: Message): Promise<void> {
 
   // Attachment listing goes in meta only — an in-content annotation is
   // forgeable by any allowlisted sender typing that string.
-  const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
+  const originalContent = msg.content || (atts.length > 0 ? '(attachment)' : '')
+  const replyHint = RT_CFG ? roundtableParentReplyHint({ channelId: msg.channelId, messageId: msg.id, isThread: msg.channel.isThread(), parentId: msg.channel.isThread() ? msg.channel.parentId ?? null : null, authorBot: msg.author.bot, referencedMessageId: msg.reference?.messageId, content: msg.content }, RT_CFG) : undefined
+  const content = replyHint ? `${originalContent}\n\n${replyHint}` : originalContent
   const inboundMeta = {
     messageId: msg.id,
     originChannelId: msg.channelId,
