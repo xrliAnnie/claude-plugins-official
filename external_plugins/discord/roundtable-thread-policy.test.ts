@@ -12,6 +12,7 @@ import { test, expect, describe } from "bun:test";
 import {
 	loadRoundtableConfig,
 	resolveRoundtableInboundChatId,
+ roundtableParentReplyHint,
 	createThreadBudgetStore,
 	decideTopicThreadHandling,
 	seedThreadBudget,
@@ -146,10 +147,20 @@ describe("classifyThreadCreate / threadGetConfirmsExistence (FLY-569 R1#2)", () 
 	});
 });
 
+describe("founder topic choice A", () => {
+ test("human topic remains in parent, without waiting, and carries the original reply hint", () => {
+  const info = { channelId: RT, messageId: "123", isThread: false, parentId: null, authorBot: false, content: "Discuss this topic" };
+  expect(resolveRoundtableInboundChatId(info, cfgOn)).toEqual({ chatId: RT, routedToThread: false });
+  expect(roundtableParentReplyHint(info, cfgOn)).toContain("reply_to=123");
+  expect(roundtableParentReplyHint({ ...info, authorBot: true }, cfgOn)).toBeUndefined();
+  expect(roundtableParentReplyHint({ ...info, referencedMessageId: "earlier" }, cfgOn)).toBeUndefined();
+ });
+});
+
 describe("resolveRoundtableInboundChatId (R1 reply routing)", () => {
 	test("top-level roundtable message → chat_id rewritten to thread id (== msg id)", () => {
 		const r = resolveRoundtableInboundChatId(
-			{ channelId: RT, messageId: "M1", isThread: false, parentId: null },
+			{ channelId: RT, messageId: "M1", isThread: false, authorBot: true, parentId: null },
 			cfgOn,
 		);
 		expect(r.chatId).toBe("M1");
@@ -166,7 +177,7 @@ describe("resolveRoundtableInboundChatId (R1 reply routing)", () => {
 	});
 	test("non-roundtable channel → unchanged", () => {
 		const r = resolveRoundtableInboundChatId(
-			{ channelId: "other", messageId: "M", isThread: false, parentId: null },
+			{ channelId: "other", messageId: "M", isThread: false, authorBot: true, parentId: null },
 			cfgOn,
 		);
 		expect(r.chatId).toBe("other");
@@ -174,7 +185,7 @@ describe("resolveRoundtableInboundChatId (R1 reply routing)", () => {
 	});
 	test("replyInThread OFF → top-level roundtable unchanged (byte-compat)", () => {
 		const r = resolveRoundtableInboundChatId(
-			{ channelId: RT, messageId: "M1", isThread: false, parentId: null },
+			{ channelId: RT, messageId: "M1", isThread: false, authorBot: true, parentId: null },
 			{ ...cfgOn, replyInThread: false },
 		);
 		expect(r.chatId).toBe(RT);
@@ -439,7 +450,7 @@ describe("resolveRoundtableInboundChatId — FLY-314 fix (follow-up + noise + na
 			{
 				channelId: RT,
 				messageId: "M1",
-				isThread: false,
+				isThread: false, authorBot: true,
 				parentId: null,
 				content: "<@1> deploy plan sync",
 			},
@@ -457,7 +468,7 @@ describe("resolveRoundtableInboundChatId — FLY-314 fix (follow-up + noise + na
 			{
 				channelId: RT,
 				messageId: "M2",
-				isThread: false,
+				isThread: false, authorBot: true,
 				parentId: null,
 				referencedMessageId: "M1",
 				content: "agreed, ship it",
@@ -473,7 +484,7 @@ describe("resolveRoundtableInboundChatId — FLY-314 fix (follow-up + noise + na
 	test("noise (pure emoji) fresh top-level → NOT routed to a thread (reply stays in parent)", () => {
 		for (const content of ["👍👍", "🎉", "<:tada:1>", "ok"]) {
 			const r = resolveRoundtableInboundChatId(
-				{ channelId: RT, messageId: "M3", isThread: false, parentId: null, content },
+				{ channelId: RT, messageId: "M3", isThread: false, authorBot: true, parentId: null, content },
 				cfgOn,
 			);
 			expect(r.chatId).toBe(RT);
@@ -483,7 +494,7 @@ describe("resolveRoundtableInboundChatId — FLY-314 fix (follow-up + noise + na
 
 	test("byte-compat: top-level with no content/ref still routes to its thread (no confirmOnly)", () => {
 		const r = resolveRoundtableInboundChatId(
-			{ channelId: RT, messageId: "M1", isThread: false, parentId: null },
+			{ channelId: RT, messageId: "M1", isThread: false, authorBot: true, parentId: null },
 			cfgOn,
 		);
 		expect(r.chatId).toBe("M1");
