@@ -24,6 +24,7 @@ export interface ReplyChunkOpts {
   files: string[]
   reply_to?: string
   replyMode: 'off' | 'first' | 'all'
+  failIfNotExists?: boolean
 }
 
 /**
@@ -42,7 +43,7 @@ export function buildChunkPayload(
     content: chunks[i],
     ...(i === 0 && opts.files.length > 0 ? { files: opts.files } : {}),
     ...(shouldReplyTo
-      ? { reply: { messageReference: opts.reply_to as string, failIfNotExists: false } }
+      ? { reply: { messageReference: opts.reply_to as string, failIfNotExists: opts.failIfNotExists ?? false } }
       : {}),
   }
 }
