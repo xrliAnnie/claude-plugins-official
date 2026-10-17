@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
 import { roundtableParentReplyHint } from "./roundtable-thread-policy";
+import { SelfAuthorFilter, attachSelfAuthorFilter } from "./self-author-filter";
 
 // Exercise the real server functions without opening Discord or the MCP process.
 const source = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
@@ -105,18 +107,41 @@ describe("FLY-3698 host-first server routing", () => {
     expect(fixture.counts().probes).toBe(0);
     expect(fixture.counts().creates).toBe(0);
   });
-  test("system messages never reach inbound, including allowed Lead bots", () => {
-    const callbackStart = source.indexOf("client.on('messageCreate', msg => {");
-    const code = source.slice(callbackStart, source.indexOf("\n})", callbackStart) + 3);
-    let handler: (msg: unknown) => void = () => {};
+  test.each(["ready", "shardReconnecting"])("real self-filter wiring keeps system/self/disallowed messages out during %s", lifecycle => {
+    const callbackStart = source.indexOf("function admitInbound(");
+    expect(callbackStart).toBeGreaterThanOrEqual(0);
+    const stop = source.indexOf("\nasync function handleInbound", callbackStart);
+    expect(stop).toBeGreaterThan(callbackStart);
+    const code = new Bun.Transpiler({ loader: "ts" }).transformSync(source.slice(callbackStart, stop));
+    const self = "100000000000000001";
+    const lead = "100000000000000002";
+    const client = Object.assign(new EventEmitter(), { user: { id: self }, isReady: () => true });
+    const filter = new SelfAuthorFilter();
     const inbound: unknown[] = [];
-    new Function("client", "gatewayHealth", "loadAccess", "handleInbound", "process", code)(
-      { user: { id: "self" }, on: (_event: string, fn: typeof handler) => { handler = fn; } },
-      { onSelfEcho() {} }, () => ({ allowBots: ["lead"] }),
+    const echoes: string[] = [];
+    new Function("client", "selfAuthorFilter", "attachSelfAuthorFilter", "gatewayHealth", "gatewayHealthFiles", "loadAccess", "handleInbound", "process", code)(
+      client, filter, attachSelfAuthorFilter,
+      { onSelfEcho(id: string) { echoes.push(id); } }, { log() {} }, () => ({ allowBots: [lead, self] }),
       async (msg: unknown) => { inbound.push(msg); }, { stderr: { write() {} } });
-    handler({ system: true, author: { id: "lead", bot: true } });
+    const emit = (id: string, system: boolean, authorId = lead, bot = true) => {
+      const msg = { id, channelId: "channel", system, author: { id: authorId, bot } };
+      client.emit("messageCreate", msg);
+      return msg;
+    };
+    emit("before-ready", false);
     expect(inbound).toEqual([]);
-    handler({ system: false, author: { id: "lead", bot: true } });
-    expect(inbound).toHaveLength(1);
+    client.emit("ready");
+    if (lifecycle !== "ready") client.emit(lifecycle);
+    emit("system", true);
+    emit("disallowed", false, "100000000000000003");
+    emit("unknown", false, "");
+    emit("self-normal", false, self);
+    emit("self-system", true, self);
+    expect(inbound).toEqual([]);
+    expect(echoes).toEqual(["self-normal", "self-system"]);
+    const allowed = emit("allowed", false);
+    expect(inbound).toEqual([allowed]);
+    const human = emit("human", false, "100000000000000004", false);
+    expect(inbound).toEqual([allowed, human]);
   });
 });

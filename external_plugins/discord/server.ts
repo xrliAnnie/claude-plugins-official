@@ -86,6 +86,8 @@ import { GatewayHealthFiles } from './gateway-health-files'
 import { inspectRawShardReconnect } from './gateway-reconnect'
 import { attachGatewayLifecycleEvents, attachGatewayStatusEvents } from './gateway-wiring'
 import { GatewayStatusTelemetry, inspectHeartbeatInterval } from './gateway-status'
+import { SelfAuthorFilter, attachSelfAuthorFilter } from './self-author-filter'
+import { VoiceSelfFilterSocket } from './voice-self-filter-socket'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -474,6 +476,21 @@ const refreshGatewayStatusEvents = attachGatewayStatusEvents(client, {
   supported: () => discordJsVersion === '14.25.1' && discordWsVersion === '1.2.3',
   interval: id => inspectHeartbeatInterval(client.ws, id, discordJsVersion, discordWsVersion),
 })
+const selfAuthorFilter = new SelfAuthorFilter(undefined, seen => {
+  process.stderr.write(`discord self-filter identity changed to ${seen}; intake closed\n`)
+  gatewayHealthFiles.log('self-filter identity changed; intake closed')
+})
+const voiceSelfFilterSocket = RECORDER_MODE.kind === 'enabled' ? new VoiceSelfFilterSocket({
+  socketPath: join(STATE_DIR, 'voice-self-filter.sock'),
+  leadId: RECORDER_MODE.leadId,
+  secret: TOKEN,
+  observe: () => selfAuthorFilter.observe({
+    recorderEnabled: RECORDER_MODE.kind === 'enabled',
+    currentUserId: client.user?.id,
+    clientReady: client.isReady(),
+  }),
+}) : undefined
+
 const gatewayFailureAlerter = new GatewayFailureAlerter({
   alertChannelId: process.env.DISCORD_ALERT_CHANNEL,
   // The client's REST manager already owns DISCORD_BOT_TOKEN after login. This
@@ -1441,7 +1458,8 @@ function shutdown(): void {
   shuttingDown = true
   process.stderr.write('discord channel: shutting down\n')
   setTimeout(() => process.exit(0), 2000)
-  void Promise.resolve(client.destroy()).finally(() => process.exit(0))
+  selfAuthorFilter.disconnected()
+  void Promise.allSettled([Promise.resolve(client.destroy()), voiceSelfFilterSocket?.close()]).finally(() => process.exit(0))
 }
 process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)
@@ -1580,18 +1598,19 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     .catch(() => {})
 })
 
-client.on('messageCreate', msg => {
+function admitInbound(msg: Message): void {
   if (msg.system) return
-  // Never process our own messages — prevents typing keepalive re-trigger on reply echo.
-  if (msg.author.id === client.user?.id) {
-    gatewayHealth.onSelfEcho(msg.id, msg.channelId)
-    return
-  }
   if (msg.author.bot) {
     const access = loadAccess()
     if (!access.allowBots?.includes(msg.author.id)) return
   }
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
+}
+
+attachSelfAuthorFilter<Message>(client, selfAuthorFilter, {
+  onSelfEcho: msg => { gatewayHealth.onSelfEcho(msg.id, msg.channelId) },
+  log: message => { gatewayHealthFiles.log(message) },
+  onOther: admitInbound,
 })
 
 async function handleInbound(msg: Message): Promise<void> {
@@ -1808,6 +1827,15 @@ client.once('ready', c => {
   publishGatewayStatus()
   chatIngestRuntime.kickWorker()
 })
+
+if (voiceSelfFilterSocket) {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+  void voiceSelfFilterSocket.maintain({
+    report: state => { gatewayHealthFiles.log(`voice self-filter probe ${state}`) },
+  }).catch(() => {
+    process.stderr.write('discord voice self-filter probe unavailable; voice admission remains closed\n')
+  })
+}
 
 client.login(TOKEN).catch(err => {
   process.stderr.write(`discord channel: login failed: ${err}\n`)
