@@ -74,31 +74,6 @@ export function loadRoundtableConfig(
 	return { channelId, replyInThread, autoContinue, budgetN };
 }
 
-/**
- * FLY-569 R1#2 — classify the POST .../threads create response (PURE).
- *
- * An independently-launched companion bot may have View/Send in the roundtable
- * parent but NOT `Create Public Threads`. The FLY-314 auto-thread manager / host
- * bot creates the topic thread; a member bot only needs to send into it. So a
- * failed create is NOT necessarily fatal — the thread may already exist. The
- * server orchestrates: created/exists → route into the thread; confirm-via-get →
- * GET the thread (id == message id) with a bounded retry for the manager race;
- * failed → fall back to the parent channel (the prior safe behavior).
- */
-export function classifyThreadCreate(
-	status: number,
-	bodyCode?: number,
-): "created" | "exists" | "confirm-via-get" | "failed" {
-	if (status >= 200 && status < 300) return "created";
-	// "A thread has already been created for this message" → code 160004.
-	if ((status === 400 || status === 409) && bodyCode === 160004) return "exists";
-	// 403 (no create perm), 404 (race / not yet), 429 (rate limited), 5xx (transient)
-	// → the thread may still exist (host/Bridge made it); confirm via GET.
-	if (status === 403 || status === 404 || status === 429 || status >= 500)
-		return "confirm-via-get";
-	return "failed"; // other 4xx (e.g. 400 without 160004) → real failure.
-}
-
 /** FLY-569 R1#2 — a GET /channels/{threadId} that returns 200 confirms the thread
  * exists; anything else does not (PURE). */
 export function threadGetConfirmsExistence(status: number): boolean {
@@ -211,6 +186,7 @@ export function shouldStripRoundtableReplyTo(
 export interface InboundChannelInfo {
 	channelId: string;
 	messageId: string;
+ authorBot?: boolean;
 	isThread: boolean;
 	/** Parent channel id when the message is in a thread, else null. */
 	parentId: string | null;
@@ -231,7 +207,7 @@ export interface InboundChatIdResolution {
 	routedToThread: boolean;
 	/**
 	 * FLY-314 fix: how the server must ensure the target thread.
-	 *  - undefined/false → create-or-confirm (a FRESH topic; may POST create).
+	 *  - undefined/false → fresh topic engagement (budget may be seeded).
 	 *  - true → confirm-only (a FOLLOW-UP into an existing thread; GET-verify only,
 	 *    NEVER create — else a follow-up over-spawns on the referenced id).
 	 */
@@ -268,7 +244,9 @@ export function resolveRoundtableInboundChatId(
 		if (info.content !== undefined && isTopicNoise(info.content)) {
 			return { chatId: info.channelId, routedToThread: false };
 		}
-		// Fresh topic → its own thread (id == message id), create-or-confirm + name.
+  // Only admitted bot authors hint at a future thread; Bridge decides the writer.
+  if (info.authorBot !== true) return { chatId: info.channelId, routedToThread: false };
+		// Fresh bot topic → only confirm its expected thread (id == message id).
 		return {
 			chatId: info.messageId,
 			sourceMessageId: info.messageId,
@@ -278,6 +256,12 @@ export function resolveRoundtableInboundChatId(
 		};
 	}
 	return { chatId: info.channelId, routedToThread: false };
+}
+
+/** A human parent topic is answered by quoting its original message (choice A). */
+export function roundtableParentReplyHint(info: InboundChannelInfo, cfg: RoundtableConfig): string | undefined {
+ if (!cfg.replyInThread || info.isThread || info.channelId !== cfg.channelId || info.referencedMessageId || info.authorBot !== false || isTopicNoise(info.content ?? "")) return undefined;
+ return `这是 founder 在圆桌的顶层话题，不会开 thread；用 reply 工具并带 reply_to=${info.messageId} 直接回复它。`;
 }
 
 /** Is this channel a roundtable TOPIC THREAD (a thread whose parent is the roundtable)? */
