@@ -67,6 +67,8 @@ import {
   seedThreadBudget,
   shouldProbeTopicThreadMembership,
   shouldSeedInitiatorBudget,
+  shouldSeedHumanTopicBudget,
+  shouldSeedRoutedTopicBudget,
   threadGetConfirmsExistence,
   confirmThreadUnderParent,
   rememberRoundtableRedirect,
@@ -1674,11 +1676,9 @@ async function handleInbound(msg: Message): Promise<void> {
         // Remember BOTH the routed topic source AND this message's own id so a
         // reply_to to either parent-channel id is stripped (FLY-314 Codex R3 HIGH#3).
         rtRememberRedirect(chat_id, routed.sourceMessageId, msg.id)
-        // Engaging a NEW top-level topic is a budget reset event (R1#1): seed N so the
-        // in-thread continuation that follows has budget. FLY-314 fix (Codex R2 HIGH#2):
-        // a FOLLOW-UP (confirmOnly) must NOT seed — a bot-authored follow-up cannot
-        // reset a spent budget. Bot triggers never seed.
-        if (RT_CFG.autoContinue && !routed.confirmOnly)
+        // FLY-3906: confirmed follow-ups initialize the topic budget once, never reset
+        // an existing entry (including exhausted 0); fresh topics retain their reset.
+        if (shouldSeedRoutedTopicBudget({ confirmOnly: routed.confirmOnly === true, hasBudget: rtBudget.budgets.has(chat_id), cfg: RT_CFG }))
           seedThreadBudget(rtBudget, chat_id, RT_CFG.budgetN)
       }
     }
@@ -1722,7 +1722,9 @@ async function handleInbound(msg: Message): Promise<void> {
   // Attachment listing goes in meta only — an in-content annotation is
   // forgeable by any allowlisted sender typing that string.
   const originalContent = msg.content || (atts.length > 0 ? '(attachment)' : '')
-  const replyHint = RT_CFG ? roundtableParentReplyHint({ channelId: msg.channelId, messageId: msg.id, isThread: msg.channel.isThread(), parentId: msg.channel.isThread() ? msg.channel.parentId ?? null : null, authorBot: msg.author.bot, referencedMessageId: msg.reference?.messageId, content: msg.content }, RT_CFG) : undefined
+  const rtInfo = { channelId: msg.channelId, messageId: msg.id, isThread: msg.channel.isThread(), parentId: msg.channel.isThread() ? msg.channel.parentId ?? null : null, authorBot: msg.author.bot, referencedMessageId: msg.reference?.messageId, content: msg.content }
+  const replyHint = RT_CFG ? roundtableParentReplyHint(rtInfo, RT_CFG) : undefined
+  if (RT_CFG && shouldSeedHumanTopicBudget(rtInfo, RT_CFG)) seedThreadBudget(rtBudget, msg.id, RT_CFG.budgetN)
   const content = replyHint ? `${originalContent}\n\n${replyHint}` : originalContent
   const inboundMeta = {
     messageId: msg.id,

@@ -7,11 +7,11 @@
  *     source message id — the Discord "thread from message" invariant), so the agent's
  *     reply lands INSIDE the thread instead of flat in the parent.
  *  2. no-@ in-thread continuation with a BOUNDED anti-loop budget. The central safety
- *     contract (Codex design review R1#1): inside a topic thread, ANY bot-authored
- *     trigger — even one that @-mentions this bot or quote-replies to it — consumes a
- *     finite per-thread budget and CANNOT reset or bypass it. The budget resets ONLY on
- *     a non-bot human message (or operator override / a brand-new top-level topic, which
- *     a fresh thread provides naturally). => bot-only loops terminate in <= budget steps.
+ *     contract (Codex design review R1#1): with autoContinue on and membership confirmed,
+ *     ANY in-thread bot trigger, even an @ or quote-reply, consumes finite budget and
+ *     cannot reset or bypass it. FLY-3906 seeds the topic source id on a human parent
+ *     topic and once on a confirmed parent follow-up when no entry exists. An existing
+ *     entry (including 0) is never reset by a follow-up. See seedThreadBudget for bounds.
  *
  * This module is intentionally free of any Discord/network side effects so the loop
  * proof can be exhaustively unit-tested (including the 2-bot adversarial case).
@@ -258,10 +258,24 @@ export function resolveRoundtableInboundChatId(
 	return { chatId: info.channelId, routedToThread: false };
 }
 
+function isHumanRoundtableTopic(info: InboundChannelInfo, cfg: RoundtableConfig): boolean {
+ return cfg.replyInThread && !info.isThread && info.channelId === cfg.channelId && !info.referencedMessageId && info.authorBot === false && !isTopicNoise(info.content ?? "");
+}
+
 /** A human parent topic is answered by quoting its original message (choice A). */
 export function roundtableParentReplyHint(info: InboundChannelInfo, cfg: RoundtableConfig): string | undefined {
- if (!cfg.replyInThread || info.isThread || info.channelId !== cfg.channelId || info.referencedMessageId || info.authorBot !== false || isTopicNoise(info.content ?? "")) return undefined;
+ if (!isHumanRoundtableTopic(info, cfg)) return undefined;
  return `这是 founder 在圆桌的顶层话题，不会开 thread；用 reply 工具并带 reply_to=${info.messageId} 直接回复它。`;
+}
+
+/** FLY-3906: the human topic source id is also its possible future thread id. */
+export function shouldSeedHumanTopicBudget(info: InboundChannelInfo, cfg: RoundtableConfig): boolean {
+ return cfg.autoContinue && isHumanRoundtableTopic(info, cfg);
+}
+
+/** Call only after thread confirmation: follow-ups initialize, never reset an entry. */
+export function shouldSeedRoutedTopicBudget(input: { confirmOnly: boolean; hasBudget: boolean; cfg: RoundtableConfig }): boolean {
+ return input.cfg.autoContinue && (!input.confirmOnly || !input.hasBudget);
 }
 
 /** Is this channel a roundtable TOPIC THREAD (a thread whose parent is the roundtable)? */
@@ -272,8 +286,7 @@ export function isRoundtableTopicThread(
 	return info.isThread && info.parentId === cfg.channelId;
 }
 
-/** Opaque per-thread budget store (process-local; cleared on restart = safe side:
- * a restart returns the thread to mention-required until a fresh human/@ reset). */
+/** Process-local budget; retain exhausted 0 entries so follow-ups cannot revive them. */
 export interface ThreadBudgetStore {
 	budgets: Map<string, number>;
 }
@@ -282,11 +295,13 @@ export function createThreadBudgetStore(): ThreadBudgetStore {
 }
 
 /**
- * Seed (reset) a thread's bot-only budget to N. Called ONLY on a genuine reset event:
- * a new top-level topic the Lead engages (its reply is routed into the thread) or a
- * non-bot human message. A bot-authored trigger must NEVER seed — see
- * decideTopicThreadHandling (Codex code review R1#1): a missing entry on a bot trigger
- * means "exhausted/drop", so process restart / state loss is NOT an implicit reset.
+ * Seed a thread's bot-only budget to N: (a) human in-thread message, (b) fresh routed
+ * topic, (c) own parent-channel send, (d) human parent topic source id, or (e) confirmed
+ * parent follow-up with no entry. (e) never resets an existing entry, including 0.
+ * With autoContinue on and membership confirmed, at most N in-thread bot messages are
+ * admitted after each effective seed. Parent follow-ups and non-member/unknown-member
+ * explicit @ paths retain their existing unbudgeted handling. The Map is not evicted.
+ * shortcut: restart lets (e) grant N once more per thread; persist budgets if this restart allowance must be removed.
  */
 export function seedThreadBudget(
 	store: ThreadBudgetStore,
@@ -318,7 +333,9 @@ export interface TopicThreadHandlingDecision {
 
 /**
  * Decide whether to deliver an inbound topic-thread message to the agent, applying the
- * bounded anti-loop budget. Mutates `store` (consumes/resets budget). See R1#1.
+ * bounded anti-loop budget when autoContinue is on and membership is confirmed.
+ * Mutates `store` (consumes/resets budget). Seed events (a)-(e) are listed above;
+ * parent follow-ups and explicit @ for non-members/unknown membership remain exceptions.
  */
 export function decideTopicThreadHandling(
 	input: TopicThreadHandlingInput,
@@ -346,8 +363,7 @@ export function decideTopicThreadHandling(
 	//     @-mentioned every line). Default-on; `autoContinue=0` (kill-switch) routes to (3).
 	//     An explicit @ also CONSUMES budget — it never bypasses or resets it (FLY-314 R1#1);
 	//     a MISSING entry means "exhausted" (NOT a fresh budget), so a process restart / state
-	//     loss / an un-seeded initiator falls on the safe side (the thread returns to
-	//     mention-required until a human / new-topic / initiator-seed reset).
+	//     loss / an un-seeded initiator drops until an explicit seed event listed above.
 	if (cfg.autoContinue && input.isMember === true) {
 		const remaining = store.budgets.get(input.threadId) ?? 0;
 		if (remaining > 0) {
@@ -379,8 +395,8 @@ export function decideTopicThreadHandling(
  * when autoContinue is on (the budget path is active). `server.ts` is the thin glue that, on a
  * successful parent-channel send, calls `seedThreadBudget` for the returned message id(s).
  *
- * restart-safe: the seed lives only in-process; a restart loses it and the initiator does not
- * re-post the topic, so there is no spurious re-seed — the thread returns to mention-required.
+ * The seed lives only in-process; a restart loses it. A later confirmed parent follow-up
+ * can initialize the missing entry once (FLY-3906), as documented at seedThreadBudget.
  */
 export function shouldSeedInitiatorBudget(input: {
 	sentToChannelId: string;

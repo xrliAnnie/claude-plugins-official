@@ -18,6 +18,8 @@ import {
 	seedThreadBudget,
 	shouldProbeTopicThreadMembership,
 	shouldSeedInitiatorBudget,
+	shouldSeedHumanTopicBudget,
+	shouldSeedRoutedTopicBudget,
 	threadGetConfirmsExistence,
 	confirmThreadUnderParent,
 	deriveRoundtableThreadName,
@@ -26,6 +28,7 @@ import {
 	shouldStripRoundtableReplyTo,
 	DEFAULT_ROUNDTABLE_THREAD_BUDGET,
 	type RoundtableConfig,
+	type InboundChannelInfo,
 } from "./roundtable-thread-policy";
 
 const RT = "1512578695468941333"; // roundtable parent channel id
@@ -42,6 +45,96 @@ const cfgOn12: RoundtableConfig = {
 	autoContinue: true,
 	budgetN: DEFAULT_ROUNDTABLE_THREAD_BUDGET,
 };
+
+describe("FLY-3906 founder topic → host first question → member in-thread reply", () => {
+	const topic: InboundChannelInfo = { channelId: RT, messageId: "T", authorBot: false, isThread: false, parentId: null, content: "Discuss the deployment plan" };
+	const botReply = { threadId: "T", authorIsSelf: false, authorIsBot: true, authorIsHuman: false, isExplicitMention: true, isMember: true };
+	const followup = { ...topic, messageId: "Q", authorBot: true, referencedMessageId: "T" };
+
+	function engage() {
+		const host = createThreadBudgetStore();
+		const member = createThreadBudgetStore();
+		expect(resolveRoundtableInboundChatId(topic, cfgOn12)).toEqual({ chatId: RT, routedToThread: false });
+		expect(shouldSeedHumanTopicBudget(topic, cfgOn12)).toBe(true);
+		if (shouldSeedHumanTopicBudget(topic, cfgOn12)) seedThreadBudget(host, topic.messageId, cfgOn12.budgetN);
+		if (shouldSeedInitiatorBudget({ sentToChannelId: RT, cfg: cfgOn12 })) seedThreadBudget(host, "Q", cfgOn12.budgetN);
+		const routed = resolveRoundtableInboundChatId(followup, cfgOn12);
+		expect(routed).toMatchObject({ chatId: "T", sourceMessageId: "T", routedToThread: true, confirmOnly: true });
+		expect(shouldSeedRoutedTopicBudget({ confirmOnly: true, hasBudget: false, cfg: cfgOn12 })).toBe(true);
+		if (shouldSeedRoutedTopicBudget({ confirmOnly: routed.confirmOnly === true, hasBudget: member.budgets.has(routed.chatId), cfg: cfgOn12 })) seedThreadBudget(member, routed.chatId, cfgOn12.budgetN);
+		return { host, member };
+	}
+
+	test("T1/T2: host receives the member reply, then member receives the host's next reply without another human event", () => {
+		const { host, member } = engage();
+		expect(decideTopicThreadHandling(botReply, host, cfgOn12).handle).toBe(true);
+		expect(decideTopicThreadHandling(botReply, member, cfgOn12).handle).toBe(true);
+	});
+
+	test("T3: old initiator-only seed on Q drops the member reply in T even with @", () => {
+		const host = createThreadBudgetStore();
+		seedThreadBudget(host, "Q", cfgOn12.budgetN);
+		expect(decideTopicThreadHandling(botReply, host, cfgOn12).handle).toBe(false);
+	});
+
+	test("T4/T5/T6: confirmed members consume exactly 12 each; repeated parent follow-ups cannot revive 0; human resets both", () => {
+		const { host, member } = engage();
+		const handled = [0, 0];
+		for (let i = 0; i < 50; i++) {
+			if (decideTopicThreadHandling(botReply, host, cfgOn12).handle) handled[0]++;
+			if (decideTopicThreadHandling(botReply, member, cfgOn12).handle) handled[1]++;
+		}
+		expect(handled).toEqual([12, 12]);
+		for (const store of [host, member]) {
+			for (let i = 0; i < 3; i++) {
+				const routed = resolveRoundtableInboundChatId(followup, cfgOn12);
+				const shouldSeed = shouldSeedRoutedTopicBudget({ confirmOnly: routed.confirmOnly === true, hasBudget: store.budgets.has(routed.chatId), cfg: cfgOn12 });
+				expect(shouldSeed).toBe(false);
+				if (shouldSeed) seedThreadBudget(store, routed.chatId, cfgOn12.budgetN);
+				expect(store.budgets.get("T")).toBe(0);
+				expect(decideTopicThreadHandling(botReply, store, cfgOn12).handle).toBe(false);
+			}
+			expect(decideTopicThreadHandling({ ...botReply, authorIsBot: false, authorIsHuman: true, isExplicitMention: false }, store, cfgOn12).handle).toBe(true);
+			expect(store.budgets.get("T")).toBe(12);
+		}
+	});
+
+	test("T7: only meaningful human roundtable parent topics seed", () => {
+		for (const info of [
+			{ ...topic, authorBot: true }, { ...topic, authorBot: undefined },
+			{ ...topic, referencedMessageId: "earlier" }, { ...topic, content: "👍" },
+			{ ...topic, channelId: "other" }, { ...topic, isThread: true, parentId: RT },
+		]) expect(shouldSeedHumanTopicBudget(info, cfgOn12)).toBe(false);
+		expect(shouldSeedHumanTopicBudget(topic, { ...cfgOn12, replyInThread: false })).toBe(false);
+	});
+
+	test("T8: continuation kill-switch disables both new seeds", () => {
+		const cfg = { ...cfgOn12, autoContinue: false };
+		expect(shouldSeedHumanTopicBudget(topic, cfg)).toBe(false);
+		for (const confirmOnly of [true, false]) for (const hasBudget of [true, false]) {
+			expect(shouldSeedRoutedTopicBudget({ confirmOnly, hasBudget, cfg })).toBe(false);
+		}
+	});
+
+	test("restart loses the entry: one confirmed follow-up can grant N again, in-thread bot alone cannot", () => {
+		const restarted = createThreadBudgetStore();
+		expect(decideTopicThreadHandling(botReply, restarted, cfgOn12).handle).toBe(false);
+		expect(shouldSeedRoutedTopicBudget({ confirmOnly: true, hasBudget: restarted.budgets.has("T"), cfg: cfgOn12 })).toBe(true);
+		seedThreadBudget(restarted, "T", cfgOn12.budgetN);
+		expect(decideTopicThreadHandling(botReply, restarted, cfgOn12).handle).toBe(true);
+		expect(shouldSeedRoutedTopicBudget({ confirmOnly: true, hasBudget: restarted.budgets.has("T"), cfg: cfgOn12 })).toBe(false);
+	});
+
+	test("T9: fresh bot topics still reset existing budgets; follow-ups preserve positive and zero entries", () => {
+		expect(shouldSeedRoutedTopicBudget({ confirmOnly: false, hasBudget: true, cfg: cfgOn12 })).toBe(true);
+		for (const remaining of [5, 0]) {
+			const store = createThreadBudgetStore();
+			store.budgets.set("T", remaining);
+			expect(shouldSeedRoutedTopicBudget({ confirmOnly: true, hasBudget: store.budgets.has("T"), cfg: cfgOn12 })).toBe(false);
+			expect(store.budgets.get("T")).toBe(remaining);
+		}
+	});
+});
 
 describe("loadRoundtableConfig", () => {
 	test("nothing set (no env channel, no routing) → undefined (byte-compat OFF)", () => {
