@@ -1,8 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
-import * as roundtablePolicy from "./roundtable-thread-policy";
-import { createThreadBudgetStore, roundtableParentReplyHint, resolveRoundtableInboundChatId, seedThreadBudget } from "./roundtable-thread-policy";
+import { createThreadBudgetStore, roundtableParentReplyHint, resolveRoundtableInboundChatId, seedThreadBudget, shouldSeedHumanTopicBudget, shouldSeedRoutedTopicBudget } from "./roundtable-thread-policy";
 import { SelfAuthorFilter, attachSelfAuthorFilter } from "./self-author-filter";
 
 // Exercise the real server functions without opening Discord or the MCP process.
@@ -21,7 +20,7 @@ function humanTopicFixture() {
   const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(source.slice(start, stop));
   const render = new Function("msg", "atts", "RT_CFG", "roundtableParentReplyHint", "shouldSeedHumanTopicBudget", "seedThreadBudget", "rtBudget", `${compiled}; return content`);
   const store = createThreadBudgetStore();
-  return { store, render: (message: unknown, cfg: typeof rtCfg | undefined) => render(message, [], cfg, roundtableParentReplyHint, roundtablePolicy.shouldSeedHumanTopicBudget, seedThreadBudget, store) };
+  return { store, render: (message: unknown, cfg: typeof rtCfg | undefined) => render(message, [], cfg, roundtableParentReplyHint, shouldSeedHumanTopicBudget, seedThreadBudget, store) };
 }
 
 const founderTopic = { id: "123", channelId: "parent", content: "Original founder topic", author: { bot: false }, reference: null, channel: { isThread: () => false } };
@@ -70,7 +69,7 @@ describe("FLY-3906 server budget wiring", () => {
     const build = new Function("msg", "RT_CFG", "resolveRoundtableInboundChatId", "ensureRoundtableThread", "rtRememberRedirect", "shouldSeedRoutedTopicBudget", "seedThreadBudget", "rtBudget", `${compiled}; return route`);
     const store = createThreadBudgetStore();
     const message = { ...founderTopic, id: "question", author: { bot: true }, reference: { messageId: "123" } };
-    const route = (confirmed: boolean, fresh = false) => build({ ...message, reference: fresh ? null : message.reference }, rtCfg, resolveRoundtableInboundChatId, async () => confirmed, () => {}, roundtablePolicy.shouldSeedRoutedTopicBudget, seedThreadBudget, store)();
+    const route = (confirmed: boolean, fresh = false) => build({ ...message, reference: fresh ? null : message.reference }, rtCfg, resolveRoundtableInboundChatId, async () => confirmed, () => {}, shouldSeedRoutedTopicBudget, seedThreadBudget, store)();
     expect(await route(false)).toMatchObject({ chat_id: "parent", routedToRoundtable: false });
     expect(store.budgets.size).toBe(0);
     expect(await route(true)).toMatchObject({ chat_id: "123", routedToRoundtable: true, replyRoute: { threadId: "123", sourceMessageId: "123" } });
