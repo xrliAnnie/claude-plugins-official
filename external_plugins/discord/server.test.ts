@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
-import { roundtableParentReplyHint } from "./roundtable-thread-policy";
+import * as roundtablePolicy from "./roundtable-thread-policy";
+import { createThreadBudgetStore, roundtableParentReplyHint, resolveRoundtableInboundChatId, seedThreadBudget } from "./roundtable-thread-policy";
 import { SelfAuthorFilter, attachSelfAuthorFilter } from "./self-author-filter";
 
 // Exercise the real server functions without opening Discord or the MCP process.
@@ -10,15 +11,26 @@ const start = source.indexOf("async function ensureRoundtableThread(");
 const body = source.slice(start, source.indexOf("\n}", start) + 2);
 const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(body);
 
+const rtCfg = { channelId: "parent", replyInThread: true, autoContinue: true, budgetN: 12 };
+
+function humanTopicFixture() {
+  const start = source.indexOf("  const originalContent = msg.content");
+  const stop = source.indexOf("\n  const inboundMeta", start);
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(stop).toBeGreaterThan(start);
+  const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(source.slice(start, stop));
+  const render = new Function("msg", "atts", "RT_CFG", "roundtableParentReplyHint", "shouldSeedHumanTopicBudget", "seedThreadBudget", "rtBudget", `${compiled}; return content`);
+  const store = createThreadBudgetStore();
+  return { store, render: (message: unknown, cfg: typeof rtCfg | undefined) => render(message, [], cfg, roundtableParentReplyHint, roundtablePolicy.shouldSeedHumanTopicBudget, seedThreadBudget, store) };
+}
+
+const founderTopic = { id: "123", channelId: "parent", content: "Original founder topic", author: { bot: false }, reference: null, channel: { isThread: () => false } };
+
 describe("choice A server wiring", () => {
   test("human parent topics include the source reply reference instruction in model input", () => {
-    const start = source.indexOf("  const originalContent = msg.content");
-    const snippet = source.slice(start, source.indexOf("\n  const inboundMeta", start));
-    const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(snippet);
-    const render = new Function("msg", "atts", "RT_CFG", "roundtableParentReplyHint", `${compiled}; return content`);
-    const message = { id: "123", channelId: "parent", content: "Original founder topic", author: { bot: false }, reference: null, channel: { isThread: () => false } };
-    expect(render(message, [], { channelId: "parent", replyInThread: true }, roundtableParentReplyHint)).toContain("reply_to=123");
-    expect(render({ ...message, author: { bot: true } }, [], { channelId: "parent", replyInThread: true }, roundtableParentReplyHint)).toBe(message.content);
+    const fixture = humanTopicFixture();
+    expect(fixture.render(founderTopic, rtCfg)).toBe(`${founderTopic.content}\n\n这是 founder 在圆桌的顶层话题，不会开 thread；用 reply 工具并带 reply_to=123 直接回复它。`);
+    expect(fixture.render({ ...founderTopic, author: { bot: true } }, rtCfg)).toBe(founderTopic.content);
   });
   test.each(["off", "first", "all"])("roundtable parent references override reply mode %s with strict all-chunk options", async replyToMode => {
     const start = source.indexOf("        const strictParentReply =");
@@ -30,6 +42,47 @@ describe("choice A server wiring", () => {
     expect(await options("parent")).toMatchObject({ replyMode: "all", reply_to: "123", failIfNotExists: true });
     expect(await options("other")).toMatchObject({ replyMode: replyToMode });
     expect(await options("other")).not.toHaveProperty("failIfNotExists");
+  });
+});
+
+describe("FLY-3906 server budget wiring", () => {
+  test("human parent topic seeds its source id before delivery", () => {
+    const fixture = humanTopicFixture();
+    fixture.render(founderTopic, rtCfg);
+    expect(fixture.store.budgets.get(founderTopic.id)).toBe(12);
+    expect(fixture.store.budgets.has("parent")).toBe(false);
+  });
+
+  test("bot topics and disabled/unconfigured continuation do not seed human-topic budget", () => {
+    const fixture = humanTopicFixture();
+    fixture.render({ ...founderTopic, author: { bot: true } }, rtCfg);
+    fixture.render(founderTopic, { ...rtCfg, autoContinue: false });
+    fixture.render(founderTopic, undefined);
+    expect(fixture.store.budgets.size).toBe(0);
+  });
+
+  test("confirmed first follow-up seeds the topic, preserves existing budgets, and never seeds on failed confirmation", async () => {
+    const start = source.indexOf("  let chat_id = msg.channelId");
+    const stop = source.indexOf("\n  if (msg.channel.type === ChannelType.DM)", start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(stop).toBeGreaterThan(start);
+    const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(`async function route() { ${source.slice(start, stop)}; return { chat_id, routedToRoundtable, replyRoute } }`);
+    const build = new Function("msg", "RT_CFG", "resolveRoundtableInboundChatId", "ensureRoundtableThread", "rtRememberRedirect", "shouldSeedRoutedTopicBudget", "seedThreadBudget", "rtBudget", `${compiled}; return route`);
+    const store = createThreadBudgetStore();
+    const message = { ...founderTopic, id: "question", author: { bot: true }, reference: { messageId: "123" } };
+    const route = (confirmed: boolean, fresh = false) => build({ ...message, reference: fresh ? null : message.reference }, rtCfg, resolveRoundtableInboundChatId, async () => confirmed, () => {}, roundtablePolicy.shouldSeedRoutedTopicBudget, seedThreadBudget, store)();
+    expect(await route(false)).toMatchObject({ chat_id: "parent", routedToRoundtable: false });
+    expect(store.budgets.size).toBe(0);
+    expect(await route(true)).toMatchObject({ chat_id: "123", routedToRoundtable: true, replyRoute: { threadId: "123", sourceMessageId: "123" } });
+    expect(store.budgets.get("123")).toBe(12);
+    for (const remaining of [5, 0]) {
+      store.budgets.set("123", remaining);
+      await route(true);
+      expect(store.budgets.get("123")).toBe(remaining);
+    }
+    store.budgets.set("question", 0);
+    await route(true, true);
+    expect(store.budgets.get("question")).toBe(12);
   });
 });
 
