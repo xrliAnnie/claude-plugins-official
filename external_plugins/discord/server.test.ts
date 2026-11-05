@@ -11,14 +11,14 @@ const body = source.slice(start, source.indexOf("\n}", start) + 2);
 const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(body);
 
 describe("choice A server wiring", () => {
-  test("human parent topics include the source reply reference instruction in model input", () => {
+  test.each(["parent", "decision"])("human %s topics include the source reply reference instruction in model input", (parent) => {
     const start = source.indexOf("  const originalContent = msg.content");
     const snippet = source.slice(start, source.indexOf("\n  const inboundMeta", start));
     const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(snippet);
     const render = new Function("msg", "atts", "RT_CFG", "roundtableParentReplyHint", `${compiled}; return content`);
-    const message = { id: "123", channelId: "parent", content: "Original founder topic", author: { bot: false }, reference: null, channel: { isThread: () => false } };
-    expect(render(message, [], { channelId: "parent", replyInThread: true }, roundtableParentReplyHint)).toContain("reply_to=123");
-    expect(render({ ...message, author: { bot: true } }, [], { channelId: "parent", replyInThread: true }, roundtableParentReplyHint)).toBe(message.content);
+    const message = { id: "123", channelId: parent, content: "Original founder topic", author: { bot: false }, reference: null, channel: { isThread: () => false } };
+    expect(render(message, [], { channelIds: ["parent", "decision"], replyInThread: true }, roundtableParentReplyHint)).toContain("reply_to=123");
+    expect(render({ ...message, author: { bot: true } }, [], { channelIds: ["parent", "decision"], replyInThread: true }, roundtableParentReplyHint)).toBe(message.content);
   });
   test.each(["off", "first", "all"])("roundtable parent references override reply mode %s with strict all-chunk options", async replyToMode => {
     const start = source.indexOf("        const strictParentReply =");
@@ -26,8 +26,9 @@ describe("choice A server wiring", () => {
     const snippet = source.slice(start, stop) + "\n); return sentIds";
     const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(`async function options() { ${snippet} }`);
     const build = new Function("RT_CFG", "chat_id", "reply_to", "access", "chunk", "text", "limit", "mode", "sendReplyChunks", "files", "replyRetryOpts", `${compiled}; return options`);
-    const options = (channel: string) => build({ channelId: "parent" }, channel, "123", { replyToMode }, () => ["a", "b"], "text", 1900, "length", async (_send: unknown, _chunks: unknown, opts: unknown) => opts, [], {})();
+    const options = (channel: string) => build({ channelIds: ["parent", "decision"] }, channel, "123", { replyToMode }, () => ["a", "b"], "text", 1900, "length", async (_send: unknown, _chunks: unknown, opts: unknown) => opts, [], {})();
     expect(await options("parent")).toMatchObject({ replyMode: "all", reply_to: "123", failIfNotExists: true });
+    expect(await options("decision")).toMatchObject({ replyMode: "all", reply_to: "123", failIfNotExists: true });
     expect(await options("other")).toMatchObject({ replyMode: replyToMode });
     expect(await options("other")).not.toHaveProperty("failIfNotExists");
   });
