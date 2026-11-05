@@ -134,3 +134,9 @@ describe("loadSharedRoundtableRouting (IO + env precedence + warnings)", () => {
 		expect(warns.length).toBe(1);
 	});
 });
+
+
+test("FLY-4948 retains only snowflake decisionChannelId alongside the roundtable", () => {
+ expect(parseSharedRoundtableRouting(JSON.stringify({channelId: RT, decisionChannelId: "1567707434057728101", token: "secret"}))).toEqual({channelId: RT, decisionChannelId: "1567707434057728101"});
+ for (const decisionChannelId of ["bad", 123, null]) expect(parseSharedRoundtableRouting(JSON.stringify({channelId: RT, decisionChannelId}))).toEqual({channelId: RT});
+});

@@ -1333,7 +1333,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const access = loadAccess()
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
-        const strictParentReply = !!RT_CFG && chat_id === RT_CFG.channelId && !!reply_to
+        const strictParentReply = !!RT_CFG && RT_CFG.channelIds.includes(chat_id) && !!reply_to
         const replyMode = strictParentReply ? 'all' : access.replyToMode ?? 'first'
         const chunks = chunk(text, limit, mode)
         // FLY-306: send each chunk with bounded retry on transient failures.

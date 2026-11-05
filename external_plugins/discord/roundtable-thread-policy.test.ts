@@ -11,6 +11,7 @@
 import { test, expect, describe } from "bun:test";
 import {
 	loadRoundtableConfig,
+	isRoundtableTopicThread,
 	resolveRoundtableInboundChatId,
  roundtableParentReplyHint,
 	createThreadBudgetStore,
@@ -30,14 +31,14 @@ import {
 
 const RT = "1512578695468941333"; // roundtable parent channel id
 const cfgOn: RoundtableConfig = {
-	channelId: RT,
+	channelIds: [RT],
 	replyInThread: true,
 	autoContinue: true,
 	budgetN: 2,
 };
 // FLY-676: production-shape config (member-follow on, default budget 12).
 const cfgOn12: RoundtableConfig = {
-	channelId: RT,
+	channelIds: [RT],
 	replyInThread: true,
 	autoContinue: true,
 	budgetN: DEFAULT_ROUNDTABLE_THREAD_BUDGET,
@@ -50,7 +51,7 @@ describe("loadRoundtableConfig", () => {
 	});
 	test("FLY-569/FLY-676: env channel id without flags → reply routing + autoContinue DEFAULT-ON", () => {
 		const c = loadRoundtableConfig({ FLYWHEEL_ROUNDTABLE_CHANNEL_ID: RT });
-		expect(c?.channelId).toBe(RT);
+		expect(c?.channelIds).toEqual([RT]);
 		expect(c?.replyInThread).toBe(true); // was false pre-FLY-569 — now default-on
 		expect(c?.autoContinue).toBe(true); // FLY-676: member-follow now default-on (was false)
 		expect(c?.budgetN).toBe(12); // FLY-676: default budget 2 → 12
@@ -75,12 +76,12 @@ describe("loadRoundtableConfig", () => {
 			FLYWHEEL_ROUNDTABLE_CHANNEL_ID: RT,
 			FLYWHEEL_ROUNDTABLE_REPLY_IN_THREAD: "0",
 		});
-		expect(c?.channelId).toBe(RT);
+		expect(c?.channelIds).toEqual([RT]);
 		expect(c?.replyInThread).toBe(false);
 	});
 	test("FLY-569/FLY-676: routing channel only (env empty) → channelId from routing + reply+autoContinue default-on (Belle path)", () => {
 		const c = loadRoundtableConfig({}, { channelId: RT });
-		expect(c?.channelId).toBe(RT);
+		expect(c?.channelIds).toEqual([RT]);
 		expect(c?.replyInThread).toBe(true);
 		expect(c?.autoContinue).toBe(true); // FLY-676: default-on
 	});
@@ -89,7 +90,7 @@ describe("loadRoundtableConfig", () => {
 			{ FLYWHEEL_ROUNDTABLE_REPLY_IN_THREAD: "0" },
 			{ channelId: RT },
 		);
-		expect(c?.channelId).toBe(RT);
+		expect(c?.channelIds).toEqual([RT]);
 		expect(c?.replyInThread).toBe(false);
 	});
 	test("FLY-569: env channel wins over routing channel", () => {
@@ -97,7 +98,7 @@ describe("loadRoundtableConfig", () => {
 			{ FLYWHEEL_ROUNDTABLE_CHANNEL_ID: RT },
 			{ channelId: "999999999999999999" },
 		);
-		expect(c?.channelId).toBe(RT); // env wins
+		expect(c?.channelIds).toEqual([RT]); // env wins
 	});
 	test("full enable (explicit =1 still works)", () => {
 		const c = loadRoundtableConfig({
@@ -552,4 +553,22 @@ describe("rememberRoundtableRedirect / shouldStripRoundtableReplyTo — FLY-314 
 		expect(map.get("T1")!.has("real")).toBe(true);
 		expect(map.get("T1")!.size).toBe(1);
 	});
+});
+
+
+test("FLY-4948 decision parent uses all roundtable policies with per-thread routing", async () => {
+ const decision = "1567707434057728101";
+ const cfg = loadRoundtableConfig({}, { channelId: RT, decisionChannelId: decision })!;
+ expect(cfg.channelIds).toEqual([RT, decision]);
+ expect(loadRoundtableConfig({}, { channelId: RT, decisionChannelId: RT })?.channelIds).toEqual([RT]);
+ expect(loadRoundtableConfig({}, { decisionChannelId: decision })).toBeUndefined();
+ for (const parent of [RT, decision]) {
+  const info = { channelId: parent, messageId: "topic", isThread: false, parentId: null, authorBot: true, content: "a topic" };
+  expect(resolveRoundtableInboundChatId(info, cfg)).toMatchObject({ chatId: "topic", routedToThread: true });
+  expect(roundtableParentReplyHint({ ...info, authorBot: false }, cfg)).toBeDefined();
+  expect(isRoundtableTopicThread({ isThread: true, parentId: parent }, cfg)).toBe(true);
+  expect(shouldSeedInitiatorBudget({ sentToChannelId: parent, cfg })).toBe(true);
+ }
+ expect(isRoundtableTopicThread({isThread: true, parentId: "other"}, cfg)).toBe(false);
+ expect(shouldSeedInitiatorBudget({sentToChannelId: "other", cfg})).toBe(false);
 });

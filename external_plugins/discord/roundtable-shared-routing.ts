@@ -27,7 +27,7 @@ const SNOWFLAKE_RE = /^[0-9]{15,21}$/;
 /** Pure: parse the shared-config JSON text → at most a benign `{channelId}`.
  * Only a valid Discord snowflake survives; all other fields (incl. anything
  * token-shaped) are dropped. */
-export function parseSharedRoundtableRouting(text: string): { channelId?: string } {
+export function parseSharedRoundtableRouting(text: string): { channelId?: string; decisionChannelId?: string } {
 	let raw: unknown;
 	try {
 		raw = JSON.parse(text);
@@ -36,7 +36,12 @@ export function parseSharedRoundtableRouting(text: string): { channelId?: string
 	}
 	const id = (raw as { channelId?: unknown } | null)?.channelId;
 	const channelId = typeof id === "string" ? id.trim() : "";
-	return SNOWFLAKE_RE.test(channelId) ? { channelId } : {};
+	const decisionRaw = (raw as {decisionChannelId?:unknown} | null)?.decisionChannelId;
+ const decisionChannelId = typeof decisionRaw === "string" ? decisionRaw.trim() : "";
+ return {
+  ...(SNOWFLAKE_RE.test(channelId) ? {channelId} : {}),
+  ...(/^\d{17,20}$/.test(decisionChannelId) ? {decisionChannelId} : {}),
+ };
 }
 
 export interface SharedRoutingIO {
@@ -63,7 +68,7 @@ export function loadSharedRoundtableRouting(
 	warn: (msg: string) => void = (m) => {
 		process.stderr.write(m);
 	},
-): { channelId?: string } {
+): { channelId?: string; decisionChannelId?: string } {
 	const configured = (env.FLYWHEEL_ROUNDTABLE_CONFIG_FILE ?? "").trim();
 	const explicit = configured.length > 0;
 	const path = explicit ? configured : join(homedir(), ".flywheel", "roundtable.json");
