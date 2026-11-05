@@ -19,7 +19,7 @@
 
 export interface RoundtableConfig {
 	/** The roundtable parent channel id (where top-level topics are posted). */
-	channelId: string;
+	channelIds: string[];
 	/** Route replies to top-level roundtable messages into the topic thread. */
 	replyInThread: boolean;
 	/** Allow no-@ continuation inside topic threads (kill-switch: false = mention-required). */
@@ -53,7 +53,7 @@ export const DEFAULT_ROUNDTABLE_THREAD_BUDGET = 12;
  * steps, reset only by a human message / new topic. */
 export function loadRoundtableConfig(
 	env: Record<string, string | undefined>,
-	routing?: { channelId?: string },
+	routing?: { channelId?: string; decisionChannelId?: string },
 ): RoundtableConfig | undefined {
 	const channelId =
 		(env.FLYWHEEL_ROUNDTABLE_CHANNEL_ID ?? "").trim() ||
@@ -71,7 +71,7 @@ export function loadRoundtableConfig(
 	);
 	const budgetN =
 		Number.isFinite(rawN) && rawN > 0 ? rawN : DEFAULT_ROUNDTABLE_THREAD_BUDGET;
-	return { channelId, replyInThread, autoContinue, budgetN };
+	return { channelIds: [...new Set([channelId, ...(routing?.decisionChannelId ? [routing.decisionChannelId] : [])])], replyInThread, autoContinue, budgetN };
 }
 
 /** FLY-569 R1#2 — a GET /channels/{threadId} that returns 200 confirms the thread
@@ -230,7 +230,7 @@ export function resolveRoundtableInboundChatId(
 	info: InboundChannelInfo,
 	cfg: RoundtableConfig,
 ): InboundChatIdResolution {
-	if (cfg.replyInThread && !info.isThread && info.channelId === cfg.channelId) {
+	if (cfg.replyInThread && !info.isThread && cfg.channelIds.includes(info.channelId)) {
 		// Follow-up (Discord reply) → route into the referenced topic thread, confirm-only.
 		if (info.referencedMessageId) {
 			return {
@@ -260,8 +260,8 @@ export function resolveRoundtableInboundChatId(
 
 /** A human parent topic is answered by quoting its original message (choice A). */
 export function roundtableParentReplyHint(info: InboundChannelInfo, cfg: RoundtableConfig): string | undefined {
- if (!cfg.replyInThread || info.isThread || info.channelId !== cfg.channelId || info.referencedMessageId || info.authorBot !== false || isTopicNoise(info.content ?? "")) return undefined;
- return `这是 founder 在圆桌的顶层话题，不会开 thread；用 reply 工具并带 reply_to=${info.messageId} 直接回复它。`;
+ if (!cfg.replyInThread || info.isThread || !cfg.channelIds.includes(info.channelId) || info.referencedMessageId || info.authorBot !== false || isTopicNoise(info.content ?? "")) return undefined;
+ return `这是 founder 在这个频道的顶层话题，不会开 thread；用 reply 工具并带 reply_to=${info.messageId} 直接回复它。`;
 }
 
 /** Is this channel a roundtable TOPIC THREAD (a thread whose parent is the roundtable)? */
@@ -269,7 +269,7 @@ export function isRoundtableTopicThread(
 	info: { isThread: boolean; parentId: string | null },
 	cfg: RoundtableConfig,
 ): boolean {
-	return info.isThread && info.parentId === cfg.channelId;
+	return info.isThread && info.parentId !== null && cfg.channelIds.includes(info.parentId);
 }
 
 /** Opaque per-thread budget store (process-local; cleared on restart = safe side:
@@ -386,7 +386,7 @@ export function shouldSeedInitiatorBudget(input: {
 	sentToChannelId: string;
 	cfg: RoundtableConfig;
 }): boolean {
-	return input.cfg.autoContinue && input.sentToChannelId === input.cfg.channelId;
+	return input.cfg.autoContinue && input.cfg.channelIds.includes(input.sentToChannelId);
 }
 
 /**
