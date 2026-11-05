@@ -11,6 +11,7 @@
 import { test, expect, describe } from "bun:test";
 import {
 	loadRoundtableConfig,
+	isRoundtableTopicThread,
 	resolveRoundtableInboundChatId,
  roundtableParentReplyHint,
 	createThreadBudgetStore,
@@ -552,4 +553,22 @@ describe("rememberRoundtableRedirect / shouldStripRoundtableReplyTo — FLY-314 
 		expect(map.get("T1")!.has("real")).toBe(true);
 		expect(map.get("T1")!.size).toBe(1);
 	});
+});
+
+
+test("FLY-4948 decision parent uses all roundtable policies with per-thread routing", async () => {
+ const decision = "1567707434057728101";
+ const cfg = loadRoundtableConfig({}, { channelId: RT, decisionChannelId: decision })!;
+ expect(cfg.channelIds).toEqual([RT, decision]);
+ expect(loadRoundtableConfig({}, { channelId: RT, decisionChannelId: RT })?.channelIds).toEqual([RT]);
+ expect(loadRoundtableConfig({}, { decisionChannelId: decision })).toBeUndefined();
+ for (const parent of [RT, decision]) {
+  const info = { channelId: parent, messageId: "topic", isThread: false, parentId: null, authorBot: true, content: "a topic" };
+  expect(resolveRoundtableInboundChatId(info, cfg)).toMatchObject({ chatId: "topic", routedToThread: true });
+  expect(roundtableParentReplyHint({ ...info, authorBot: false }, cfg)).toBeDefined();
+  expect(isRoundtableTopicThread({ isThread: true, parentId: parent }, cfg)).toBe(true);
+  expect(shouldSeedInitiatorBudget({ sentToChannelId: parent, cfg })).toBe(true);
+ }
+ expect(isRoundtableTopicThread({isThread: true, parentId: "other"}, cfg)).toBe(false);
+ expect(shouldSeedInitiatorBudget({sentToChannelId: "other", cfg})).toBe(false);
 });
