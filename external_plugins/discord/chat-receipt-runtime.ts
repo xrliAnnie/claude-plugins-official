@@ -120,22 +120,25 @@ export class ChatIngestRuntime {
     this.clearTimer = opts.clearTimer ?? (timer => clearTimeout(timer))
   }
 
-  async acceptInbound(args: BeginArgs): Promise<'mailbox' | 'legacy'> {
-    if (this.mode.kind !== 'enabled') return 'legacy'
-    await this.ingest(args)
-    return 'mailbox'
+  // FLY-5394: `durable` tells inbound catch-up whether this message is safely
+  // recorded (an intent file exists or chat-ingest returned a lane). A false value
+  // keeps its catch-up cursor behind the message so it is read again later.
+  async acceptInbound(args: BeginArgs): Promise<{ delivery: 'mailbox' | 'legacy'; durable: boolean }> {
+    if (this.mode.kind !== 'enabled') return { delivery: 'legacy', durable: true }
+    const durable = await this.ingest(args)
+    return { delivery: 'mailbox', durable }
   }
 
   async holdInbound(
     intent: RejectedIntentV1 | undefined,
-  ): Promise<'rejected' | 'legacy'> {
-    if (this.mode.kind !== 'broken') return 'legacy'
+  ): Promise<{ delivery: 'rejected' | 'legacy'; durable: boolean }> {
+    if (this.mode.kind !== 'broken') return { delivery: 'legacy', durable: true }
     if (!intent) {
       this.log(JSON.stringify({
         event: 'discord_mailbox_rejected_write_failed',
         error: 'rejected intent is missing',
       }))
-      return 'rejected'
+      return { delivery: 'rejected', durable: false }
     }
     const path = this.rejectedIntentPath(intent.inbound.messageId)
     try {
@@ -166,11 +169,13 @@ export class ChatIngestRuntime {
         channel_id: intent.inbound.originChannelId,
         error: errorText(error),
       }))
+      return { delivery: 'rejected', durable: false }
     }
-    return 'rejected'
+    return { delivery: 'rejected', durable: true }
   }
 
-  private async ingest(args: BeginArgs): Promise<void> {
+  /** true when the message is durably recorded: an intent file or a chat-ingest lane. */
+  private async ingest(args: BeginArgs): Promise<boolean> {
     const path = this.ingestIntentPath(args.messageId)
     let intent = readIngestIntent(path) ?? {
       v: 1 as const,
@@ -196,7 +201,7 @@ export class ChatIngestRuntime {
           command_error: command.stderr || command.stdout,
         }))
       }
-      return
+      return lane !== undefined
     }
 
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -205,7 +210,7 @@ export class ChatIngestRuntime {
       if (lane) {
         this.logIngestVerdict(args, lane)
         rmSync(path, { force: true })
-        return
+        return true
       }
       intent.attempts += 1
     }
@@ -215,9 +220,10 @@ export class ChatIngestRuntime {
     } catch (error) {
       this.log(`discord mailbox ingest retry state write failed for ${args.messageId}: ${errorText(error)}`)
       this.scheduleIngestRetry(INGEST_RETRY_INITIAL_MS)
-      return
+      return true
     }
     this.scheduleIngestRetry()
+    return true
   }
 
   async diagnoseNode(): Promise<void> {

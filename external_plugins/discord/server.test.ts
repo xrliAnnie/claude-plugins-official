@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { roundtableParentReplyHint } from "./roundtable-thread-policy";
 import { SelfAuthorFilter, attachSelfAuthorFilter } from "./self-author-filter";
+import { AdmissionMemo, createIntakePipeline } from "./inbound-catchup";
+import { createThreadBudgetStore, decideTopicThreadHandling, isRoundtableTopicThread, seedThreadBudget } from "./roundtable-thread-policy";
 
 // Exercise the real server functions without opening Discord or the MCP process.
 const source = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
@@ -107,10 +109,10 @@ describe("FLY-3698 host-first server routing", () => {
     expect(fixture.counts().probes).toBe(0);
     expect(fixture.counts().creates).toBe(0);
   });
-  test.each(["ready", "shardReconnecting"])("real self-filter wiring keeps system/self/disallowed messages out during %s", lifecycle => {
-    const callbackStart = source.indexOf("function admitInbound(");
+  test.each(["ready", "shardReconnecting"])("real self-filter wiring keeps system/self/disallowed messages out during %s", async lifecycle => {
+    const callbackStart = source.indexOf("function catchupLiveRef(");
     expect(callbackStart).toBeGreaterThanOrEqual(0);
-    const stop = source.indexOf("\nasync function handleInbound", callbackStart);
+    const stop = source.indexOf("\n// Returns 'done' once", callbackStart);
     expect(stop).toBeGreaterThan(callbackStart);
     const code = new Bun.Transpiler({ loader: "ts" }).transformSync(source.slice(callbackStart, stop));
     const self = "100000000000000001";
@@ -119,10 +121,24 @@ describe("FLY-3698 host-first server routing", () => {
     const filter = new SelfAuthorFilter();
     const inbound: unknown[] = [];
     const echoes: string[] = [];
-    new Function("client", "selfAuthorFilter", "attachSelfAuthorFilter", "gatewayHealth", "gatewayHealthFiles", "loadAccess", "handleInbound", "process", code)(
+    const tracked: string[] = [];
+    const catchup = {
+      noteLive(ref: { channelId: string }) { tracked.push(`live:${ref.channelId}`); },
+      noteDone(_channel: string, id: string) { tracked.push(`done:${id}`); },
+      begin(_channel: string, id: string, live: boolean) { tracked.push(`begin:${id}:${live}`); },
+      finish(_channel: string, id: string, outcome: string) { tracked.push(`finish:${id}:${outcome}`); },
+    };
+    const intake = createIntakePipeline({
+      tracker: catchup,
+      allowBots: () => [lead, self],
+      identityValid: () => filter.identityValid(),
+      allowsIntake: (id: string) => filter.allowsIntake(id),
+      handle: async (msg: unknown) => { inbound.push(msg); return "done" as const; },
+      log() {},
+    });
+    new Function("client", "selfAuthorFilter", "attachSelfAuthorFilter", "gatewayHealth", "gatewayHealthFiles", "inboundCatchup", "inboundIntake", code)(
       client, filter, attachSelfAuthorFilter,
-      { onSelfEcho(id: string) { echoes.push(id); } }, { log() {} }, () => ({ allowBots: [lead, self] }),
-      async (msg: unknown) => { inbound.push(msg); }, { stderr: { write() {} } });
+      { onSelfEcho(id: string) { echoes.push(id); } }, { log() {} }, catchup, intake);
     const emit = (id: string, system: boolean, authorId = lead, bot = true) => {
       const msg = { id, channelId: "channel", system, author: { id: authorId, bot } };
       client.emit("messageCreate", msg);
@@ -140,8 +156,150 @@ describe("FLY-3698 host-first server routing", () => {
     expect(inbound).toEqual([]);
     expect(echoes).toEqual(["self-normal", "self-system"]);
     const allowed = emit("allowed", false);
+    await Promise.resolve();
     expect(inbound).toEqual([allowed]);
     const human = emit("human", false, "100000000000000004", false);
+    await Promise.resolve();
     expect(inbound).toEqual([allowed, human]);
+    // FLY-5394: self echoes and every admitted message are tracked for catch-up.
+    expect(tracked).toContain("done:self-normal");
+    expect(tracked).toContain("begin:allowed:true");
+    expect(tracked).toContain("finish:allowed:done");
+    expect(tracked.filter(t => t.startsWith("finish:system"))).toEqual(["finish:system:done"]);
+  });
+});
+
+describe("FLY-5394 inbound catch-up server wiring", () => {
+  const between = (from: string, to: string) => {
+    const start = source.indexOf(from);
+    expect(start).toBeGreaterThanOrEqual(0);
+    const stop = source.indexOf(to, start);
+    expect(stop).toBeGreaterThan(start);
+    return source.slice(start, stop);
+  };
+
+  test("T18 the startup window is constructed at module load before client.login, only outside disabled mode", () => {
+    const construct = source.indexOf("new InboundCatchup<Message>(");
+    expect(construct).toBeGreaterThan(0);
+    expect(construct).toBeLessThan(source.indexOf("await mcp.connect("));
+    expect(construct).toBeLessThan(source.indexOf("client.login(TOKEN)"));
+    expect(source).toContain("const inboundCatchup: InboundCatchup<Message> | undefined = RECORDER_MODE.kind === 'disabled'\n  ? undefined");
+  });
+
+  test("T18 lifecycle and raw events reach the catch-up; messageCreate stays a single listener", () => {
+    const wiring = between("if (inboundCatchup) {", "inboundCatchupEvidence.unref");
+    for (const event of ["shardReady", "shardResume"]) {
+      expect(wiring).toContain(`client.on('${event}', () => { inboundCatchup.onConnected() })`);
+    }
+    for (const event of ["shardReconnecting", "shardDisconnect", "invalidated"]) {
+      expect(wiring).toContain(`client.on('${event}', () => { inboundCatchup.onDisconnected() })`);
+    }
+    expect(wiring).toContain("client.on('raw', (packet: unknown) => { inboundCatchup.noteRaw(packet) })");
+    expect(wiring).toContain("if (!selfAuthorFilter.identityValid()) return");
+    // The only messageCreate listener stays inside attachSelfAuthorFilter (FLY-2598).
+    expect(source).not.toMatch(/\.on\(\s*['"]messageCreate/);
+    expect(source.match(/attachSelfAuthorFilter<Message>\(/g) ?? []).toHaveLength(1);
+    expect(source).toContain("onOther: msg => {\n    inboundCatchup?.noteLive(catchupLiveRef(msg))\n    void inboundIntake.intake(msg, 'live')");
+    expect(between("function shutdown(): void {", "process.stdin.on('end'")).toContain("inboundCatchup?.shutdown()");
+  });
+
+  test("T18 handleInbound reports durability for both mailbox and held (broken) delivery", () => {
+    const body = between("async function handleInbound(msg: Message, origin: 'live' | 'catchup')", "\nclient.once('ready'");
+    expect(body).toContain("const outcome: IntakeOutcome = accepted.durable ? 'done' : 'failed'");
+    expect(body).toContain("if (result.action === 'drop') {\n    roundtableAdmissions.forget(msg.id)\n    return 'done'\n  }");
+    expect(between("if (delivery === 'rejected') {", "// Typing keepalive")).toContain("return outcome");
+    expect(body.trimEnd().endsWith("return outcome\n}")).toBe(true);
+  });
+
+  test("T11 a caught-up permission reply for an unknown request is delivered as a normal message", () => {
+    const line = source.split("\n").find(l => l.includes("if (permMatch &&"))!;
+    const condition = line.trim().replace(/^if \(/, "").replace(/\) \{$/, "").replaceAll("]!.", "].");
+    const decide = new Function("permMatch", "origin", "pendingPermissions", `return ${condition}`);
+    const match = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i.exec("yes abcde");
+    expect(decide(match, "live", new Map())).toBe(true);
+    expect(decide(match, "catchup", new Map())).toBe(false);
+    expect(decide(match, "catchup", new Map([["abcde", {}]]))).toBe(true);
+    expect(decide(null, "live", new Map())).toBeFalsy();
+  });
+
+  test("T20 channel metadata is always read with force so a stale cache cannot hide new messages", () => {
+    const adapter = between("function inboundCatchupDiscord()", "\nconst inboundCatchup");
+    expect(adapter).toContain("client.channels.fetch(id, { force: true })");
+    expect(adapter).toContain("fetchArchived({\n        type: 'public',\n        limit: 100,");
+    expect(adapter).toContain("ch.messages.fetch({ after, limit, cache: false })");
+  });
+});
+
+describe("FLY-5394 code review round 1 server fixes", () => {
+  test("F1 gateway-status.json is not overwritten before the catch-up startup window is durable", () => {
+    const start = source.indexOf("function publishGatewayStatus(): void {");
+    const body = source.slice(start, source.indexOf("\n}\n", start));
+    const guard = body.indexOf("if (inboundCatchup && !inboundCatchup.startupPersisted()) return");
+    expect(guard).toBeGreaterThan(0);
+    expect(guard).toBeLessThan(body.indexOf("gatewayHealthFiles.writeStatus("));
+  });
+
+  test("F2/F4 a retry reuses only the roundtable budget decision; every access check runs again", () => {
+    const gateBody = source.slice(source.indexOf("async function gate(msg: Message)"), source.indexOf("\nasync function isMentioned("));
+    const reuse = gateBody.indexOf("if (roundtableAdmissions.has(msg.id)) return { action: 'deliver', access }");
+    expect(reuse).toBeGreaterThan(0);
+    for (const check of ["if (access.dmPolicy === 'disabled') return { action: 'drop' }", "if (!policy) return { action: 'drop' }",
+      "if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {"]) {
+      expect(gateBody.indexOf(check)).toBeGreaterThan(0);
+      expect(gateBody.indexOf(check)).toBeLessThan(reuse);
+    }
+    expect(reuse).toBeLessThan(gateBody.indexOf("decideTopicThreadHandling("));
+    expect(gateBody).toContain("if (decision.handle) roundtableAdmissions.remember(msg.id)");
+    const body = source.slice(source.indexOf("async function handleInbound(msg: Message, origin: 'live' | 'catchup')"), source.indexOf("\nclient.once('ready'"));
+    expect(body).toContain("const result = await gate(msg)");
+    expect(body).toContain("if (outcome === 'done') roundtableAdmissions.forget(msg.id)");
+    expect(body).not.toContain("retryAdmissions");
+  });
+});
+
+describe("FLY-5394 F4 real gate() on retry", () => {
+  const start = source.indexOf("async function gate(msg: Message): Promise<GateResult> {");
+  const gateCode = new Bun.Transpiler({ loader: "ts" }).transformSync(source.slice(start, source.indexOf("\nasync function isMentioned(", start)));
+  const self = "100000000000000001";
+  const peer = "100000000000000002";
+  const build = (access: { current: Record<string, unknown> }, budget: ReturnType<typeof createThreadBudgetStore>, memo: AdmissionMemo) =>
+    new Function("loadAccess", "pruneExpired", "saveAccess", "ChannelType", "RT_CFG", "isRoundtableTopicThread", "client",
+      "isMentioned", "resolveGroupMentionPatterns", "shouldProbeTopicThreadMembership", "isRoundtableThreadMember",
+      "decideTopicThreadHandling", "rtBudget", "roundtableAdmissions", "randomBytes", `${gateCode}; return gate`)(
+      () => access.current, () => false, () => {}, { DM: 1 },
+      { channelId: "rt", replyInThread: true, autoContinue: true, budgetN: 1 }, isRoundtableTopicThread,
+      { user: { id: self } },
+      async (msg: { content: string }) => msg.content.includes("<@lead>"), () => [], () => true, async () => true,
+      decideTopicThreadHandling, budget, memo, () => Buffer.from("abc"));
+  const msg = (channelId: string, parentId: string | null, content: string) => ({
+    id: "900000000000000001", channelId, content, author: { id: peer, bot: true },
+    channel: { type: 0, isThread: () => parentId !== null, parentId },
+  });
+
+  test("a non-durable roundtable admission is reused once, but a revoked sender is dropped", async () => {
+    const access = { current: { dmPolicy: "allowlist", allowFrom: [], groups: { rt: { requireMention: true, allowFrom: [] } }, pending: {} } as Record<string, unknown> };
+    const budget = createThreadBudgetStore();
+    seedThreadBudget(budget, "thread", 1);
+    const memo = new AdmissionMemo();
+    const gate = build(access, budget, memo);
+    const m = msg("thread", "rt", "continuing");
+    expect((await gate(m)).action).toBe("deliver");
+    expect(budget.budgets.get("thread")).toBe(0);
+    expect((await gate(m)).action).toBe("deliver");
+    expect(budget.budgets.get("thread")).toBe(0);
+    const withoutMemo = build(access, budget, new AdmissionMemo());
+    expect((await withoutMemo(m)).action).toBe("drop");
+    access.current = { ...access.current, groups: { rt: { requireMention: true, allowFrom: ["100000000000000003"] } } };
+    expect((await gate(m)).action).toBe("drop");
+    access.current = { ...access.current, dmPolicy: "disabled", groups: { rt: { requireMention: true, allowFrom: [] } } };
+    expect((await gate(m)).action).toBe("drop");
+  });
+
+  test("an edited message outside the roundtable is gated on its current content", async () => {
+    const access = { current: { dmPolicy: "allowlist", allowFrom: [], groups: { core: { requireMention: true, allowFrom: [] } }, pending: {} } as Record<string, unknown> };
+    const memo = new AdmissionMemo();
+    const gate = build(access, createThreadBudgetStore(), memo);
+    expect((await gate(msg("core", null, "hi <@lead>"))).action).toBe("deliver");
+    expect((await gate(msg("core", null, "hi (edited, no mention)"))).action).toBe("drop");
   });
 });

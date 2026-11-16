@@ -143,7 +143,7 @@ describe('durable Discord ingest runtime', () => {
       },
     })
 
-    expect(await runtime.acceptInbound(begin)).toBe('mailbox')
+    expect(await runtime.acceptInbound(begin)).toEqual({ delivery: 'mailbox', durable: true })
     expect(commands).toHaveLength(1)
     expect(commands[0]).toContain('chat-ingest')
     expect(commands[0]).not.toContain('chat-receipt')
@@ -163,7 +163,7 @@ describe('durable Discord ingest runtime', () => {
       },
     })
 
-    expect(await runtime.acceptInbound(begin)).toBe('mailbox')
+    expect(await runtime.acceptInbound(begin)).toEqual({ delivery: 'mailbox', durable: true })
     expect(presentDuringCli).toBe(true)
     expect(existsSync(intent)).toBe(false)
   })
@@ -191,7 +191,7 @@ describe('durable Discord ingest runtime', () => {
       clearTimer: () => {},
     })
 
-    expect(await runtime.acceptInbound(begin)).toBe('mailbox')
+    expect(await runtime.acceptInbound(begin)).toEqual({ delivery: 'mailbox', durable: true })
     expect(calls).toBe(2)
     expect(existsSync(intent)).toBe(true)
     expect(timers).toHaveLength(1)
@@ -221,8 +221,25 @@ describe('durable Discord ingest runtime', () => {
       clearTimer: () => {},
     })
 
-    expect(await runtime.acceptInbound(begin)).toBe('mailbox')
+    expect(await runtime.acceptInbound(begin)).toEqual({ delivery: 'mailbox', durable: true })
     expect(timers).toEqual([5_000])
+  })
+
+  it('FLY-5394 T19 reports durable when chat-ingest returns a lane even though the intent write failed', async () => {
+    const runtime = new ChatIngestRuntime({
+      mode: enabledMode(),
+      stateDir: tempDir(),
+      writeIngestIntent: () => { throw new Error('disk full') },
+      runCommand: async () => result(JSON.stringify({ lane: 'inserted_inbox' })),
+      log: () => {},
+    })
+    expect(await runtime.acceptInbound(begin)).toEqual({ delivery: 'mailbox', durable: true })
+    const broken = new ChatIngestRuntime({
+      mode: { kind: 'broken', missing: ['FLYWHEEL_COMM_DB'] },
+      stateDir: tempDir(),
+      log: () => {},
+    })
+    expect(await broken.holdInbound(undefined)).toEqual({ delivery: 'rejected', durable: false })
   })
 
   it('logs an unrecoverable ingest when neither durability nor immediate delivery works', async () => {
@@ -235,7 +252,7 @@ describe('durable Discord ingest runtime', () => {
       log: line => logs.push(line),
     })
 
-    await runtime.acceptInbound(begin)
+    expect(await runtime.acceptInbound(begin)).toEqual({ delivery: 'mailbox', durable: false })
     expect(logs.filter(line => line.includes('discord_mailbox_ingest_unrecoverable'))).toHaveLength(1)
   })
 
@@ -338,7 +355,7 @@ describe('durable Discord ingest runtime', () => {
         new Date('2026-08-11T05:00:01.000Z'),
       )
 
-      expect(await runtime.holdInbound(intent)).toBe('rejected')
+      expect(await runtime.holdInbound(intent)).toEqual({ delivery: 'rejected', durable: true })
       expect(commands).toEqual([])
       const rejectedDir = join(dir, 'chat-receipt-spool', 'rejected')
       const rejectedPath = join(
@@ -382,10 +399,10 @@ describe('durable Discord ingest runtime', () => {
     )
     const path = join(dir, 'chat-receipt-spool', 'rejected', `${begin.messageId}.json`)
 
-    expect(await runtime.holdInbound(first)).toBe('rejected')
+    expect(await runtime.holdInbound(first)).toEqual({ delivery: 'rejected', durable: true })
     const original = readFileSync(path, 'utf8')
-    expect(await runtime.holdInbound(later)).toBe('rejected')
-    expect(await runtime.holdInbound(conflict)).toBe('rejected')
+    expect(await runtime.holdInbound(later)).toEqual({ delivery: 'rejected', durable: true })
+    expect(await runtime.holdInbound(conflict)).toEqual({ delivery: 'rejected', durable: true })
     expect(readFileSync(path, 'utf8')).toBe(original)
     expect(logs.filter(line => line.includes('discord_mailbox_rejected_duplicate'))).toHaveLength(1)
     expect(logs.filter(line => line.includes('discord_mailbox_rejected_conflict'))).toHaveLength(1)
@@ -411,7 +428,7 @@ describe('durable Discord ingest runtime', () => {
       routing,
       ['FLYWHEEL_COMM_DB'],
       new Date('2026-08-11T05:00:01.000Z'),
-    ))).toBe('rejected')
+    ))).toEqual({ delivery: 'rejected', durable: false })
     const rejectedDir = join(dir, 'chat-receipt-spool', 'rejected')
     expect(readdirSync(rejectedDir).filter(name => name.endsWith('.tmp'))).toEqual([])
     expect(logs.filter(line => line.includes('discord_mailbox_rejected_write_failed'))).toHaveLength(1)
@@ -425,7 +442,7 @@ describe('durable Discord ingest runtime', () => {
       log: line => logs.push(line),
       writeRejectedIntent: () => { throw new Error('disk full') },
     })
-    expect(await runtime.holdInbound(rejectedIntent(begin.messageId))).toBe('rejected')
+    expect(await runtime.holdInbound(rejectedIntent(begin.messageId))).toEqual({ delivery: 'rejected', durable: false })
     expect(logs.filter(line => line.includes('discord_mailbox_rejected_write_failed'))).toHaveLength(1)
   })
 
@@ -654,12 +671,12 @@ describe('durable Discord ingest runtime', () => {
       mode: { kind: 'disabled', reason: 'stock' },
       stateDir: tempDir(),
     })
-    expect(await stock.holdInbound(undefined)).toBe('legacy')
+    expect(await stock.holdInbound(undefined)).toEqual({ delivery: 'legacy', durable: true })
 
     const isolated = new ChatIngestRuntime({
       mode: { kind: 'disabled', reason: 'isolated' },
       stateDir: tempDir(),
     })
-    expect(await isolated.holdInbound(undefined)).toBe('legacy')
+    expect(await isolated.holdInbound(undefined)).toEqual({ delivery: 'legacy', durable: true })
   })
 })
