@@ -3,7 +3,8 @@ import { readFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { roundtableParentReplyHint } from "./roundtable-thread-policy";
 import { SelfAuthorFilter, attachSelfAuthorFilter } from "./self-author-filter";
-import { createIntakePipeline } from "./inbound-catchup";
+import { AdmissionMemo, createIntakePipeline } from "./inbound-catchup";
+import { createThreadBudgetStore, decideTopicThreadHandling, isRoundtableTopicThread, seedThreadBudget } from "./roundtable-thread-policy";
 
 // Exercise the real server functions without opening Discord or the MCP process.
 const source = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
@@ -205,7 +206,7 @@ describe("FLY-5394 inbound catch-up server wiring", () => {
   test("T18 handleInbound reports durability for both mailbox and held (broken) delivery", () => {
     const body = between("async function handleInbound(msg: Message, origin: 'live' | 'catchup')", "\nclient.once('ready'");
     expect(body).toContain("const outcome: IntakeOutcome = accepted.durable ? 'done' : 'failed'");
-    expect(body).toContain("if (result.action === 'drop') return 'done'");
+    expect(body).toContain("if (result.action === 'drop') {\n    roundtableAdmissions.forget(msg.id)\n    return 'done'\n  }");
     expect(between("if (delivery === 'rejected') {", "// Typing keepalive")).toContain("return outcome");
     expect(body.trimEnd().endsWith("return outcome\n}")).toBe(true);
   });
@@ -238,12 +239,67 @@ describe("FLY-5394 code review round 1 server fixes", () => {
     expect(guard).toBeLessThan(body.indexOf("gatewayHealthFiles.writeStatus("));
   });
 
-  test("F2 handleInbound reuses a previous admission for a retry and forgets it once recorded", () => {
-    const start = source.indexOf("async function handleInbound(msg: Message, origin: 'live' | 'catchup')");
-    const body = source.slice(start, source.indexOf("\nclient.once('ready'", start));
-    expect(body).toContain("retryAdmissions.has(msg.id)\n    ? { action: 'deliver', access: loadAccess() }\n    : await gate(msg)");
-    expect(body.indexOf("if (result.action === 'deliver') retryAdmissions.remember(msg.id)")).toBeGreaterThan(0);
-    expect(body).toContain("if (outcome === 'done') retryAdmissions.forget(msg.id)");
-    expect(source).toContain("const retryAdmissions = new AdmissionMemo()");
+  test("F2/F4 a retry reuses only the roundtable budget decision; every access check runs again", () => {
+    const gateBody = source.slice(source.indexOf("async function gate(msg: Message)"), source.indexOf("\nasync function isMentioned("));
+    const reuse = gateBody.indexOf("if (roundtableAdmissions.has(msg.id)) return { action: 'deliver', access }");
+    expect(reuse).toBeGreaterThan(0);
+    for (const check of ["if (access.dmPolicy === 'disabled') return { action: 'drop' }", "if (!policy) return { action: 'drop' }",
+      "if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {"]) {
+      expect(gateBody.indexOf(check)).toBeGreaterThan(0);
+      expect(gateBody.indexOf(check)).toBeLessThan(reuse);
+    }
+    expect(reuse).toBeLessThan(gateBody.indexOf("decideTopicThreadHandling("));
+    expect(gateBody).toContain("if (decision.handle) roundtableAdmissions.remember(msg.id)");
+    const body = source.slice(source.indexOf("async function handleInbound(msg: Message, origin: 'live' | 'catchup')"), source.indexOf("\nclient.once('ready'"));
+    expect(body).toContain("const result = await gate(msg)");
+    expect(body).toContain("if (outcome === 'done') roundtableAdmissions.forget(msg.id)");
+    expect(body).not.toContain("retryAdmissions");
+  });
+});
+
+describe("FLY-5394 F4 real gate() on retry", () => {
+  const start = source.indexOf("async function gate(msg: Message): Promise<GateResult> {");
+  const gateCode = new Bun.Transpiler({ loader: "ts" }).transformSync(source.slice(start, source.indexOf("\nasync function isMentioned(", start)));
+  const self = "100000000000000001";
+  const peer = "100000000000000002";
+  const build = (access: { current: Record<string, unknown> }, budget: ReturnType<typeof createThreadBudgetStore>, memo: AdmissionMemo) =>
+    new Function("loadAccess", "pruneExpired", "saveAccess", "ChannelType", "RT_CFG", "isRoundtableTopicThread", "client",
+      "isMentioned", "resolveGroupMentionPatterns", "shouldProbeTopicThreadMembership", "isRoundtableThreadMember",
+      "decideTopicThreadHandling", "rtBudget", "roundtableAdmissions", "randomBytes", `${gateCode}; return gate`)(
+      () => access.current, () => false, () => {}, { DM: 1 },
+      { channelId: "rt", replyInThread: true, autoContinue: true, budgetN: 1 }, isRoundtableTopicThread,
+      { user: { id: self } },
+      async (msg: { content: string }) => msg.content.includes("<@lead>"), () => [], () => true, async () => true,
+      decideTopicThreadHandling, budget, memo, () => Buffer.from("abc"));
+  const msg = (channelId: string, parentId: string | null, content: string) => ({
+    id: "900000000000000001", channelId, content, author: { id: peer, bot: true },
+    channel: { type: 0, isThread: () => parentId !== null, parentId },
+  });
+
+  test("a non-durable roundtable admission is reused once, but a revoked sender is dropped", async () => {
+    const access = { current: { dmPolicy: "allowlist", allowFrom: [], groups: { rt: { requireMention: true, allowFrom: [] } }, pending: {} } as Record<string, unknown> };
+    const budget = createThreadBudgetStore();
+    seedThreadBudget(budget, "thread", 1);
+    const memo = new AdmissionMemo();
+    const gate = build(access, budget, memo);
+    const m = msg("thread", "rt", "continuing");
+    expect((await gate(m)).action).toBe("deliver");
+    expect(budget.budgets.get("thread")).toBe(0);
+    expect((await gate(m)).action).toBe("deliver");
+    expect(budget.budgets.get("thread")).toBe(0);
+    const withoutMemo = build(access, budget, new AdmissionMemo());
+    expect((await withoutMemo(m)).action).toBe("drop");
+    access.current = { ...access.current, groups: { rt: { requireMention: true, allowFrom: ["100000000000000003"] } } };
+    expect((await gate(m)).action).toBe("drop");
+    access.current = { ...access.current, dmPolicy: "disabled", groups: { rt: { requireMention: true, allowFrom: [] } } };
+    expect((await gate(m)).action).toBe("drop");
+  });
+
+  test("an edited message outside the roundtable is gated on its current content", async () => {
+    const access = { current: { dmPolicy: "allowlist", allowFrom: [], groups: { core: { requireMention: true, allowFrom: [] } }, pending: {} } as Record<string, unknown> };
+    const memo = new AdmissionMemo();
+    const gate = build(access, createThreadBudgetStore(), memo);
+    expect((await gate(msg("core", null, "hi <@lead>"))).action).toBe("deliver");
+    expect((await gate(msg("core", null, "hi (edited, no mention)"))).action).toBe("drop");
   });
 });

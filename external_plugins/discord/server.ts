@@ -152,6 +152,8 @@ const RT_CFG: RoundtableConfig | undefined = loadRoundtableConfig(
 )
 // Per-thread bot-only continuation budget (process-local; cleared on restart).
 const rtBudget = createThreadBudgetStore()
+// FLY-5394: roundtable admissions whose intake is not yet durable (see gate()).
+const roundtableAdmissions = new AdmissionMemo()
 // threadId -> the SET of parent-channel message ids we redirected into this thread,
 // so the reply handler can strip a cross-channel `reply_to` (R1#5). FLY-314 fix
 // (Codex R3 HIGH#3): a follow-up routed into a topic thread must strip BOTH the root
@@ -894,6 +896,10 @@ async function gate(msg: Message): Promise<GateResult> {
     )
   ) {
     const threadId = msg.channelId
+    // FLY-5394: a retry of a message this decision already admitted (its intake
+    // was not durable) reuses that admission instead of spending the budget again.
+    // Every access check above still ran for this attempt.
+    if (roundtableAdmissions.has(msg.id)) return { action: 'deliver', access }
     const botUserId = client.user?.id ?? ''
     const authorIsBot = msg.author.bot
     // FLY-898: per-group patterns override the global set for this group.
@@ -923,6 +929,7 @@ async function gate(msg: Message): Promise<GateResult> {
       rtBudget,
       RT_CFG,
     )
+    if (decision.handle) roundtableAdmissions.remember(msg.id)
     return decision.handle ? { action: 'deliver', access } : { action: 'drop' }
   }
 
@@ -1737,16 +1744,13 @@ attachSelfAuthorFilter<Message>(client, selfAuthorFilter, {
 
 // Returns 'done' once the message is durably recorded or deliberately dropped,
 // 'failed' when it could not be recorded (FLY-5394 catch-up reads it again).
-// A retry of an admitted-but-not-recorded message keeps its first admission, so
-// gate() side effects such as the roundtable continuation budget apply once.
-const retryAdmissions = new AdmissionMemo()
 async function handleInbound(msg: Message, origin: 'live' | 'catchup'): Promise<IntakeOutcome> {
-  const result: GateResult = retryAdmissions.has(msg.id)
-    ? { action: 'deliver', access: loadAccess() }
-    : await gate(msg)
+  const result = await gate(msg)
 
-  if (result.action === 'drop') return 'done'
-  if (result.action === 'deliver') retryAdmissions.remember(msg.id)
+  if (result.action === 'drop') {
+    roundtableAdmissions.forget(msg.id)
+    return 'done'
+  }
 
   if (result.action === 'pair') {
     const lead = result.isResend ? 'Still pending' : 'Pairing required'
@@ -1835,7 +1839,7 @@ async function handleInbound(msg: Message, origin: 'live' | 'catchup'): Promise<
     })
     const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '✅' : '❌'
     void msg.react(emoji).catch(() => {})
-    retryAdmissions.forget(msg.id)
+    roundtableAdmissions.forget(msg.id)
     return 'done'
   }
 
@@ -1916,7 +1920,7 @@ async function handleInbound(msg: Message, origin: 'live' | 'catchup'): Promise<
   if (ingestArgs) chatIngestRuntime.kickWorker()
   const delivery = accepted.delivery
   const outcome: IntakeOutcome = accepted.durable ? 'done' : 'failed'
-  if (outcome === 'done') retryAdmissions.forget(msg.id)
+  if (outcome === 'done') roundtableAdmissions.forget(msg.id)
 
   if (delivery === 'rejected') {
     void msg.react(REJECTED_REACTION).catch(err => {
