@@ -253,6 +253,34 @@ export class HandledOnce {
   }
 }
 
+/**
+ * Remembers messages that gate() already admitted but whose intake then failed,
+ * so the retry does not consume an admission budget (roundtable continuation)
+ * a second time and turn a non-durable message into a silent drop.
+ */
+export class AdmissionMemo {
+  private readonly ids = new Set<string>()
+
+  constructor(private readonly cap = 1_000) {}
+
+  has(id: string): boolean {
+    return this.ids.has(id)
+  }
+
+  remember(id: string): void {
+    this.ids.delete(id)
+    this.ids.add(id)
+    if (this.ids.size > this.cap) {
+      const oldest = this.ids.values().next().value
+      if (oldest !== undefined) this.ids.delete(oldest)
+    }
+  }
+
+  forget(id: string): void {
+    this.ids.delete(id)
+  }
+}
+
 export interface IntakeTracker {
   begin(channelId: string, messageId: string, live: boolean): void
   finish(channelId: string, messageId: string, outcome: IntakeOutcome): void
@@ -429,6 +457,7 @@ export class InboundCatchup<M extends { id: string; channelId: string }> impleme
   private failureStreak = 0
   private saveTimer: unknown
   private lastWriteError = ''
+  private startupDurable = false
 
   constructor(opts: InboundCatchupOptions<M>) {
     this.opts = opts
@@ -465,6 +494,17 @@ export class InboundCatchup<M extends { id: string; channelId: string }> impleme
       }
     }
     this.openWindow(cause, Math.min(floorMs, now - CATCHUP_LIMITS.marginMs))
+    this.startupDurable = this.lastWriteError === ''
+  }
+
+  /**
+   * True once the startup window is on disk. Until then the caller must not
+   * overwrite the previous process's gateway-status.json: on a first upgrade it is
+   * the only evidence of where the gap began. Each call retries the write.
+   */
+  startupPersisted(): boolean {
+    if (!this.startupDurable) this.startupDurable = this.saveNow()
+    return this.startupDurable
   }
 
   // ── observation (live path) ─────────────────────────────────────────────
@@ -570,6 +610,11 @@ export class InboundCatchup<M extends { id: string; channelId: string }> impleme
 
   // ── read-only views (tests / logs) ──────────────────────────────────────
 
+  /** In-memory bookkeeping sizes (tests: bounded growth). */
+  memorySizes(): { tracks: number; caught: number; touched: number } {
+    return { tracks: this.tracks.size, caught: this.caughtSeq.size, touched: this.touched.size }
+  }
+
   snapshot(): CatchupStateV1 {
     return structuredClone({ ...this.state, liveThroughMs: this.liveThroughMs() })
   }
@@ -650,12 +695,16 @@ export class InboundCatchup<M extends { id: string; channelId: string }> impleme
 
   /** A channel caught up on every open window persists its live progress; others stay behind the barrier. */
   private followLive(channelId: string): void {
-    const through = this.tracks.get(channelId)?.through
+    const track = this.tracks.get(channelId)
+    const through = track?.through
     if (through === undefined || !this.isCaught(channelId)) return
     const current = this.state.cursors[channelId]
-    if (current !== undefined && compareIds(current, through) >= 0) return
-    this.state.cursors[channelId] = through
-    this.scheduleSave()
+    if (current === undefined || compareIds(current, through) < 0) {
+      this.state.cursors[channelId] = through
+      this.scheduleSave()
+    }
+    // Its progress is in the persisted cursor now; idle tracks are not kept in memory.
+    if (track && track.entries.size === 0) this.tracks.delete(channelId)
   }
 
   private advanceProgress(channelId: string, id: string): void {
@@ -711,7 +760,7 @@ export class InboundCatchup<M extends { id: string; channelId: string }> impleme
     }, CATCHUP_LIMITS.debounceMs)
   }
 
-  private saveNow(): void {
+  private saveNow(): boolean {
     if (this.saveTimer !== undefined) {
       this.timers.clearTimeout(this.saveTimer)
       this.saveTimer = undefined
@@ -724,10 +773,12 @@ export class InboundCatchup<M extends { id: string; channelId: string }> impleme
     try {
       this.files.write(this.statePath, `${JSON.stringify(this.state)}\n`)
       this.lastWriteError = ''
+      return true
     } catch (error) {
-      const text = errorText(error)
+      const text = errorText(error) || 'unknown'
       if (text !== this.lastWriteError) this.opts.log(`inbound-catchup state_write_failed error=${text}`)
       this.lastWriteError = text
+      return false
     }
   }
 
@@ -993,7 +1044,9 @@ export class InboundCatchup<M extends { id: string; channelId: string }> impleme
     if (success) {
       this.state.windows = this.state.windows.filter(w => !ownedSeqs.has(w.seq))
       for (const seq of ownedSeqs) this.opts.log(`inbound-catchup window_close seq=${seq} by=run`)
-      for (const channelId of this.tracks.keys()) this.followLive(channelId)
+      for (const channelId of [...this.tracks.keys()]) this.followLive(channelId)
+      // With no open window every channel is caught (0 >= 0); later windows get higher seqs.
+      if (this.state.windows.length === 0) this.caughtSeq.clear()
       this.opts.log(`inbound-catchup done ${tail}`)
       this.saveNow()
     } else {

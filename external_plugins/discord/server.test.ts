@@ -228,3 +228,22 @@ describe("FLY-5394 inbound catch-up server wiring", () => {
     expect(adapter).toContain("ch.messages.fetch({ after, limit, cache: false })");
   });
 });
+
+describe("FLY-5394 code review round 1 server fixes", () => {
+  test("F1 gateway-status.json is not overwritten before the catch-up startup window is durable", () => {
+    const start = source.indexOf("function publishGatewayStatus(): void {");
+    const body = source.slice(start, source.indexOf("\n}\n", start));
+    const guard = body.indexOf("if (inboundCatchup && !inboundCatchup.startupPersisted()) return");
+    expect(guard).toBeGreaterThan(0);
+    expect(guard).toBeLessThan(body.indexOf("gatewayHealthFiles.writeStatus("));
+  });
+
+  test("F2 handleInbound reuses a previous admission for a retry and forgets it once recorded", () => {
+    const start = source.indexOf("async function handleInbound(msg: Message, origin: 'live' | 'catchup')");
+    const body = source.slice(start, source.indexOf("\nclient.once('ready'", start));
+    expect(body).toContain("retryAdmissions.has(msg.id)\n    ? { action: 'deliver', access: loadAccess() }\n    : await gate(msg)");
+    expect(body.indexOf("if (result.action === 'deliver') retryAdmissions.remember(msg.id)")).toBeGreaterThan(0);
+    expect(body).toContain("if (outcome === 'done') retryAdmissions.forget(msg.id)");
+    expect(source).toContain("const retryAdmissions = new AdmissionMemo()");
+  });
+});

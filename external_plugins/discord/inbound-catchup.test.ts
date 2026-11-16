@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Client, Events } from 'discord.js'
 import {
+  AdmissionMemo,
   CATCHUP_LIMITS,
   DISCORD_EPOCH_MS,
   HandledOnce,
@@ -22,6 +23,7 @@ import {
   type IntakeOutcome,
 } from './inbound-catchup'
 import { SelfAuthorFilter, attachSelfAuthorFilter } from './self-author-filter'
+import { createThreadBudgetStore, decideTopicThreadHandling, seedThreadBudget } from './roundtable-thread-policy'
 
 // FLY-5394: every Discord, clock, timer and file dependency is a local fake.
 const SELF = '100000000000000001'
@@ -91,6 +93,7 @@ class World {
   allowBots: string[] = [OTHER_LEAD_BOT]
   identity = true
   writes = 0
+  failWrites = false
 
   constructor(now = T0) {
     this.now = now
@@ -199,6 +202,7 @@ class World {
     return {
       read: path => this.files.get(path),
       write: (path, text) => {
+        if (this.failWrites) throw new Error('disk full')
         this.writes += 1
         this.files.set(path, text)
       },
@@ -1088,5 +1092,76 @@ describe('FLY-5394 state file on disk', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe('FLY-5394 code review round 1 fixes', () => {
+  test('F1 an unwritten startup window keeps the previous gateway evidence usable after a crash', async () => {
+    const world = new World()
+    world.files.set(STATUS_PATH, JSON.stringify({ lead: LEAD, shards: [{ lastAckAt: T0 - 3 * HOUR }] }))
+    const old = world.post(MAIN, T0 - 2 * HOUR)
+    world.now = T0
+    world.failWrites = true
+    const first = world.start()
+    expect(first.catchup.startupPersisted()).toBe(false)
+    expect(world.files.has(STATE_PATH)).toBe(false)
+    expect(world.logs).toContain('inbound-catchup state_write_failed error=disk full')
+    // crash; the previous gateway-status.json was not overwritten
+    world.failWrites = false
+    const second = world.start()
+    expect(world.state().windows[0]!.floorMs).toBe(T0 - 3 * HOUR - 120_000)
+    await second.ready()
+    expect(world.rows(old)).toBe(1)
+  })
+
+  test('F1 the startup write is retried until it lands', () => {
+    const world = new World()
+    world.failWrites = true
+    const { catchup } = world.start()
+    expect(catchup.startupPersisted()).toBe(false)
+    world.failWrites = false
+    expect(catchup.startupPersisted()).toBe(true)
+    expect(world.state().windows).toHaveLength(1)
+    world.failWrites = true
+    expect(catchup.startupPersisted()).toBe(true)
+  })
+
+  test('F2 a retried roundtable message keeps its first admission instead of spending the budget again', () => {
+    const cfg = { channelId: 'rt', replyInThread: true, autoContinue: true, budgetN: 1 }
+    const input = { threadId: 't', authorIsSelf: false, authorIsBot: true, authorIsHuman: false, isExplicitMention: false, isMember: true }
+    const attempt = (memo: AdmissionMemo | undefined, store: ReturnType<typeof createThreadBudgetStore>, durable: boolean) => {
+      const admitted = memo?.has('m') ? true : decideTopicThreadHandling(input, store, cfg).handle
+      if (!admitted) return 'dropped'
+      memo?.remember('m')
+      if (!durable) return 'failed'
+      memo?.forget('m')
+      return 'recorded'
+    }
+    const withoutMemo = createThreadBudgetStore()
+    seedThreadBudget(withoutMemo, 't', 1)
+    expect([attempt(undefined, withoutMemo, false), attempt(undefined, withoutMemo, true)]).toEqual(['failed', 'dropped'])
+
+    const memo = new AdmissionMemo(2)
+    const store = createThreadBudgetStore()
+    seedThreadBudget(store, 't', 1)
+    expect([attempt(memo, store, false), attempt(memo, store, true)]).toEqual(['failed', 'recorded'])
+    expect(memo.has('m')).toBe(false)
+    memo.remember('a')
+    memo.remember('b')
+    memo.remember('c')
+    expect([memo.has('a'), memo.has('b'), memo.has('c')]).toEqual([false, true, true])
+  })
+
+  test('F3 caught channels leave no per-channel bookkeeping behind', async () => {
+    const world = new World()
+    world.writeState({ liveThroughMs: T0 })
+    const threads = Array.from({ length: 20 }, () => world.addThread(T0 - HOUR))
+    for (const t of threads) world.post(t, T0 + 1_000)
+    world.now = T0 + MIN
+    const { catchup, live, ready } = world.start()
+    await ready()
+    for (const t of threads) await live(world.post(t, world.now + 1_000))
+    expect(catchup.memorySizes()).toEqual({ tracks: 0, caught: 0, touched: 0 })
+    expect(threads.every(t => world.state().cursors[t] !== undefined)).toBe(true)
   })
 })

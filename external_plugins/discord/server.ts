@@ -89,6 +89,7 @@ import { GatewayStatusTelemetry, inspectHeartbeatInterval } from './gateway-stat
 import { SelfAuthorFilter, attachSelfAuthorFilter } from './self-author-filter'
 import { VoiceSelfFilterSocket } from './voice-self-filter-socket'
 import {
+  AdmissionMemo,
   CATCHUP_LIMITS,
   InboundCatchup,
   createIntakePipeline,
@@ -587,6 +588,9 @@ function initializeRawShardReconnect(): void {
 
 function publishGatewayStatus(): void {
   refreshGatewayStatusEvents()
+  // FLY-5394: keep the previous process's heartbeat evidence until the catch-up
+  // startup window that relies on it is on disk.
+  if (inboundCatchup && !inboundCatchup.startupPersisted()) return
   const status = getGatewayStatus()
   if (!status) return
   try {
@@ -1733,10 +1737,16 @@ attachSelfAuthorFilter<Message>(client, selfAuthorFilter, {
 
 // Returns 'done' once the message is durably recorded or deliberately dropped,
 // 'failed' when it could not be recorded (FLY-5394 catch-up reads it again).
+// A retry of an admitted-but-not-recorded message keeps its first admission, so
+// gate() side effects such as the roundtable continuation budget apply once.
+const retryAdmissions = new AdmissionMemo()
 async function handleInbound(msg: Message, origin: 'live' | 'catchup'): Promise<IntakeOutcome> {
-  const result = await gate(msg)
+  const result: GateResult = retryAdmissions.has(msg.id)
+    ? { action: 'deliver', access: loadAccess() }
+    : await gate(msg)
 
   if (result.action === 'drop') return 'done'
+  if (result.action === 'deliver') retryAdmissions.remember(msg.id)
 
   if (result.action === 'pair') {
     const lead = result.isResend ? 'Still pending' : 'Pairing required'
@@ -1825,6 +1835,7 @@ async function handleInbound(msg: Message, origin: 'live' | 'catchup'): Promise<
     })
     const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '✅' : '❌'
     void msg.react(emoji).catch(() => {})
+    retryAdmissions.forget(msg.id)
     return 'done'
   }
 
@@ -1905,6 +1916,7 @@ async function handleInbound(msg: Message, origin: 'live' | 'catchup'): Promise<
   if (ingestArgs) chatIngestRuntime.kickWorker()
   const delivery = accepted.delivery
   const outcome: IntakeOutcome = accepted.durable ? 'done' : 'failed'
+  if (outcome === 'done') retryAdmissions.forget(msg.id)
 
   if (delivery === 'rejected') {
     void msg.react(REJECTED_REACTION).catch(err => {
