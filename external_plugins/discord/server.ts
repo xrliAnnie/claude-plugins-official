@@ -88,6 +88,14 @@ import { attachGatewayLifecycleEvents, attachGatewayStatusEvents } from './gatew
 import { GatewayStatusTelemetry, inspectHeartbeatInterval } from './gateway-status'
 import { SelfAuthorFilter, attachSelfAuthorFilter } from './self-author-filter'
 import { VoiceSelfFilterSocket } from './voice-self-filter-socket'
+import {
+  CATCHUP_LIMITS,
+  InboundCatchup,
+  createIntakePipeline,
+  type CatchupDiscord,
+  type ChannelMeta,
+  type IntakeOutcome,
+} from './inbound-catchup'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -1117,6 +1125,90 @@ const chatIngestRuntime = new ChatIngestRuntime({
 })
 void chatIngestRuntime.diagnoseNode()
 
+// FLY-5394: inbound catch-up after a gateway gap. Constructed at module load so
+// the startup window is durably written BEFORE client.login; Flywheel-managed
+// modes only (disabled / stock / isolated plugins keep today's behavior).
+function catchupChannelMeta(channel: unknown): ChannelMeta | null {
+  const ch = channel as {
+    id: string
+    type: ChannelType
+    isThread(): boolean
+    isTextBased(): boolean
+    isDMBased(): boolean
+    parentId?: string | null
+    guildId?: string | null
+    lastMessageId?: string | null
+    archiveTimestamp?: number | null
+  } | null
+  if (!ch) return null
+  const base = { id: ch.id, parentId: null, guildId: ch.guildId ?? null, lastMessageId: null, archiveTimestamp: null }
+  if (ch.isThread()) {
+    return {
+      ...base, kind: 'thread', parentId: ch.parentId ?? null,
+      lastMessageId: ch.lastMessageId ?? null, archiveTimestamp: ch.archiveTimestamp ?? null,
+    }
+  }
+  if (ch.type === ChannelType.GuildForum || ch.type === ChannelType.GuildMedia) return { ...base, kind: 'forum' }
+  if (ch.isTextBased() && !ch.isDMBased()) return { ...base, kind: 'text', lastMessageId: ch.lastMessageId ?? null }
+  return { ...base, kind: 'skip' }
+}
+
+function inboundCatchupDiscord(): CatchupDiscord<Message> {
+  return {
+    async fetchChannel(id) {
+      // force: the discord.js cache can hold a stale lastMessageId.
+      return catchupChannelMeta(await client.channels.fetch(id, { force: true }))
+    },
+    async fetchActiveThreads(guildId) {
+      const guild = client.guilds.cache.get(guildId)
+      if (!guild) throw new Error('guild_unavailable')
+      const fetched = await guild.channels.fetchActiveThreads()
+      return [...fetched.threads.values()].flatMap(t => catchupChannelMeta(t) ?? [])
+    },
+    async fetchArchivedPublicThreads(channelId, beforeMs) {
+      const ch = await client.channels.fetch(channelId)
+      if (!ch || ch.isThread() || !('threads' in ch)) return { threads: [], hasMore: false }
+      const fetched = await ch.threads.fetchArchived({
+        type: 'public',
+        limit: 100,
+        ...(beforeMs !== undefined ? { before: new Date(beforeMs) } : {}),
+      })
+      return {
+        threads: [...fetched.threads.values()].flatMap(t => catchupChannelMeta(t) ?? []),
+        hasMore: fetched.hasMore,
+      }
+    },
+    async fetchMessagesAfter(channelId, after, limit) {
+      const ch = await client.channels.fetch(channelId)
+      if (!ch || !ch.isTextBased() || ch.isDMBased()) return []
+      const page = await ch.messages.fetch({ after, limit, cache: false })
+      return [...page.values()]
+    },
+  }
+}
+
+const inboundCatchup: InboundCatchup<Message> | undefined = RECORDER_MODE.kind === 'disabled'
+  ? undefined
+  : new InboundCatchup<Message>({
+    mode: RECORDER_MODE.kind,
+    stateDir: STATE_DIR,
+    leadId: process.env.FLYWHEEL_LEAD_ID || undefined,
+    log: line => { gatewayHealthFiles.log(line) },
+    groups: () => Object.keys(loadAccess().groups),
+    discord: inboundCatchupDiscord(),
+    intake: msg => inboundIntake.catchupIntake(msg),
+  })
+
+// One admission chain for live delivery and catch-up; the same id runs once.
+const inboundIntake = createIntakePipeline<Message>({
+  tracker: inboundCatchup,
+  allowBots: () => loadAccess().allowBots,
+  identityValid: () => selfAuthorFilter.identityValid(),
+  allowsIntake: authorId => selfAuthorFilter.allowsIntake(authorId),
+  handle: (msg, origin) => handleInbound(msg, origin),
+  log: line => { process.stderr.write(`${line}\n`) },
+})
+
 // Stores full permission details for "See more" expansion keyed by request_id.
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
 
@@ -1459,6 +1551,7 @@ function shutdown(): void {
   process.stderr.write('discord channel: shutting down\n')
   setTimeout(() => process.exit(0), 2000)
   selfAuthorFilter.disconnected()
+  inboundCatchup?.shutdown()
   void Promise.allSettled([Promise.resolve(client.destroy()), voiceSelfFilterSocket?.close()]).finally(() => process.exit(0))
 }
 process.stdin.on('end', shutdown)
@@ -1537,6 +1630,26 @@ client.on('error', err => {
 })
 attachGatewayLifecycleEvents(client, gatewayHealth)
 
+// FLY-5394: a gap may begin at any disconnect; every new or resumed session
+// triggers a catch-up run. Raw THREAD_* packets fire before the cache handlers.
+if (inboundCatchup) {
+  client.on('shardReady', () => { inboundCatchup.onConnected() })
+  client.on('shardResume', () => { inboundCatchup.onConnected() })
+  client.on('shardReconnecting', () => { inboundCatchup.onDisconnected() })
+  client.on('shardDisconnect', () => { inboundCatchup.onDisconnected() })
+  client.on('invalidated', () => { inboundCatchup.onDisconnected() })
+  client.on('raw', (packet: unknown) => { inboundCatchup.noteRaw(packet) })
+  const inboundCatchupEvidence = setInterval(() => {
+    if (!selfAuthorFilter.identityValid()) return
+    let ack: number | undefined
+    for (const shard of getGatewayStatus()?.snapshot().shards ?? []) {
+      if (shard.state === 'ready' && shard.lastAckAt !== null) ack = Math.max(ack ?? 0, shard.lastAckAt)
+    }
+    inboundCatchup.noteAck(ack)
+  }, CATCHUP_LIMITS.evidenceTickMs)
+  inboundCatchupEvidence.unref?.()
+}
+
 // Button-click handler for permission requests. customId is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
@@ -1598,25 +1711,32 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     .catch(() => {})
 })
 
-function admitInbound(msg: Message): void {
-  if (msg.system) return
-  if (msg.author.bot) {
-    const access = loadAccess()
-    if (!access.allowBots?.includes(msg.author.id)) return
+function catchupLiveRef(msg: Message): { channelId: string; threadParentId: string | null } {
+  return {
+    channelId: msg.channelId,
+    threadParentId: msg.channel?.isThread() ? msg.channel.parentId ?? null : null,
   }
-  handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 }
 
 attachSelfAuthorFilter<Message>(client, selfAuthorFilter, {
-  onSelfEcho: msg => { gatewayHealth.onSelfEcho(msg.id, msg.channelId) },
+  onSelfEcho: msg => {
+    gatewayHealth.onSelfEcho(msg.id, msg.channelId)
+    inboundCatchup?.noteLive(catchupLiveRef(msg))
+    inboundCatchup?.noteDone(msg.channelId, msg.id)
+  },
   log: message => { gatewayHealthFiles.log(message) },
-  onOther: admitInbound,
+  onOther: msg => {
+    inboundCatchup?.noteLive(catchupLiveRef(msg))
+    void inboundIntake.intake(msg, 'live')
+  },
 })
 
-async function handleInbound(msg: Message): Promise<void> {
+// Returns 'done' once the message is durably recorded or deliberately dropped,
+// 'failed' when it could not be recorded (FLY-5394 catch-up reads it again).
+async function handleInbound(msg: Message, origin: 'live' | 'catchup'): Promise<IntakeOutcome> {
   const result = await gate(msg)
 
-  if (result.action === 'drop') return
+  if (result.action === 'drop') return 'done'
 
   if (result.action === 'pair') {
     const lead = result.isResend ? 'Still pending' : 'Pairing required'
@@ -1630,7 +1750,7 @@ async function handleInbound(msg: Message): Promise<void> {
     } catch (err) {
       process.stderr.write(`discord channel: failed to send pairing code: ${err}\n`)
     }
-    return
+    return 'done'
   }
 
   // FLY-314 Part(b): a top-level message in the roundtable parent is delivered with
@@ -1692,8 +1812,10 @@ async function handleInbound(msg: Message): Promise<void> {
   // pending permission request, emit the structured event instead of
   // relaying as chat. The sender is already gate()-approved at this point
   // (non-allowlisted senders were dropped above), so we trust the reply.
+  // FLY-5394: a caught-up reply to a request this process never issued (the
+  // previous Claude process asked it) is delivered as a normal message instead.
   const permMatch = PERMISSION_REPLY_RE.exec(msg.content)
-  if (permMatch) {
+  if (permMatch && (origin === 'live' || pendingPermissions.has(permMatch[2]!.toLowerCase()))) {
     void mcp.notification({
       method: 'notifications/claude/channel/permission',
       params: {
@@ -1703,7 +1825,7 @@ async function handleInbound(msg: Message): Promise<void> {
     })
     const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '✅' : '❌'
     void msg.react(emoji).catch(() => {})
-    return
+    return 'done'
   }
 
   // Attachments are listed (name/type/size) but not downloaded — the model
@@ -1777,16 +1899,18 @@ async function handleInbound(msg: Message): Promise<void> {
     }
   }
 
-  const delivery = ingestArgs
+  const accepted = ingestArgs
     ? await chatIngestRuntime.acceptInbound(ingestArgs)
     : await chatIngestRuntime.holdInbound(rejectedIntent)
   if (ingestArgs) chatIngestRuntime.kickWorker()
+  const delivery = accepted.delivery
+  const outcome: IntakeOutcome = accepted.durable ? 'done' : 'failed'
 
   if (delivery === 'rejected') {
     void msg.react(REJECTED_REACTION).catch(err => {
       process.stderr.write(`discord channel: rejected reaction failed: ${err}\n`)
     })
-    return
+    return outcome
   }
 
   // Typing keepalive — refreshes every 8s so "Bot is typing..." persists
@@ -1819,6 +1943,7 @@ async function handleInbound(msg: Message): Promise<void> {
       process.stderr.write(`discord channel: failed to deliver inbound to Claude: ${err}\n`)
     })
   }
+  return outcome
 }
 
 client.once('ready', c => {
